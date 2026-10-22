@@ -6,6 +6,7 @@ mod audio;
 mod com;
 mod convert;
 mod d3d;
+mod desktop;
 mod duplication;
 mod encoder;
 mod h264;
@@ -18,7 +19,7 @@ use std::path::PathBuf;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{FOLDERID_Videos, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 
-pub use audio::{AudioInput, MIX_TRACK};
+pub use audio::{AudioInput, DESKTOP_TRACK};
 pub use recorder::{ClipSaver, Recorder, RecorderStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

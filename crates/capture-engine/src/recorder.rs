@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
-use crate::audio::{self, AudioInput, AudioRings, AudioShared};
+use crate::audio::{self, AudioInput, AudioRings, AudioShared, DESKTOP_TRACK};
 use crate::com::MfThread;
+use crate::desktop;
 use crate::convert::Converter;
 use crate::d3d::open_primary_output;
 use crate::duplication::{Desktop, Poll};
@@ -71,28 +72,30 @@ impl RecorderStatus {
     }
 }
 
-/// Continuously records the primary monitor (hardware-encoded H.264) and the
-/// audio tracks fed through [`Recorder::audio_input`] into rolling in-memory
-/// buffers. Dropping it stops recording.
+/// Continuously records the primary monitor (hardware-encoded H.264), the
+/// audio tracks fed through [`Recorder::audio_input`], and desktop audio into
+/// rolling in-memory buffers. Dropping it stops recording.
 pub struct Recorder {
     commands: Sender<Command>,
     worker: Option<JoinHandle<()>>,
     audio: Arc<AudioShared>,
-    audio_worker: Option<JoinHandle<()>>,
+    audio_workers: Vec<JoinHandle<()>>,
     status: Arc<RecorderStatus>,
 }
 
 impl Recorder {
-    /// `tracks` names the audio tracks clips get after the mix track, in
-    /// order (for sonar-rs: the buses).
+    /// `tracks` names the audio tracks fed through [`Recorder::audio_input`]
+    /// (for sonar-rs: the buses). Clips get those tracks in order, then
+    /// [`DESKTOP_TRACK`], which the recorder captures itself.
     pub fn start(settings: VideoSettings, tracks: &[&str]) -> Result<Self, StartError> {
         let epoch = Instant::now();
         let span = settings.buffer_secs as i64 * HNS_PER_SECOND;
         let status = Arc::new(RecorderStatus::default());
-        let audio = AudioShared::new(epoch, tracks);
-        let rings = audio::new_rings(tracks.len(), span);
+        let names: Vec<&str> = tracks.iter().copied().chain([DESKTOP_TRACK]).collect();
+        let audio = AudioShared::new(epoch, &names);
+        let rings = audio::new_rings(names.len(), span);
 
-        let audio_worker = {
+        let encoder = {
             let (audio, rings, status) = (audio.clone(), rings.clone(), status.clone());
             std::thread::Builder::new()
                 .name("moments-audio".into())
@@ -102,6 +105,17 @@ impl Recorder {
                     }
                 })
                 .expect("spawn moments audio thread")
+        };
+        let desktop_capture = {
+            let (audio, status) = (audio.clone(), status.clone());
+            std::thread::Builder::new()
+                .name("moments-desktop".into())
+                .spawn(move || {
+                    if let Err(error) = desktop::run(audio) {
+                        *status.error.lock().unwrap() = Some(format!("desktop audio: {error}"));
+                    }
+                })
+                .expect("spawn moments desktop audio thread")
         };
 
         let (commands, command_rx) = mpsc::channel();
@@ -115,10 +129,10 @@ impl Recorder {
             commands,
             worker: Some(worker),
             audio,
-            audio_worker: Some(audio_worker),
+            audio_workers: vec![encoder, desktop_capture],
             status,
         };
-        // On failure, dropping `recorder` stops and joins both threads.
+        // On failure, dropping `recorder` stops and joins every thread.
         ready_rx.recv().map_err(|_| StartError::ThreadExited)??;
         Ok(recorder)
     }
@@ -153,7 +167,7 @@ impl Drop for Recorder {
         // An explicit stop: ClipSaver clones may keep the channel open.
         let _ = self.commands.send(Command::Stop);
         self.audio.stop();
-        for worker in [self.worker.take(), self.audio_worker.take()].into_iter().flatten() {
+        for worker in self.worker.take().into_iter().chain(self.audio_workers.drain(..)) {
             let _ = worker.join();
         }
     }
@@ -328,8 +342,7 @@ impl Session {
             pps,
             frames,
             frame_duration,
-            tracks: Vec::new(),
-            mix: Vec::new(),
+            audio: Vec::new(),
         };
         let audio = self.audio.clone();
         std::thread::Builder::new()
@@ -341,8 +354,7 @@ impl Session {
                 if let (Some(first), Some(last)) = (clip.frames.first(), clip.frames.last()) {
                     let end = last.pts + clip.frame_duration;
                     let rings = audio.lock().unwrap();
-                    clip.mix = rings[0].snapshot(first.pts, end);
-                    clip.tracks = rings[1..].iter().map(|ring| ring.snapshot(first.pts, end)).collect();
+                    clip.audio = rings.iter().map(|ring| ring.snapshot(first.pts, end)).collect();
                 }
                 let _ = reply.send(save_to(&dir, &clip));
             })

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use audio_engine::{BusTap, Mixer};
-use capture_engine::{default_clips_dir, AudioInput, ClipSaver, Recorder, Resolution, VideoSettings};
+use capture_engine::{default_clips_dir, AudioInput, ClipSaver, Recorder, Resolution, VideoSettings, DESKTOP_TRACK};
 use common::MomentsConfig;
 use eframe::egui;
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
@@ -14,6 +14,12 @@ use crate::hotkey::{self, GlobalHotkey};
 use crate::FIXED_BUSES;
 
 const CLIP_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Every audio track a clip has, in file order: one per bus, then desktop
+/// audio (the default track).
+fn clip_tracks() -> impl Iterator<Item = &'static str> {
+    FIXED_BUSES.iter().copied().chain([DESKTOP_TRACK])
+}
 const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 100, 100);
 
 /// Feeds every mixer bus into the clip recorder's track of the same name.
@@ -123,8 +129,8 @@ impl Moments {
         }
         match Recorder::start(self.video_settings(), FIXED_BUSES) {
             Ok(recorder) => {
-                for bus in FIXED_BUSES {
-                    recorder.set_track_volume(bus, self.track_volume(bus));
+                for track in clip_tracks() {
+                    recorder.set_track_volume(track, self.track_volume(track));
                 }
                 mixer.set_bus_tap(Some(Arc::new(BusesToRecorder(recorder.audio_input()))));
                 *self.shared.saver.lock().unwrap() = Some(recorder.saver());
@@ -338,9 +344,10 @@ impl Moments {
         ui.separator();
         ui.strong("Clip audio");
         ui.weak("How loud each track is in saved clips. This doesn't change what you hear.");
+        ui.weak("Desktop audio is everything you hear and plays by default; the bus tracks are for editing.");
         egui::Grid::new("moments-tracks").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-            for bus in FIXED_BUSES {
-                ui.label(*bus);
+            for bus in clip_tracks() {
+                ui.label(if bus == DESKTOP_TRACK { "Desktop audio" } else { bus });
                 let mut volume = self.track_volume(bus);
                 let response = ui.add(
                     egui::Slider::new(&mut volume, 0.0..=2.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),

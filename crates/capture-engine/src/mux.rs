@@ -26,20 +26,18 @@ pub(crate) struct Clip {
     pub frames: Vec<VideoSample>,
     /// Duration given to the final frame (100 ns units).
     pub frame_duration: i64,
-    /// The per-bus AAC tracks, each starting at the video's start.
-    pub tracks: Vec<Vec<AudioFrame>>,
-    /// All tracks mixed together.
-    pub mix: Vec<AudioFrame>,
+    /// AAC tracks in file order, each starting at the video's start. The
+    /// last one (desktop audio) is the default.
+    pub audio: Vec<Vec<AudioFrame>>,
 }
 
-/// Writes `video` as an MP4 at `path`: the video track, the per-bus audio
-/// tracks, then the mix. Video sample durations come from the frames' actual
-/// timestamps, so dropped frames don't speed the clip up.
+/// Writes `video` as an MP4 at `path`: the video track, then the audio
+/// tracks. Video sample durations come from the frames' actual timestamps,
+/// so dropped frames don't speed the clip up.
 ///
-/// The mix is the only enabled audio track and goes last: players built on
-/// ffmpeg (VLC, mpv) pick the enabled track, while Windows' own MP4 reader
-/// ignores that flag and picks the last audio track in the file. Either way
-/// people hear everything; editors still get each bus separately.
+/// The last audio track is the default and the only enabled one: players
+/// built on ffmpeg (VLC, mpv) pick the enabled track, while Windows' own MP4
+/// reader ignores that flag and picks the last audio track in the file.
 pub(crate) fn write_clip(path: &Path, video: &Clip) -> Result<(), SaveError> {
     let Some(first) = video.frames.first() else {
         return Err(SaveError::Empty);
@@ -85,8 +83,7 @@ pub(crate) fn write_clip(path: &Path, video: &Clip) -> Result<(), SaveError> {
         )?;
     }
 
-    let audio = video.tracks.iter().chain(std::iter::once(&video.mix));
-    for (index, track) in audio.enumerate() {
+    for (index, track) in video.audio.iter().enumerate() {
         let track_id = index as u32 + 2;
         writer.add_track(&TrackConfig {
             track_type: TrackType::Audio,
@@ -118,9 +115,9 @@ pub(crate) fn write_clip(path: &Path, video: &Clip) -> Result<(), SaveError> {
 
     // Audio tracks share one alternate group so players treat them as
     // alternatives rather than playing all of them at once.
+    let last = video.audio.len().saturating_sub(1);
     let defaults: Vec<TrackDefault> = std::iter::once(TrackDefault { enabled: true, alternate_group: 0 })
-        .chain(video.tracks.iter().map(|_| TrackDefault { enabled: false, alternate_group: 1 }))
-        .chain(std::iter::once(TrackDefault { enabled: true, alternate_group: 1 }))
+        .chain((0..video.audio.len()).map(|index| TrackDefault { enabled: index == last, alternate_group: 1 }))
         .collect();
     set_track_defaults(&mut file, &defaults)?;
     Ok(())

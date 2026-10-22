@@ -1,5 +1,5 @@
-//! Clip audio: per-track PCM pushed from the mixer's render thread, cut into
-//! time-aligned blocks, volume-scaled, mixed, and AAC-encoded into rolling
+//! Clip audio: per-track PCM (the mixer's buses, plus desktop audio), cut
+//! into time-aligned blocks, volume-scaled, and AAC-encoded into rolling
 //! buffers alongside the video.
 
 use std::collections::VecDeque;
@@ -15,7 +15,7 @@ use crate::com::MfThread;
 pub(crate) const SAMPLE_RATE: u32 = 48_000;
 pub(crate) const CHANNELS: usize = 2;
 /// One AAC frame. Every track is cut on the same block boundaries, so the
-/// tracks (and the mix built from them) stay sample-aligned.
+/// tracks stay sample-aligned.
 pub(crate) const BLOCK_FRAMES: i64 = 1024;
 /// How long a block waits for its audio to arrive before it's encoded; any
 /// still missing then becomes silence.
@@ -27,9 +27,10 @@ const RESYNC_FRAMES: i64 = SAMPLE_RATE as i64 / 20;
 const MAX_BACKLOG_FRAMES: i64 = 2 * SAMPLE_RATE as i64;
 const HNS_PER_SECOND: i64 = 10_000_000;
 
-/// The extra audio track carrying every track mixed together, which players
-/// play by default (most only ever play one audio track).
-pub const MIX_TRACK: &str = "Mix";
+/// Everything playing on the default output device. Always a clip's last
+/// audio track, and the one players play by default (most only ever play
+/// one audio track).
+pub const DESKTOP_TRACK: &str = "Desktop";
 
 struct Chunk {
     /// Time of the first frame, in 48 kHz frames since the recorder started.
@@ -124,6 +125,10 @@ impl AudioShared {
         }
     }
 
+    pub(crate) fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
     }
@@ -189,40 +194,34 @@ impl AudioRing {
     }
 }
 
-/// Encoded rings for the mix (index 0) and each track, in order.
+/// Encoded rings for each track, in track order.
 pub(crate) type AudioRings = Arc<Mutex<Vec<AudioRing>>>;
 
 pub(crate) fn new_rings(track_count: usize, span: i64) -> AudioRings {
     // A second of slack so the audio always reaches back as far as the
     // keyframe-aligned video does.
     let span = span + HNS_PER_SECOND;
-    let rings = (0..=track_count).map(|_| AudioRing { frames: VecDeque::new(), span, bytes: 0 }).collect();
+    let rings = (0..track_count).map(|_| AudioRing { frames: VecDeque::new(), span, bytes: 0 }).collect();
     Arc::new(Mutex::new(rings))
 }
 
 /// Runs on the "moments-audio" thread until `shared` is stopped.
 pub(crate) fn run(shared: Arc<AudioShared>, rings: AudioRings) -> windows::core::Result<()> {
     let _mf = MfThread::init()?;
-    let mut encoders: Vec<AacEncoder> = (0..=shared.tracks.len()).map(|_| AacEncoder::new()).collect::<Result<_, _>>()?;
+    let mut encoders: Vec<AacEncoder> = shared.tracks.iter().map(|_| AacEncoder::new()).collect::<Result<_, _>>()?;
     let mut block = vec![0.0f32; BLOCK_FRAMES as usize * CHANNELS];
-    let mut mix = vec![0.0f32; block.len()];
     let mut pcm = vec![0i16; block.len()];
     let mut block_start = shared.now_frames();
 
     while shared.running.load(Ordering::Relaxed) {
         while block_start + BLOCK_FRAMES + LATENCY_FRAMES <= shared.now_frames() {
             let pts = block_start * HNS_PER_SECOND / SAMPLE_RATE as i64;
-            mix.fill(0.0);
             for (index, track) in shared.tracks.iter().enumerate() {
                 track.fifo.lock().unwrap().take_block(block_start, &mut block);
                 let volume = f32::from_bits(track.volume.load(Ordering::Relaxed));
-                for (sample, mixed) in block.iter_mut().zip(mix.iter_mut()) {
-                    *sample *= volume;
-                    *mixed += *sample;
-                }
-                encode_into(&mut encoders[index + 1], &block, &mut pcm, pts, &rings, index + 1)?;
+                block.iter_mut().for_each(|sample| *sample *= volume);
+                encode_into(&mut encoders[index], &block, &mut pcm, pts, &rings, index)?;
             }
-            encode_into(&mut encoders[0], &mix, &mut pcm, pts, &rings, 0)?;
             block_start += BLOCK_FRAMES;
         }
         std::thread::sleep(Duration::from_millis(10));

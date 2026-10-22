@@ -3,7 +3,8 @@
 //! Usage: clip_demo [seconds to record] [buffer seconds] [fps] [720|1080|1440|2160]
 //!
 //! Tracks: Game 440 Hz, Chat 880 Hz at 50% clip volume, Aux and Media
-//! silent, Mic 220 Hz; all tones at amplitude 0.5.
+//! silent, Mic 220 Hz; all tones at amplitude 0.5. The recorder adds the
+//! Desktop track itself, from whatever is playing on the default output.
 
 use std::time::{Duration, Instant};
 
