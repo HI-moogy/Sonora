@@ -2,8 +2,10 @@
 //! on the audio tracks, and saves a clip.
 //! Usage: clip_demo [seconds to record] [buffer seconds] [fps] [720|1080|1440|2160]
 //!
-//! Tracks: Game 440 Hz, Chat 880 Hz at 50% clip volume, Aux and Media
-//! silent, Mic 220 Hz; all tones at amplitude 0.5. The recorder adds the
+//! Saves to `CLIP_DIR` if set, else the default clips folder.
+//!
+//! Tracks: Game 440 Hz, Chat 880 Hz at 50% clip volume, Aux silent, Media
+//! 660 Hz, Mic 220 Hz; all tones at amplitude 0.5. The recorder adds the
 //! Desktop track itself, from whatever is playing on the default output.
 
 use std::time::{Duration, Instant};
@@ -40,7 +42,7 @@ fn main() {
 
     let input = recorder.audio_input();
     std::thread::spawn(move || {
-        let tones = [("Game", 440.0f32), ("Chat", 880.0), ("Aux", 0.0), ("Media", 0.0), ("Mic", 220.0)];
+        let tones = [("Game", 440.0f32), ("Chat", 880.0), ("Aux", 0.0), ("Media", 660.0), ("Mic", 220.0)];
         let mut phase = [0.0f32; 5];
         let chunk = 480; // 10 ms at 48 kHz
         let begun = Instant::now();
@@ -74,7 +76,7 @@ fn main() {
     }
 
     let save_started = Instant::now();
-    match recorder.save_clip(default_clips_dir()).recv().expect("save reply") {
+    match recorder.save_clip(std::env::var_os("CLIP_DIR").map(std::path::PathBuf::from).unwrap_or_else(default_clips_dir)).recv().expect("save reply") {
         Ok(path) => println!(
             "saved {} ({:.1} MB) in {:?}",
             path.display(),

@@ -8,9 +8,11 @@ mod convert;
 mod d3d;
 mod desktop;
 mod duplication;
+mod edit;
 mod encoder;
 mod h264;
 mod mux;
+mod preview;
 mod recorder;
 mod ring;
 
@@ -20,6 +22,8 @@ use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{FOLDERID_Videos, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 
 pub use audio::{AudioInput, DESKTOP_TRACK};
+pub use edit::{decode_clip_audio, save_edited_clip, ClipAudio, ClipEdit, EditError, TrackAudio};
+pub use preview::{PreviewFrame, VideoPreview};
 pub use recorder::{ClipSaver, Recorder, RecorderStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

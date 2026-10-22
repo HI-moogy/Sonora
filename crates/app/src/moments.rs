@@ -7,6 +7,7 @@ use capture_engine::{default_clips_dir, AudioInput, ClipSaver, Recorder, Resolut
 use common::MomentsConfig;
 use eframe::egui;
 
+use crate::clips::editor::{ClipEditor, EditorAction};
 use crate::clips::{self, ClipList, Thumbnails};
 use crate::hotkey::{self, GlobalHotkey};
 use crate::{sounds, FIXED_BUSES};
@@ -82,6 +83,8 @@ pub struct Moments {
     thumbnails: Thumbnails,
     last_scan: Option<Instant>,
     show_settings: bool,
+    /// The clip open in the editor, shown instead of the clip list.
+    editor: Option<ClipEditor>,
     ctx: egui::Context,
 }
 
@@ -99,6 +102,7 @@ impl Moments {
             thumbnails: Thumbnails::new(ctx),
             last_scan: None,
             show_settings: false,
+            editor: None,
             ctx: ctx.clone(),
         };
         *moments.shared.dir.lock().unwrap() = moments.clips_dir();
@@ -213,7 +217,14 @@ impl Moments {
                 egui::ScrollArea::vertical().show(ui, |ui| self.settings_ui(ui, mixer));
             });
         }
-        egui::CentralPanel::default().show(ui, |ui| self.clips_ui(ui));
+        egui::CentralPanel::default().show(ui, |ui| match &mut self.editor {
+            Some(editor) => match editor.ui(ui) {
+                EditorAction::None => {}
+                EditorAction::Close => self.editor = None,
+                EditorAction::Saved => self.last_scan = None,
+            },
+            None => self.clips_ui(ui),
+        });
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui, mixer: &Mixer) {
@@ -428,6 +439,7 @@ impl Moments {
         }
 
         let ctx = ui.ctx().clone();
+        let mut opened = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             // Top-aligned so cards line up even while thumbnails are still loading.
             ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP).with_main_wrap(true), |ui| {
@@ -443,8 +455,8 @@ impl Moments {
                                 ),
                                 None => ui.add_sized(CARD_THUMBNAIL, egui::Button::new("▶")),
                             };
-                            if thumbnail.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Play").clicked() {
-                                clips::play(&clip.path);
+                            if thumbnail.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open").clicked() {
+                                opened = Some(ClipEditor::open(&ctx, clip));
                             }
                             ui.label(clip.name.strip_prefix("sonar-rs ").unwrap_or(&clip.name));
                             ui.horizontal(|ui| {
@@ -462,5 +474,8 @@ impl Moments {
                 }
             });
         });
+        if opened.is_some() {
+            self.editor = opened;
+        }
     }
 }

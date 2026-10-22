@@ -20,6 +20,8 @@ use windows::Win32::UI::Shell::{
     FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, SIGDN_FILESYSPATH, SIIGBF_THUMBNAILONLY,
 };
 
+pub mod editor;
+
 /// Thumbnails are requested at this size; clips are always 16:9.
 pub const THUMBNAIL_SIZE: [i32; 2] = [320, 180];
 
