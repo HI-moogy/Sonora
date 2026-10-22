@@ -45,6 +45,7 @@ struct AvailableSession {
 enum Tab {
     Mixer,
     Moments,
+    Clips,
 }
 
 struct MixerApp {
@@ -179,11 +180,19 @@ impl eframe::App for MixerApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Mixer, "Mixer");
                 ui.selectable_value(&mut self.tab, Tab::Moments, "Moments");
+                ui.selectable_value(&mut self.tab, Tab::Clips, "Clips");
             });
         });
-        if self.tab == Tab::Moments {
-            egui::CentralPanel::default().show(ui, |ui| self.moments.ui(ui, &self.mixer));
-            return;
+        match self.tab {
+            Tab::Moments => {
+                egui::CentralPanel::default().show(ui, |ui| self.moments.ui(ui, &self.mixer));
+                return;
+            }
+            Tab::Clips => {
+                egui::CentralPanel::default().show(ui, |ui| self.moments.clips_ui(ui));
+                return;
+            }
+            Tab::Mixer => {}
         }
 
         let mic_already_added = sources.iter().any(|s| s.pid.is_none());

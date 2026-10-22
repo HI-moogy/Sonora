@@ -9,11 +9,13 @@ use eframe::egui;
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONHAND, MB_OK};
 
-use crate::clips::{self, ClipList};
+use crate::clips::{self, ClipList, Thumbnails};
 use crate::hotkey::{self, GlobalHotkey};
 use crate::FIXED_BUSES;
 
 const CLIP_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+/// On-screen size of a clip's thumbnail in the Clips tab.
+const CARD_THUMBNAIL: egui::Vec2 = egui::vec2(256.0, 144.0);
 
 /// Every audio track a clip has, in file order: one per bus, then desktop
 /// audio (the default track).
@@ -77,6 +79,7 @@ pub struct Moments {
     hotkey_error: Option<String>,
     capturing_hotkey: bool,
     clips: ClipList,
+    thumbnails: Thumbnails,
     last_scan: Option<Instant>,
     ctx: egui::Context,
 }
@@ -92,6 +95,7 @@ impl Moments {
             hotkey_error: None,
             capturing_hotkey: false,
             clips: ClipList::default(),
+            thumbnails: Thumbnails::new(ctx),
             last_scan: None,
             ctx: ctx.clone(),
         };
@@ -192,11 +196,6 @@ impl Moments {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, mixer: &Mixer) {
         let dir = self.clips_dir();
-        if self.last_scan.is_none_or(|at| at.elapsed() >= CLIP_SCAN_INTERVAL) {
-            self.clips.refresh(&dir);
-            self.last_scan = Some(Instant::now());
-        }
-
         ui.horizontal(|ui| {
             let mut enabled = self.config.enabled;
             if ui.checkbox(&mut enabled, egui::RichText::new("Record Moments").strong()).changed() {
@@ -227,7 +226,7 @@ impl Moments {
                         clips::play(&path);
                     }
                 });
-                // A new clip just landed; show it in the list right away.
+                // A new clip just landed; list it the next time the Clips tab shows.
                 if self.clips.entries.first().is_none_or(|newest| newest.path != path) {
                     self.last_scan = None;
                 }
@@ -324,20 +323,7 @@ impl Moments {
             }
 
             ui.label("Clips folder");
-            ui.horizontal(|ui| {
-                ui.label(dir.display().to_string());
-                if ui.button("Change…").clicked() {
-                    if let Some(picked) = clips::pick_folder(&dir) {
-                        self.config.clips_dir = Some(picked.clone());
-                        *self.shared.dir.lock().unwrap() = picked;
-                        self.persist();
-                        self.last_scan = None;
-                    }
-                }
-                if ui.button("Open").clicked() {
-                    clips::open_folder(&dir);
-                }
-            });
+            ui.weak(format!("{} (change it in the Clips tab)", dir.display()));
             ui.end_row();
         });
 
@@ -365,14 +351,49 @@ impl Moments {
             }
         });
 
-        ui.separator();
+    }
+
+    /// The Clips tab: where clips are saved, and every saved clip as a
+    /// thumbnail you click to play.
+    pub fn clips_ui(&mut self, ui: &mut egui::Ui) {
+        let dir = self.clips_dir();
+        if self.last_scan.is_none_or(|at| at.elapsed() >= CLIP_SCAN_INTERVAL) {
+            self.clips.refresh(&dir);
+            self.thumbnails.retain(&self.clips.entries);
+            self.last_scan = Some(Instant::now());
+        }
+
         ui.horizontal(|ui| {
-            ui.strong(format!("Clips ({})", self.clips.entries.len()));
-            if ui.small_button("Refresh").clicked() {
+            ui.heading("Clips");
+            let total: u64 = self.clips.entries.iter().map(|clip| clip.size).sum();
+            let count = self.clips.entries.len();
+            ui.weak(format!("{count} clip{} · {}", if count == 1 { "" } else { "s" }, clips::format_size(total)));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Saved to");
+            ui.strong(dir.display().to_string());
+            if ui.button("Open folder").clicked() {
+                clips::open_folder(&dir);
+            }
+            if ui.button("Change folder…").clicked() {
+                if let Some(picked) = clips::pick_folder(&dir) {
+                    self.config.clips_dir = Some(picked.clone());
+                    *self.shared.dir.lock().unwrap() = picked;
+                    self.persist();
+                    self.last_scan = None;
+                }
+            }
+            if self.config.clips_dir.is_some() && ui.button("Use default").clicked() {
+                self.config.clips_dir = None;
+                *self.shared.dir.lock().unwrap() = default_clips_dir();
+                self.persist();
                 self.last_scan = None;
             }
         });
+        ui.separator();
+
         if self.clips.entries.is_empty() {
+            ui.add_space(12.0);
             ui.weak(format!(
                 "No clips yet. Press {} right after something happens to save the last {}.",
                 hotkey::label(self.config.hotkey),
@@ -380,19 +401,39 @@ impl Moments {
             ));
             return;
         }
-        egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
-            egui::Grid::new("moments-clips").num_columns(5).striped(true).spacing([16.0, 6.0]).show(ui, |ui| {
+
+        let ctx = ui.ctx().clone();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // Top-aligned so cards line up even while thumbnails are still loading.
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP).with_main_wrap(true), |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
                 for clip in &self.clips.entries {
-                    ui.label(&clip.name);
-                    ui.label(clip.duration.map(clips::format_duration).unwrap_or_else(|| "?".into()));
-                    ui.label(clips::format_size(clip.size));
-                    if ui.small_button("Play").clicked() {
-                        clips::play(&clip.path);
-                    }
-                    if ui.small_button("Show in folder").clicked() {
-                        clips::show_in_folder(&clip.path);
-                    }
-                    ui.end_row();
+                    ui.allocate_ui(egui::vec2(CARD_THUMBNAIL.x, CARD_THUMBNAIL.y + 48.0), |ui| {
+                        ui.vertical(|ui| {
+                            let thumbnail = match self.thumbnails.get(&ctx, clip) {
+                                Some(texture) => ui.add(
+                                    egui::Image::new((texture.id(), CARD_THUMBNAIL))
+                                        .corner_radius(4.0)
+                                        .sense(egui::Sense::click()),
+                                ),
+                                None => ui.add_sized(CARD_THUMBNAIL, egui::Button::new("▶")),
+                            };
+                            if thumbnail.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Play").clicked() {
+                                clips::play(&clip.path);
+                            }
+                            ui.label(clip.name.strip_prefix("sonar-rs ").unwrap_or(&clip.name));
+                            ui.horizontal(|ui| {
+                                ui.weak(format!(
+                                    "{} · {}",
+                                    clip.duration.map(clips::format_duration).unwrap_or_else(|| "?".into()),
+                                    clips::format_size(clip.size)
+                                ));
+                                if ui.small_button("Show in folder").clicked() {
+                                    clips::show_in_folder(&clip.path);
+                                }
+                            });
+                        });
+                    });
                 }
             });
         });
