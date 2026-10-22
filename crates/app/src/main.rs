@@ -11,6 +11,7 @@ mod clips;
 mod hotkey;
 mod moments;
 mod single_instance;
+mod sounds;
 
 use moments::Moments;
 
@@ -44,7 +45,6 @@ struct AvailableSession {
 #[derive(PartialEq, Eq)]
 enum Tab {
     Mixer,
-    Moments,
     Clips,
 }
 
@@ -179,20 +179,12 @@ impl eframe::App for MixerApp {
         egui::Panel::top("tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Mixer, "Mixer");
-                ui.selectable_value(&mut self.tab, Tab::Moments, "Moments");
                 ui.selectable_value(&mut self.tab, Tab::Clips, "Clips");
             });
         });
-        match self.tab {
-            Tab::Moments => {
-                egui::CentralPanel::default().show(ui, |ui| self.moments.ui(ui, &self.mixer));
-                return;
-            }
-            Tab::Clips => {
-                egui::CentralPanel::default().show(ui, |ui| self.moments.clips_ui(ui));
-                return;
-            }
-            Tab::Mixer => {}
+        if self.tab == Tab::Clips {
+            self.moments.tab(ui, &self.mixer);
+            return;
         }
 
         let mic_already_added = sources.iter().any(|s| s.pid.is_none());

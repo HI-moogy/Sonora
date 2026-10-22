@@ -6,12 +6,10 @@ use audio_engine::{BusTap, Mixer};
 use capture_engine::{default_clips_dir, AudioInput, ClipSaver, Recorder, Resolution, VideoSettings, DESKTOP_TRACK};
 use common::MomentsConfig;
 use eframe::egui;
-use windows::Win32::System::Diagnostics::Debug::MessageBeep;
-use windows::Win32::UI::WindowsAndMessaging::{MB_ICONHAND, MB_OK};
 
 use crate::clips::{self, ClipList, Thumbnails};
 use crate::hotkey::{self, GlobalHotkey};
-use crate::FIXED_BUSES;
+use crate::{sounds, FIXED_BUSES};
 
 const CLIP_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 /// On-screen size of a clip's thumbnail in the Clips tab.
@@ -62,8 +60,10 @@ impl Shared {
     /// Records the outcome and confirms it audibly, since you're usually in
     /// a game rather than looking at sonar-rs when you save.
     fn finish(&self, ctx: &egui::Context, result: Result<PathBuf, String>) {
-        unsafe {
-            let _ = MessageBeep(if result.is_ok() { MB_OK } else { MB_ICONHAND });
+        if result.is_ok() {
+            sounds::clip_saved();
+        } else {
+            sounds::clip_failed();
         }
         *self.last_result.lock().unwrap() = Some(result);
         ctx.request_repaint();
@@ -81,6 +81,7 @@ pub struct Moments {
     clips: ClipList,
     thumbnails: Thumbnails,
     last_scan: Option<Instant>,
+    show_settings: bool,
     ctx: egui::Context,
 }
 
@@ -97,6 +98,7 @@ impl Moments {
             clips: ClipList::default(),
             thumbnails: Thumbnails::new(ctx),
             last_scan: None,
+            show_settings: false,
             ctx: ctx.clone(),
         };
         *moments.shared.dir.lock().unwrap() = moments.clips_dir();
@@ -194,8 +196,27 @@ impl Moments {
         (self.video_settings().bitrate() as u64 + audio_bits) / 8 * self.config.buffer_secs as u64
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, mixer: &Mixer) {
-        let dir = self.clips_dir();
+    /// The Clips tab: clips fill the tab; the gear opens clip settings in a
+    /// side panel.
+    pub fn tab(&mut self, ui: &mut egui::Ui, mixer: &Mixer) {
+        if self.show_settings {
+            egui::Panel::right("clip-settings").min_size(430.0).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Clip settings");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("✕").on_hover_text("Close settings").clicked() {
+                            self.show_settings = false;
+                        }
+                    });
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| self.settings_ui(ui, mixer));
+            });
+        }
+        egui::CentralPanel::default().show(ui, |ui| self.clips_ui(ui));
+    }
+
+    fn settings_ui(&mut self, ui: &mut egui::Ui, mixer: &Mixer) {
         ui.horizontal(|ui| {
             let mut enabled = self.config.enabled;
             if ui.checkbox(&mut enabled, egui::RichText::new("Record Moments").strong()).changed() {
@@ -211,31 +232,6 @@ impl Moments {
                 ui.label(text);
             }
         });
-        ui.horizontal(|ui| {
-            if ui.add_enabled(self.recorder.is_some(), egui::Button::new("Save clip")).clicked() {
-                self.shared.save(ui.ctx());
-            }
-            ui.weak(format!("or press {} anywhere", hotkey::label(self.config.hotkey)));
-        });
-        let saved = self.shared.last_result.lock().unwrap().clone();
-        match saved {
-            Some(Ok(path)) => {
-                ui.horizontal(|ui| {
-                    ui.label(format!("Saved {}", path.file_name().unwrap_or_default().to_string_lossy()));
-                    if ui.small_button("Play").clicked() {
-                        clips::play(&path);
-                    }
-                });
-                // A new clip just landed; list it the next time the Clips tab shows.
-                if self.clips.entries.first().is_none_or(|newest| newest.path != path) {
-                    self.last_scan = None;
-                }
-            }
-            Some(Err(error)) => {
-                ui.colored_label(ERROR_COLOR, format!("Couldn't save clip: {error}"));
-            }
-            None => {}
-        }
         ui.separator();
 
         egui::Grid::new("moments-settings").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
@@ -321,10 +317,6 @@ impl Moments {
                 ui.colored_label(ERROR_COLOR, error);
                 ui.end_row();
             }
-
-            ui.label("Clips folder");
-            ui.weak(format!("{} (change it in the Clips tab)", dir.display()));
-            ui.end_row();
         });
 
         ui.separator();
@@ -353,10 +345,17 @@ impl Moments {
 
     }
 
-    /// The Clips tab: where clips are saved, and every saved clip as a
-    /// thumbnail you click to play.
-    pub fn clips_ui(&mut self, ui: &mut egui::Ui) {
+    /// Where clips are saved, the recording status, and every saved clip as
+    /// a thumbnail you click to play.
+    fn clips_ui(&mut self, ui: &mut egui::Ui) {
         let dir = self.clips_dir();
+        let last_result = self.shared.last_result.lock().unwrap().clone();
+        // A clip saved from the hotkey shows up right away, not on the next scan.
+        if let Some(Ok(path)) = &last_result {
+            if self.clips.entries.first().is_none_or(|newest| &newest.path != path) {
+                self.last_scan = None;
+            }
+        }
         if self.last_scan.is_none_or(|at| at.elapsed() >= CLIP_SCAN_INTERVAL) {
             self.clips.refresh(&dir);
             self.thumbnails.retain(&self.clips.entries);
@@ -368,7 +367,33 @@ impl Moments {
             let total: u64 = self.clips.entries.iter().map(|clip| clip.size).sum();
             let count = self.clips.entries.len();
             ui.weak(format!("{count} clip{} · {}", if count == 1 { "" } else { "s" }, clips::format_size(total)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let gear = ui
+                    .add(egui::Button::new(egui::RichText::new("⚙").size(18.0)).selected(self.show_settings))
+                    .on_hover_text("Clip settings");
+                if gear.clicked() {
+                    self.show_settings = !self.show_settings;
+                }
+                if ui.add_enabled(self.recorder.is_some(), egui::Button::new("Save clip")).clicked() {
+                    self.shared.save(ui.ctx());
+                }
+            });
         });
+        let (status, is_error) = self.status();
+        if is_error {
+            ui.colored_label(ERROR_COLOR, status);
+        } else if self.recorder.is_some() {
+            ui.weak(format!(
+                "Recording the last {} · press {} anywhere to save it",
+                clips::format_duration(Duration::from_secs(self.config.buffer_secs as u64)),
+                hotkey::label(self.config.hotkey),
+            ));
+        } else {
+            ui.weak("Recording is off. Turn it on in ⚙ settings.");
+        }
+        if let Some(Err(error)) = &last_result {
+            ui.colored_label(ERROR_COLOR, format!("Couldn't save the last clip: {error}"));
+        }
         ui.horizontal(|ui| {
             ui.label("Saved to");
             ui.strong(dir.display().to_string());
