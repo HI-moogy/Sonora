@@ -7,7 +7,12 @@ use audio_engine::{
 };
 use eframe::egui;
 
+mod clips;
+mod hotkey;
+mod moments;
 mod single_instance;
+
+use moments::Moments;
 
 /// The five channels always shown as faders, matching SteelSeries Sonar's
 /// own channel naming plus a dedicated Mic channel.
@@ -36,8 +41,16 @@ struct AvailableSession {
     name: String,
 }
 
+#[derive(PartialEq, Eq)]
+enum Tab {
+    Mixer,
+    Moments,
+}
+
 struct MixerApp {
     mixer: Mixer,
+    moments: Moments,
+    tab: Tab,
     available_sessions: Vec<AvailableSession>,
     last_session_refresh: Instant,
     output_devices: Vec<OutputDevice>,
@@ -52,13 +65,16 @@ impl MixerApp {
     // calls work fine under that apartment, so this thread doesn't need its
     // own ComGuard. Only the mixer's dedicated capture/render threads need
     // (and independently set up) their own COM apartment.
-    fn new() -> windows::core::Result<Self> {
+    fn new(ctx: &egui::Context) -> windows::core::Result<Self> {
         let mixer = Mixer::start()?;
         for bus in FIXED_BUSES {
             mixer.ensure_bus(bus);
         }
+        let moments = Moments::new(ctx, &mixer);
         Ok(Self {
             mixer,
+            moments,
+            tab: Tab::Mixer,
             available_sessions: Vec::new(),
             last_session_refresh: Instant::now() - SESSION_REFRESH_INTERVAL,
             output_devices: Vec::new(),
@@ -158,6 +174,18 @@ impl eframe::App for MixerApp {
         } else {
             IDLE_REPAINT_INTERVAL
         });
+
+        egui::Panel::top("tabs").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Mixer, "Mixer");
+                ui.selectable_value(&mut self.tab, Tab::Moments, "Moments");
+            });
+        });
+        if self.tab == Tab::Moments {
+            egui::CentralPanel::default().show(ui, |ui| self.moments.ui(ui, &self.mixer));
+            return;
+        }
+
         let mic_already_added = sources.iter().any(|s| s.pid.is_none());
         let active_pids: HashSet<u32> = sources.iter().filter_map(|s| s.pid).collect();
 
@@ -307,8 +335,8 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         single_instance::WINDOW_TITLE,
         options,
-        Box::new(|_cc| {
-            let app = MixerApp::new().expect("failed to start audio mixer");
+        Box::new(|cc| {
+            let app = MixerApp::new(&cc.egui_ctx).expect("failed to start audio mixer");
             Ok(Box::new(app))
         }),
     )

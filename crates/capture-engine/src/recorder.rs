@@ -24,6 +24,26 @@ const AUDIO_CATCH_UP: Duration = Duration::from_millis(250);
 
 enum Command {
     Save { dir: PathBuf, reply: Sender<Result<PathBuf, SaveError>> },
+    Stop,
+}
+
+/// A cheap, cloneable handle for saving clips from any thread (e.g. a
+/// global hotkey listener). Saves after the recorder stops fail with
+/// [`SaveError::Stopped`].
+#[derive(Clone)]
+pub struct ClipSaver(Sender<Command>);
+
+impl ClipSaver {
+    /// Saves the buffered video and audio to a new MP4 in `dir`. The file is
+    /// written on a background thread; the receiver yields its path once
+    /// complete.
+    pub fn save(&self, dir: impl Into<PathBuf>) -> Receiver<Result<PathBuf, SaveError>> {
+        let (reply, result) = mpsc::channel();
+        if self.0.send(Command::Save { dir: dir.into(), reply: reply.clone() }).is_err() {
+            let _ = reply.send(Err(SaveError::Stopped));
+        }
+        result
+    }
 }
 
 /// Live numbers for the UI.
@@ -55,7 +75,7 @@ impl RecorderStatus {
 /// audio tracks fed through [`Recorder::audio_input`] into rolling in-memory
 /// buffers. Dropping it stops recording.
 pub struct Recorder {
-    commands: Option<Sender<Command>>,
+    commands: Sender<Command>,
     worker: Option<JoinHandle<()>>,
     audio: Arc<AudioShared>,
     audio_worker: Option<JoinHandle<()>>,
@@ -92,7 +112,7 @@ impl Recorder {
             .spawn(move || run(settings, epoch, rings, command_rx, ready_tx, worker_status))
             .expect("spawn moments video thread");
         let recorder = Self {
-            commands: Some(commands),
+            commands,
             worker: Some(worker),
             audio,
             audio_worker: Some(audio_worker),
@@ -118,22 +138,20 @@ impl Recorder {
         &self.status
     }
 
-    /// Saves the buffered video to a new MP4 in `dir`. The file is written on
-    /// a background thread; the receiver yields its path once complete.
+    pub fn saver(&self) -> ClipSaver {
+        ClipSaver(self.commands.clone())
+    }
+
+    /// See [`ClipSaver::save`].
     pub fn save_clip(&self, dir: impl Into<PathBuf>) -> Receiver<Result<PathBuf, SaveError>> {
-        let (reply, result) = mpsc::channel();
-        let command = Command::Save { dir: dir.into(), reply: reply.clone() };
-        if self.commands.as_ref().map(|c| c.send(command)).is_none_or(|sent| sent.is_err()) {
-            let _ = reply.send(Err(SaveError::Stopped));
-        }
-        result
+        self.saver().save(dir)
     }
 }
 
 impl Drop for Recorder {
     fn drop(&mut self) {
-        // Closing the channel tells the video worker to stop.
-        self.commands = None;
+        // An explicit stop: ClipSaver clones may keep the channel open.
+        let _ = self.commands.send(Command::Stop);
         self.audio.stop();
         for worker in [self.worker.take(), self.audio_worker.take()].into_iter().flatten() {
             let _ = worker.join();
@@ -230,7 +248,7 @@ impl Session {
             match commands.try_recv() {
                 Ok(Command::Save { dir, reply }) => self.save(settings, dir, reply),
                 Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => return Ok(()),
+                Ok(Command::Stop) | Err(TryRecvError::Disconnected) => return Ok(()),
             }
 
             // Sleep until the next frame is due, then take only the latest

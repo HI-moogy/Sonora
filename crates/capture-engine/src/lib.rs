@@ -19,7 +19,7 @@ use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{FOLDERID_Videos, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 
 pub use audio::{AudioInput, MIX_TRACK};
-pub use recorder::{Recorder, RecorderStatus};
+pub use recorder::{ClipSaver, Recorder, RecorderStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {
@@ -103,6 +103,15 @@ pub enum SaveError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Mp4(#[from] mp4::Error),
+}
+
+/// A saved clip's length, read from its MP4 header (cheap: the media data
+/// isn't read). `None` if the file isn't a readable MP4.
+pub fn clip_duration(path: &std::path::Path) -> Option<std::time::Duration> {
+    let file = std::fs::File::open(path).ok()?;
+    let size = file.metadata().ok()?.len();
+    let reader = mp4::Mp4Reader::read_header(std::io::BufReader::new(file), size).ok()?;
+    Some(reader.duration())
 }
 
 /// `Videos\sonar-rs`, the default place clips are saved.

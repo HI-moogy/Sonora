@@ -116,14 +116,21 @@ fn analyze_audio(reader: &IMFSourceReader, stream: u32) -> windows::core::Result
         unsafe { buffer.Unlock()? };
     }
     let secs = left.len() as f64 / 48_000.0;
-    // Skip the encoder's start-up silence when judging level and pitch.
-    let body = &left[left.len().min(4_800)..];
-    let rms = (body.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / body.len().max(1) as f64).sqrt();
-    let crossings = body.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count();
-    let pitch = crossings as f64 / 2.0 / (body.len() as f64 / 48_000.0).max(1e-9);
+    // Judge level and pitch over the non-silent 10 ms blocks only, so a tone
+    // that covers part of a clip still reads correctly.
+    let active: Vec<f32> = left
+        .chunks(480)
+        .filter(|block| block.iter().any(|s| s.abs() > 1e-3))
+        .flatten()
+        .copied()
+        .collect();
+    let rms = (active.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / active.len().max(1) as f64).sqrt();
+    let crossings = active.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count();
+    let pitch = crossings as f64 / 2.0 / (active.len() as f64 / 48_000.0).max(1e-9);
     println!(
-        "audio stream {stream}: {secs:.3}s, first sample at {:.3}s, RMS {rms:.3}, ~{pitch:.0} Hz",
-        first_ts.unwrap_or(0) as f64 / 1e7
+        "audio stream {stream}: {secs:.3}s, first sample at {:.3}s, non-silent {:.1}s, RMS {rms:.3}, ~{pitch:.0} Hz",
+        first_ts.unwrap_or(0) as f64 / 1e7,
+        active.len() as f64 / 48_000.0,
     );
     Ok(())
 }
