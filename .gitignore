@@ -1,0 +1,7 @@
+/target
+
+# Separate git repo (fork of microsoft/Windows-driver-samples, branch sonar-rs).
+/driver/windows-driver-samples/
+
+# Windows ISO and Media Creation Tool for the test VM.
+/driver/vm-setup/
