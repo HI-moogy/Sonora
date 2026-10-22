@@ -29,6 +29,9 @@ const BUS_COLORS: [egui::Color32; 5] = [
 
 const SESSION_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
 const DEVICE_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+/// How often to retry restoring apps a crashed run left turned down, for
+/// apps that weren't running yet the last time.
+const ROUTE_RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Redraw rate while any meter is moving vs. while everything is silent.
 /// egui still repaints immediately on input, so the idle rate only bounds
@@ -56,6 +59,7 @@ struct MixerApp {
     last_session_refresh: Instant,
     output_devices: Vec<OutputDevice>,
     last_device_refresh: Instant,
+    last_route_recovery: Instant,
     selected_bus: Option<String>,
     save_status: Option<String>,
 }
@@ -80,6 +84,7 @@ impl MixerApp {
             last_session_refresh: Instant::now() - SESSION_REFRESH_INTERVAL,
             output_devices: Vec::new(),
             last_device_refresh: Instant::now() - DEVICE_REFRESH_INTERVAL,
+            last_route_recovery: Instant::now(),
             selected_bus: None,
             save_status: None,
         })
@@ -163,6 +168,10 @@ impl eframe::App for MixerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.refresh_sessions();
         self.refresh_devices();
+        if self.last_route_recovery.elapsed() >= ROUTE_RECOVERY_INTERVAL {
+            self.last_route_recovery = Instant::now();
+            self.mixer.recover_routed_volumes();
+        }
 
         let buses = self.mixer.buses();
         let sources = self.mixer.sources();

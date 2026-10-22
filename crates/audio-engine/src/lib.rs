@@ -6,6 +6,7 @@ pub mod loopback;
 pub mod mic;
 pub mod mixer;
 pub mod passthrough;
+pub mod process_tree;
 pub mod render;
 pub mod session_volume;
 pub mod sessions;

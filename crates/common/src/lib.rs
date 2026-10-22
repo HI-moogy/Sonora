@@ -76,12 +76,40 @@ impl Default for Hotkey {
     }
 }
 
-fn config_path() -> PathBuf {
+/// `%APPDATA%\sonar-rs`, where every sonar-rs settings file lives.
+pub fn config_dir() -> PathBuf {
     let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    let mut path = PathBuf::from(base);
-    path.push("sonar-rs");
-    path.push("presets.json");
-    path
+    PathBuf::from(base).join("sonar-rs")
+}
+
+fn config_path() -> PathBuf {
+    config_dir().join("presets.json")
+}
+
+/// Apps whose own volume sonar-rs turned down to route them through the
+/// mixer, with the volume each had before (keyed by lowercase executable
+/// name). Kept on disk so a crash can't leave an app near-silent: Windows
+/// remembers per-app volumes, so the next run restores leftovers.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoutedApps {
+    pub original_volumes: HashMap<String, f32>,
+}
+
+fn routed_apps_path() -> PathBuf {
+    config_dir().join("routed-apps.json")
+}
+
+pub fn load_routed_apps() -> RoutedApps {
+    std::fs::read_to_string(routed_apps_path())
+        .ok()
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_routed_apps(apps: &RoutedApps) -> std::io::Result<()> {
+    std::fs::create_dir_all(config_dir())?;
+    let json = serde_json::to_string_pretty(apps).map_err(std::io::Error::other)?;
+    std::fs::write(routed_apps_path(), json)
 }
 
 /// Loads saved presets from disk, or an empty set if none have been saved

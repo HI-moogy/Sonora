@@ -1,58 +1,178 @@
-use windows::core::Interface;
-use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator,
-    ISimpleAudioVolume, MMDeviceEnumerator,
-};
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+//! Silencing an app's own output while the mixer plays its captured copy.
+//!
+//! Windows' per-app (process-loopback) capture is taken *after* the app's
+//! session volume and mute. Muting an app therefore silences its capture
+//! too, but turning it down only scales the capture: measured, a session at
+//! 0.01% captures at exactly 1/10,000 of full and boosting it 10,000×
+//! restores the original. So routed apps are turned down to
+//! [`ROUTED_VOLUME`] (inaudible) and the mixer boosts their capture by
+//! [`ROUTED_BOOST`].
+//!
+//! Windows remembers per-app volumes across restarts, so each routed app's
+//! original volume is also kept on disk ([`common::RoutedApps`]); if sonar-rs
+//! exits without restoring it (crash, killed), [`recover`] puts it back.
 
-/// Windows' process-loopback capture is a non-destructive tap: capturing a
-/// process's audio does not stop that process from also playing it through
-/// its own, real audio session exactly as before. Controlling what the
-/// user actually hears for a captured app therefore requires separately
-/// controlling that app's own session here — the same mechanism Windows'
-/// own Volume Mixer uses — not just adjusting our own captured copy.
-fn find_session_volume(pid: u32) -> windows::core::Result<Option<ISimpleAudioVolume>> {
-    unsafe {
-        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
-        let manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
-        let session_list = manager.GetSessionEnumerator()?;
-        let count = session_list.GetCount()?;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
-        for i in 0..count {
-            let control = session_list.GetSession(i)?;
-            let control2: IAudioSessionControl2 = control.cast()?;
-            if control2.GetProcessId().unwrap_or(0) == pid {
-                return Ok(Some(control2.cast()?));
+use common::RoutedApps;
+use windows::core::{Interface, Result};
+use windows::Win32::Media::Audio::ISimpleAudioVolume;
+
+use crate::sessions::{process_executable_name, visit_sessions};
+
+/// Session volume routed apps are turned down to: −80 dB, inaudible.
+pub const ROUTED_VOLUME: f32 = 1e-4;
+/// Gain that brings a routed app's capture back to its original level.
+pub const ROUTED_BOOST: f32 = 1.0 / ROUTED_VOLUME;
+
+/// The on-disk record, cached so the per-tick routing check doesn't read it.
+static ROUTED_APPS: Mutex<Option<RoutedApps>> = Mutex::new(None);
+
+fn with_routed_apps<R>(change: impl FnOnce(&mut RoutedApps) -> (R, bool)) -> R {
+    let mut cache = ROUTED_APPS.lock().unwrap();
+    let apps = cache.get_or_insert_with(common::load_routed_apps);
+    let (result, changed) = change(apps);
+    if changed {
+        let _ = common::save_routed_apps(apps);
+    }
+    result
+}
+
+fn is_routed(volume: f32) -> bool {
+    (volume - ROUTED_VOLUME).abs() <= ROUTED_VOLUME * 0.01
+}
+
+fn app_key(pid: u32) -> Option<String> {
+    process_executable_name(pid).map(|name| name.to_lowercase())
+}
+
+/// Every audio session owned by a process in `pids` (or by any process, for
+/// `None`), on every active output device, with its owner's pid.
+fn sessions(pids: Option<&HashSet<u32>>) -> Result<Vec<(u32, ISimpleAudioVolume)>> {
+    let mut found = Vec::new();
+    visit_sessions(|control| {
+        let Ok(pid) = (unsafe { control.GetProcessId() }) else {
+            return;
+        };
+        if pid != 0 && pids.is_none_or(|pids| pids.contains(&pid)) {
+            if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
+                found.push((pid, volume));
             }
         }
-        Ok(None)
+    })?;
+    Ok(found)
+}
+
+/// Turns every session of the processes in `pids` (an app's audio
+/// processes) down to [`ROUTED_VOLUME`], recording each process's original
+/// volume first (once). Returns whether every session now reads back at
+/// [`ROUTED_VOLUME`], i.e. whether the app's capture can safely be boosted;
+/// false if it has no sessions.
+pub fn route(pids: &HashSet<u32>) -> bool {
+    let Ok(sessions) = sessions(Some(pids)) else {
+        return false;
+    };
+    if sessions.is_empty() {
+        return false;
+    }
+    for &pid in pids {
+        let Some(key) = app_key(pid) else { continue };
+        with_routed_apps(|apps| {
+            if apps.original_volumes.contains_key(&key) {
+                return ((), false);
+            }
+            // A session already at the routed level was left that way by
+            // an earlier run; its real original is unknown, so use full.
+            let original = sessions
+                .iter()
+                .filter(|(owner, _)| *owner == pid)
+                .filter_map(|(_, v)| unsafe { v.GetMasterVolume() }.ok())
+                .find(|&v| !is_routed(v))
+                .unwrap_or(1.0);
+            apps.original_volumes.insert(key, original);
+            ((), true)
+        });
+    }
+    let mut all_routed = true;
+    for (_, volume) in &sessions {
+        unsafe {
+            if !volume.GetMasterVolume().is_ok_and(is_routed) {
+                let _ = volume.SetMasterVolume(ROUTED_VOLUME, std::ptr::null());
+            }
+            all_routed &= volume.GetMasterVolume().is_ok_and(is_routed);
+        }
+    }
+    all_routed
+}
+
+/// Puts the sessions of the processes in `pids` back to the volume each
+/// had before [`route`].
+pub fn unroute(pids: &HashSet<u32>) {
+    let keys: HashMap<u32, String> = pids
+        .iter()
+        .filter_map(|&pid| Some((pid, app_key(pid)?)))
+        .collect();
+    // Several processes can share an executable, and so a record.
+    let originals: HashMap<String, f32> = with_routed_apps(|apps| {
+        let originals = keys
+            .values()
+            .filter_map(|key| Some((key.clone(), *apps.original_volumes.get(key)?)))
+            .collect();
+        apps.original_volumes
+            .retain(|key, _| !keys.values().any(|k| k == key));
+        (originals, true)
+    });
+    if let Ok(sessions) = sessions(Some(pids)) {
+        for (pid, volume) in sessions {
+            unsafe {
+                let original = keys
+                    .get(&pid)
+                    .and_then(|key| originals.get(key))
+                    .copied()
+                    .unwrap_or(1.0);
+                let _ = volume.SetMasterVolume(original, std::ptr::null());
+            }
+        }
     }
 }
 
-/// Mutes or unmutes `pid`'s own Windows audio session directly (not our
-/// captured copy of it). Silently does nothing if the process currently
-/// has no active session (e.g. not playing anything right now) rather than
-/// erroring, since that's a normal, transient state.
-pub fn set_session_muted(pid: u32, muted: bool) {
-    match find_session_volume(pid) {
-        Ok(Some(volume)) => unsafe {
-            let _ = volume.SetMute(muted, std::ptr::null());
-        },
-        Ok(None) => {}
-        Err(error) => eprintln!("session_volume: failed to look up session for pid {pid}: {error:?}"),
+/// Restores apps an earlier run left turned down (it crashed or was
+/// killed). Apps in `routed_now` are being routed and are left alone; apps
+/// that aren't running keep their record until they are.
+pub fn recover(routed_now: &[u32]) {
+    let pending = with_routed_apps(|apps| (apps.original_volumes.clone(), false));
+    if pending.is_empty() {
+        return;
+    }
+    let active: HashSet<String> = routed_now.iter().filter_map(|&pid| app_key(pid)).collect();
+    let Ok(sessions) = sessions(None) else { return };
+    let mut restored = HashSet::new();
+    for (pid, volume) in sessions {
+        let Some(key) = app_key(pid) else { continue };
+        let Some(&original) = pending.get(&key) else {
+            continue;
+        };
+        if active.contains(&key) {
+            continue;
+        }
+        unsafe {
+            if volume.GetMasterVolume().is_ok_and(is_routed) {
+                let _ = volume.SetMasterVolume(original, std::ptr::null());
+            }
+        }
+        restored.insert(key);
+    }
+    if !restored.is_empty() {
+        with_routed_apps(|apps| {
+            apps.original_volumes
+                .retain(|key, _| !restored.contains(key));
+            ((), true)
+        });
     }
 }
 
-/// Sets `pid`'s own Windows session volume directly, in `[0.0, 1.0]`
-/// (Windows sessions can't be boosted past 100% this way, unlike our
-/// internal mixer gain).
-pub fn set_session_volume(pid: u32, level: f32) {
-    match find_session_volume(pid) {
-        Ok(Some(volume)) => unsafe {
-            let _ = volume.SetMasterVolume(level.clamp(0.0, 1.0), std::ptr::null());
-        },
-        Ok(None) => {}
-        Err(error) => eprintln!("session_volume: failed to look up session for pid {pid}: {error:?}"),
-    }
+/// Whether any app's original volume is still recorded (cheap: no I/O).
+pub fn has_pending_routes() -> bool {
+    with_routed_apps(|apps| (!apps.original_volumes.is_empty(), false))
 }

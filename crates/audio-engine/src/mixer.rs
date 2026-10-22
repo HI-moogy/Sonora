@@ -1,7 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::{Error, Result};
 use windows::Win32::Foundation::{CloseHandle, E_INVALIDARG, E_UNEXPECTED, HANDLE, WAIT_OBJECT_0};
@@ -17,8 +17,10 @@ use crate::com::ComGuard;
 use crate::eq::{EqBands, EQ_BAND_COUNT};
 use crate::loopback::{activate_process_loopback_client, standard_format};
 use crate::mic::run_mic_capture_thread;
+use crate::process_tree::ProcessTree;
 use crate::render::open_render_client_for_device;
-use crate::session_volume;
+use crate::session_volume::{self, ROUTED_BOOST, ROUTED_VOLUME};
+use crate::sessions::session_owners;
 
 const CAPTURE_BUFFER_DURATION_100NS: i64 = 2_000_000;
 const CHANNELS: usize = 2;
@@ -26,6 +28,20 @@ const SAMPLE_RATE: f32 = 48_000.0;
 /// Bounds how far a source's buffer can grow if the render thread falls
 /// behind, so a stalled render loop can't leak memory indefinitely.
 pub(crate) const MAX_BUFFERED_SAMPLES: usize = 48_000 * CHANNELS * 2;
+/// How often a routed app's sessions are checked and turned down again
+/// (apps create new sessions as they go, e.g. browsers per tab).
+const ROUTE_ENFORCE_INTERVAL: Duration = Duration::from_millis(100);
+/// How often an app's audio processes are looked up again, since helper
+/// processes come and go (see [`crate::process_tree`]).
+const APP_RESCAN_INTERVAL: Duration = Duration::from_secs(1);
+/// A turned-down app can't produce samples above `ROUTED_VOLUME` times its
+/// own peak; apps with hot float output can exceed full scale a little, so
+/// allow this much before treating a packet as not turned down.
+const ROUTED_HEADROOM: f32 = 2.0;
+/// After capturing audio that wasn't turned down despite every session
+/// reading back as turned down (audio we can't reach, e.g. a child process),
+/// don't boost again for this long.
+const BOOST_BLOCK: Duration = Duration::from_secs(2);
 
 pub(crate) struct SourceInner {
     /// `None` for the microphone source, which has no owning process.
@@ -37,6 +53,22 @@ pub(crate) struct SourceInner {
     pub(crate) level: AtomicF32,
     pub(crate) samples: Mutex<VecDeque<f32>>,
     pub(crate) stop: Arc<AtomicBool>,
+    /// The app's audio processes currently turned down. Held while turning
+    /// them down or restoring them, so removal can't race with the capture
+    /// thread turning them down again.
+    routed: Mutex<HashSet<u32>>,
+}
+
+impl SourceInner {
+    /// Stops capturing and, for an app, gives it back its own volume.
+    fn stop_and_restore(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if self.pid.is_some() {
+            let mut routed = self.routed.lock().unwrap();
+            session_volume::unroute(&routed);
+            routed.clear();
+        }
+    }
 }
 
 struct BusInner {
@@ -97,6 +129,9 @@ pub struct Mixer {
 
 impl Mixer {
     pub fn start() -> Result<Self> {
+        // Before anything is routed: give back any app a previous run left
+        // turned down.
+        session_volume::recover(&[]);
         let sources = Arc::new(Mutex::new(HashMap::new()));
         let buses = Arc::new(Mutex::new(HashMap::<String, Arc<BusInner>>::new()));
         let master_gain = Arc::new(AtomicF32::new(1.0));
@@ -114,9 +149,14 @@ impl Mixer {
             std::thread::Builder::new()
                 .name("mixer-render".into())
                 .spawn(move || {
-                    if let Err(error) =
-                        run_render_loop(sources, buses, master_gain, master_level, render_stop, bus_tap)
-                    {
+                    if let Err(error) = run_render_loop(
+                        sources,
+                        buses,
+                        master_gain,
+                        master_level,
+                        render_stop,
+                        bus_tap,
+                    ) {
                         eprintln!("mixer render thread exited with error: {error:?}");
                     }
                 })
@@ -152,9 +192,14 @@ impl Mixer {
     /// until the capture thread confirms activation succeeded, so a bad pid
     /// surfaces as an `Err` here rather than silently failing in the
     /// background.
-    pub fn add_source(&self, pid: u32, name: impl Into<String>, bus: impl Into<String>) -> Result<u64> {
+    pub fn add_source(
+        &self,
+        pid: u32,
+        name: impl Into<String>,
+        bus: impl Into<String>,
+    ) -> Result<u64> {
         // Capturing our own process would loop the mix back into itself, and
-        // the capture thread's session muting would silence our own output.
+        // turning the app down would silence our own output.
         if pid == std::process::id() {
             return Err(Error::from(E_INVALIDARG));
         }
@@ -170,6 +215,7 @@ impl Mixer {
             level: AtomicF32::new(0.0),
             samples: Mutex::new(VecDeque::new()),
             stop: Arc::new(AtomicBool::new(false)),
+            routed: Mutex::default(),
         });
 
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -183,12 +229,8 @@ impl Mixer {
             .recv_timeout(Duration::from_secs(5))
             .map_err(|_| Error::from(E_UNEXPECTED))??;
 
-        // Capturing is a non-destructive tap: pid's own session keeps
-        // playing through its real output unless we separately silence it
-        // here, so our mixer's processed copy becomes the only audible
-        // path (and our gain/mute controls actually have an effect).
-        session_volume::set_session_muted(pid, true);
-
+        // The capture thread turns the app's own output down right away, so
+        // the mixer's processed copy becomes the only audible path.
         let id = self.next_id();
         self.sources.lock().unwrap().insert(id, inner);
         Ok(id)
@@ -210,6 +252,7 @@ impl Mixer {
             level: AtomicF32::new(0.0),
             samples: Mutex::new(VecDeque::new()),
             stop: Arc::new(AtomicBool::new(false)),
+            routed: Mutex::default(),
         });
 
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -229,16 +272,29 @@ impl Mixer {
     }
 
     /// Stops capturing `id`; its thread exits and cleans up its WASAPI
-    /// client within one poll interval (<=100ms). If it was a process
-    /// source, restores that process's own session to unmuted, handing
-    /// normal audio control back to it.
+    /// client within one poll interval (<=100ms). If it was an app, gives
+    /// the app back its own volume.
     pub fn remove_source(&self, id: u64) {
-        if let Some(source) = self.sources.lock().unwrap().remove(&id) {
-            source.stop.store(true, Ordering::Relaxed);
-            if let Some(pid) = source.pid {
-                session_volume::set_session_muted(pid, false);
-            }
+        let removed = self.sources.lock().unwrap().remove(&id);
+        if let Some(source) = removed {
+            source.stop_and_restore();
         }
+    }
+
+    /// Restores apps a previous run left turned down because it didn't exit
+    /// cleanly (crash, killed). Cheap when there's nothing to restore.
+    pub fn recover_routed_volumes(&self) {
+        if !session_volume::has_pending_routes() {
+            return;
+        }
+        let routed: Vec<u32> = self
+            .sources
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|s| s.routed.lock().unwrap().iter().copied().collect::<Vec<_>>())
+            .collect();
+        session_volume::recover(&routed);
     }
 
     pub fn set_source_gain(&self, id: u64, gain: f32) {
@@ -297,7 +353,9 @@ impl Mixer {
         let mut presets = common::load_presets();
         for (name, bus) in self.buses.lock().unwrap().iter() {
             let gains_db = bus.eq.lock().unwrap().gains();
-            presets.eq.insert(name.clone(), common::EqPreset { gains_db });
+            presets
+                .eq
+                .insert(name.clone(), common::EqPreset { gains_db });
         }
         common::save_presets(&presets)
     }
@@ -377,22 +435,87 @@ impl Mixer {
 impl Drop for Mixer {
     fn drop(&mut self) {
         self.render_stop.store(true, Ordering::Relaxed);
+        // Closing the mixer must never leave an app turned down.
         for source in self.sources.lock().unwrap().values() {
-            source.stop.store(true, Ordering::Relaxed);
-            // Hand real audio control back to any still-captured process so
-            // closing the mixer never leaves an app muted at the OS level.
-            if let Some(pid) = source.pid {
-                session_volume::set_session_muted(pid, false);
+            source.stop_and_restore();
+        }
+    }
+}
+
+/// A started process-loopback capture of one process (and its descendants).
+struct LoopbackCapture {
+    pid: u32,
+    client: IAudioClient,
+    service: IAudioCaptureClient,
+    event: HANDLE,
+}
+
+impl LoopbackCapture {
+    fn start(pid: u32) -> Result<Self> {
+        let client = activate_process_loopback_client(pid)?;
+        let event = unsafe { CreateEventW(None, false, false, None)? };
+        let started = (|| -> Result<IAudioCaptureClient> {
+            unsafe {
+                client.Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    AUDCLNT_STREAMFLAGS_LOOPBACK
+                        | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+                    CAPTURE_BUFFER_DURATION_100NS,
+                    0,
+                    &standard_format(),
+                    None,
+                )?;
+                client.SetEventHandle(event)?;
+                let service: IAudioCaptureClient = client.GetService()?;
+                client.Start()?;
+                Ok(service)
+            }
+        })();
+        match started {
+            Ok(service) => Ok(Self {
+                pid,
+                client,
+                service,
+                event,
+            }),
+            Err(error) => {
+                unsafe {
+                    let _ = CloseHandle(event);
+                }
+                Err(error)
             }
         }
     }
 }
 
+impl Drop for LoopbackCapture {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.client.Stop();
+            let _ = CloseHandle(self.event);
+        }
+    }
+}
+
+/// The processes making up app `pid`'s audio and the one to capture it
+/// from (see [`crate::process_tree`]). Falls back to just `pid` if the
+/// processes or sessions can't be read.
+fn app_audio(pid: u32) -> (HashSet<u32>, u32) {
+    match (ProcessTree::snapshot(), session_owners()) {
+        (Ok(tree), Ok(owners)) => (
+            tree.app_audio_processes(pid, &owners),
+            tree.capture_target(pid, &owners),
+        ),
+        _ => (HashSet::from([pid]), pid),
+    }
+}
+
 /// Runs entirely on its own OS thread: initializes this thread's own COM
-/// apartment, activates process-loopback capture for `pid`, reports the
-/// outcome over `ready_tx`, then (on success) captures until `source.stop`
-/// is set. COM interface pointers are never moved across threads — each
-/// thread that uses them creates and owns them itself.
+/// apartment, starts capturing app `pid`'s audio, reports the outcome over
+/// `ready_tx`, then (on success) captures until `source.stop` is set. COM
+/// interface pointers are never moved across threads — each thread that
+/// uses them creates and owns them itself.
 fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: mpsc::Sender<Result<()>>) {
     let _com = match ComGuard::init() {
         Ok(com) => com,
@@ -402,62 +525,62 @@ fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: mpsc::Sender
         }
     };
 
-    let setup = (|| -> Result<(IAudioClient, IAudioCaptureClient, HANDLE)> {
-        let capture_client = activate_process_loopback_client(pid)?;
-        let event = unsafe { CreateEventW(None, false, false, None)? };
-        let format = standard_format();
-        unsafe {
-            capture_client.Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK
-                    | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-                    | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-                CAPTURE_BUFFER_DURATION_100NS,
-                0,
-                &format,
-                None,
-            )?;
-            capture_client.SetEventHandle(event)?;
-        }
-        let capture_service: IAudioCaptureClient = unsafe { capture_client.GetService()? };
-        unsafe {
-            capture_client.Start()?;
-        }
-        Ok((capture_client, capture_service, event))
-    })();
-
-    let (capture_client, capture_service, event) = match setup {
-        Ok(triple) => {
+    let (mut processes, target) = app_audio(pid);
+    let mut capture = match LoopbackCapture::start(target) {
+        Ok(capture) => {
             let _ = ready_tx.send(Ok(()));
-            triple
+            capture
         }
         Err(error) => {
             let _ = ready_tx.send(Err(error));
             return;
         }
     };
+    let mut last_scan = Instant::now();
 
-    // Capturing a process's audio does not stop it creating a *new* audio
-    // session later (common for browsers/media apps as content changes),
-    // which a one-time SetMute at activation can't reach. Re-assert it
-    // periodically so a freshly-created session gets caught quickly rather
-    // than silently playing alongside our processed copy.
-    const MUTE_ENFORCE_INTERVAL: Duration = Duration::from_millis(500);
-    let mut last_mute_enforced = std::time::Instant::now() - MUTE_ENFORCE_INTERVAL;
+    // Apps create new sessions as they go, which start at full volume, so
+    // keep turning every session down. The capture is only boosted while
+    // every session reads back as turned down; boosting audio that isn't
+    // would make it 10,000x too loud.
+    let mut last_routed = Instant::now() - ROUTE_ENFORCE_INTERVAL;
+    let mut all_routed = false;
+    let mut boost_blocked_until = Instant::now();
+    let mut boosted = Vec::new();
 
     while !source.stop.load(Ordering::Relaxed) {
-        if last_mute_enforced.elapsed() >= MUTE_ENFORCE_INTERVAL {
-            session_volume::set_session_muted(pid, true);
-            last_mute_enforced = std::time::Instant::now();
+        if last_scan.elapsed() >= APP_RESCAN_INTERVAL {
+            let target;
+            (processes, target) = app_audio(pid);
+            // Keep the old capture if the new one can't start.
+            if target != capture.pid {
+                if let Ok(new_capture) = LoopbackCapture::start(target) {
+                    capture = new_capture;
+                }
+            }
+            last_scan = Instant::now();
+        }
+        if last_routed.elapsed() >= ROUTE_ENFORCE_INTERVAL {
+            let mut routed = source.routed.lock().unwrap();
+            if source.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            // Give back processes that stopped being part of the app.
+            let gone: HashSet<u32> = routed.difference(&processes).copied().collect();
+            if !gone.is_empty() {
+                session_volume::unroute(&gone);
+            }
+            routed.clone_from(&processes);
+            all_routed = session_volume::route(&processes);
+            last_routed = Instant::now();
         }
 
-        let wait_result = unsafe { WaitForSingleObject(event, 100) };
+        let wait_result = unsafe { WaitForSingleObject(capture.event, 100) };
         if wait_result != WAIT_OBJECT_0 {
             continue;
         }
 
         loop {
-            let packet_size = match unsafe { capture_service.GetNextPacketSize() } {
+            let packet_size = match unsafe { capture.service.GetNextPacketSize() } {
                 Ok(size) => size,
                 Err(_) => break,
             };
@@ -468,34 +591,50 @@ fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: mpsc::Sender
             let mut data_ptr: *mut u8 = std::ptr::null_mut();
             let mut num_frames = 0u32;
             let mut flags = 0u32;
-            if unsafe { capture_service.GetBuffer(&mut data_ptr, &mut num_frames, &mut flags, None, None) }
-                .is_err()
+            if unsafe {
+                capture
+                    .service
+                    .GetBuffer(&mut data_ptr, &mut num_frames, &mut flags, None, None)
+            }
+            .is_err()
             {
                 break;
             }
 
             if num_frames > 0 && !data_ptr.is_null() {
                 let samples = unsafe {
-                    std::slice::from_raw_parts(data_ptr as *const f32, num_frames as usize * CHANNELS)
+                    std::slice::from_raw_parts(
+                        data_ptr as *const f32,
+                        num_frames as usize * CHANNELS,
+                    )
                 };
-                let peak = samples.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
-                source.level.store(peak);
+                let raw_peak = samples.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
+                let turned_down = raw_peak <= ROUTED_VOLUME * ROUTED_HEADROOM;
+                if all_routed && !turned_down {
+                    // Louder than a turned-down app can be: some of its audio
+                    // isn't turned down. Don't boost; re-check right away.
+                    boost_blocked_until = Instant::now() + BOOST_BLOCK;
+                    last_routed = Instant::now() - ROUTE_ENFORCE_INTERVAL;
+                }
+                let gain = if all_routed && turned_down && Instant::now() >= boost_blocked_until {
+                    ROUTED_BOOST
+                } else {
+                    1.0
+                };
+                boosted.clear();
+                boosted.extend(samples.iter().map(|&s| s * gain));
+                source.level.store(raw_peak * gain);
 
                 let mut buffer = source.samples.lock().unwrap();
-                buffer.extend(samples.iter().copied());
+                buffer.extend(boosted.iter().copied());
                 while buffer.len() > MAX_BUFFERED_SAMPLES {
                     buffer.pop_front();
                 }
             }
             unsafe {
-                let _ = capture_service.ReleaseBuffer(num_frames);
+                let _ = capture.service.ReleaseBuffer(num_frames);
             }
         }
-    }
-
-    unsafe {
-        let _ = capture_client.Stop();
-        let _ = CloseHandle(event);
     }
 }
 
@@ -549,15 +688,22 @@ fn run_render_loop(
                         .filter(|s| *s.bus.lock().unwrap() == *name)
                         .cloned()
                         .collect();
-                    BusSnapshot { name: name.clone(), bus: bus.clone(), members, device_id }
+                    BusSnapshot {
+                        name: name.clone(),
+                        bus: bus.clone(),
+                        members,
+                        device_id,
+                    }
                 })
                 .collect()
         };
 
         // Open any newly-needed device clients; close ones no bus targets
         // anymore.
-        let needed_devices: std::collections::HashSet<Option<String>> =
-            bus_snapshot.iter().map(|snapshot| snapshot.device_id.clone()).collect();
+        let needed_devices: std::collections::HashSet<Option<String>> = bus_snapshot
+            .iter()
+            .map(|snapshot| snapshot.device_id.clone())
+            .collect();
         for device_id in &needed_devices {
             if device_outputs.contains_key(device_id) {
                 continue;
@@ -570,7 +716,11 @@ fn run_render_loop(
                     }
                     device_outputs.insert(
                         device_id.clone(),
-                        DeviceOutput { client, render_service, buffer_frames },
+                        DeviceOutput {
+                            client,
+                            render_service,
+                            buffer_frames,
+                        },
                     );
                 }
                 Err(error) => {
@@ -591,8 +741,10 @@ fn run_render_loop(
 
         let master_gain_value = master_gain.load();
         let mut master_peak = 0.0f32;
-        let mut source_peaks: Vec<Vec<f32>> =
-            bus_snapshot.iter().map(|snapshot| vec![0.0f32; snapshot.members.len()]).collect();
+        let mut source_peaks: Vec<Vec<f32>> = bus_snapshot
+            .iter()
+            .map(|snapshot| vec![0.0f32; snapshot.members.len()])
+            .collect();
         let mut bus_peaks: Vec<f32> = vec![0.0f32; bus_snapshot.len()];
         let tap = bus_tap.lock().unwrap().clone();
         if tap.is_some() {
@@ -614,7 +766,16 @@ fn run_render_loop(
             for frame in 0..available as usize {
                 let mut device_mix = [0.0f32; CHANNELS];
 
-                for (bus_idx, BusSnapshot { bus, members, device_id: bus_device, .. }) in bus_snapshot.iter().enumerate() {
+                for (
+                    bus_idx,
+                    BusSnapshot {
+                        bus,
+                        members,
+                        device_id: bus_device,
+                        ..
+                    },
+                ) in bus_snapshot.iter().enumerate()
+                {
                     if bus_device != device_id {
                         continue;
                     }
@@ -637,7 +798,8 @@ fn run_render_loop(
                             }
                         }
                         drop(buffer);
-                        source_peaks[bus_idx][src_idx] = source_peaks[bus_idx][src_idx].max(local_peak);
+                        source_peaks[bus_idx][src_idx] =
+                            source_peaks[bus_idx][src_idx].max(local_peak);
                     }
 
                     bus.eq.lock().unwrap().process(&mut bus_mix);
@@ -677,6 +839,12 @@ fn run_render_loop(
             }
         }
 
+        // A pass where no device had room rendered nothing; storing its
+        // all-zero peaks would make every meter flicker to empty.
+        if !rendered_any {
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
         for (bus_idx, BusSnapshot { bus, members, .. }) in bus_snapshot.iter().enumerate() {
             bus.level.store(bus_peaks[bus_idx]);
             for (src_idx, source) in members.iter().enumerate() {
@@ -684,10 +852,6 @@ fn run_render_loop(
             }
         }
         master_level.store(master_peak);
-
-        if !rendered_any {
-            std::thread::sleep(Duration::from_millis(5));
-        }
     }
 
     for output in device_outputs.values() {
