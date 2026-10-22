@@ -4,7 +4,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use windows::core::{Error, Result};
-use windows::Win32::Foundation::{CloseHandle, E_UNEXPECTED, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, E_INVALIDARG, E_UNEXPECTED, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     IAudioCaptureClient, IAudioClient, IAudioRenderClient, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -133,6 +133,11 @@ impl Mixer {
     /// surfaces as an `Err` here rather than silently failing in the
     /// background.
     pub fn add_source(&self, pid: u32, name: impl Into<String>, bus: impl Into<String>) -> Result<u64> {
+        // Capturing our own process would loop the mix back into itself, and
+        // the capture thread's session muting would silence our own output.
+        if pid == std::process::id() {
+            return Err(Error::from(E_INVALIDARG));
+        }
         let bus_name = bus.into();
         self.ensure_bus(&bus_name);
 

@@ -7,6 +7,8 @@ use audio_engine::{
 };
 use eframe::egui;
 
+mod single_instance;
+
 /// The five channels always shown as faders, matching SteelSeries Sonar's
 /// own channel naming plus a dedicated Mic channel.
 const FIXED_BUSES: &[&str] = &["Game", "Chat", "Aux", "Media", "Mic"];
@@ -75,9 +77,10 @@ impl MixerApp {
         let Ok(sessions) = enumerate_sessions() else {
             return;
         };
+        let own_pid = std::process::id();
         let mut sessions: Vec<AvailableSession> = sessions
             .into_iter()
-            .filter(|s| s.process_id != 0 && !s.display_name.is_empty())
+            .filter(|s| s.process_id != 0 && s.process_id != own_pid && !s.display_name.is_empty())
             .map(|s| AvailableSession {
                 pid: s.process_id,
                 name: s.display_name,
@@ -290,12 +293,15 @@ impl eframe::App for MixerApp {
 }
 
 fn main() -> eframe::Result<()> {
+    let Some(_instance) = single_instance::acquire() else {
+        return Ok(());
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "sonar-rs",
+        single_instance::WINDOW_TITLE,
         options,
         Box::new(|_cc| {
             let app = MixerApp::new().expect("failed to start audio mixer");
