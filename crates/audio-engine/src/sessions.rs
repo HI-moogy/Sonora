@@ -54,19 +54,6 @@ pub(crate) fn visit_sessions(
     Ok(())
 }
 
-/// The processes that own an audio session on any active output device.
-pub(crate) fn session_owners() -> windows::core::Result<HashSet<u32>> {
-    let mut owners = HashSet::new();
-    visit_sessions(|control| {
-        if let Ok(pid) = unsafe { control.GetProcessId() } {
-            if pid != 0 {
-                owners.insert(pid);
-            }
-        }
-    })?;
-    Ok(owners)
-}
-
 /// Every audio session on every active output device, i.e. every app that
 /// has played or is playing audio. A helper process playing audio for an
 /// app (see [`crate::process_tree`]) is listed as that app, not on its own.

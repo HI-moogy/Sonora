@@ -47,9 +47,18 @@ fn app_key(pid: u32) -> Option<String> {
     process_executable_name(pid).map(|name| name.to_lowercase())
 }
 
+/// An audio session's volume control, with the pid of the process that
+/// owns the session.
+pub type OwnedSession = (u32, ISimpleAudioVolume);
+
+/// Every audio session on every active output device.
+pub fn all_sessions() -> Result<Vec<OwnedSession>> {
+    sessions(None)
+}
+
 /// Every audio session owned by a process in `pids` (or by any process, for
-/// `None`), on every active output device, with its owner's pid.
-fn sessions(pids: Option<&HashSet<u32>>) -> Result<Vec<(u32, ISimpleAudioVolume)>> {
+/// `None`), on every active output device.
+fn sessions(pids: Option<&HashSet<u32>>) -> Result<Vec<OwnedSession>> {
     let mut found = Vec::new();
     visit_sessions(|control| {
         let Ok(pid) = (unsafe { control.GetProcessId() }) else {
@@ -65,18 +74,23 @@ fn sessions(pids: Option<&HashSet<u32>>) -> Result<Vec<(u32, ISimpleAudioVolume)
 }
 
 /// Turns every session of the processes in `pids` (an app's audio
-/// processes) down to [`ROUTED_VOLUME`], recording each process's original
-/// volume first (once). Returns whether every session now reads back at
-/// [`ROUTED_VOLUME`], i.e. whether the app's capture can safely be boosted;
-/// false if it has no sessions.
+/// processes) down to [`ROUTED_VOLUME`]; see [`record_originals`] and
+/// [`enforce`].
 pub fn route(pids: &HashSet<u32>) -> bool {
     let Ok(sessions) = sessions(Some(pids)) else {
         return false;
     };
-    if sessions.is_empty() {
-        return false;
-    }
-    for &pid in pids {
+    record_originals(&sessions);
+    enforce(&sessions)
+}
+
+/// Records the volume each process owning one of `sessions` has before it
+/// is turned down, once per executable, so [`unroute`] and [`recover`] can
+/// put it back. Call whenever an app's sessions are (re)found, before
+/// [`enforce`].
+pub fn record_originals(sessions: &[OwnedSession]) {
+    let pids: HashSet<u32> = sessions.iter().map(|&(pid, _)| pid).collect();
+    for pid in pids {
         let Some(key) = app_key(pid) else { continue };
         with_routed_apps(|apps| {
             if apps.original_volumes.contains_key(&key) {
@@ -94,8 +108,15 @@ pub fn route(pids: &HashSet<u32>) -> bool {
             ((), true)
         });
     }
-    let mut all_routed = true;
-    for (_, volume) in &sessions {
+}
+
+/// Turns every session in `sessions` down to [`ROUTED_VOLUME`] (cheap: only
+/// sessions not already there are changed). Returns whether every one now
+/// reads back at [`ROUTED_VOLUME`], i.e. whether the app's capture can
+/// safely be boosted; false if there are none.
+pub fn enforce(sessions: &[OwnedSession]) -> bool {
+    let mut all_routed = !sessions.is_empty();
+    for (_, volume) in sessions {
         unsafe {
             if !volume.GetMasterVolume().is_ok_and(is_routed) {
                 let _ = volume.SetMasterVolume(ROUTED_VOLUME, std::ptr::null());

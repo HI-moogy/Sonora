@@ -19,8 +19,7 @@ use crate::loopback::{activate_process_loopback_client, standard_format};
 use crate::mic::run_mic_capture_thread;
 use crate::process_tree::ProcessTree;
 use crate::render::open_render_client_for_device;
-use crate::session_volume::{self, ROUTED_BOOST, ROUTED_VOLUME};
-use crate::sessions::session_owners;
+use crate::session_volume::{self, OwnedSession, ROUTED_BOOST, ROUTED_VOLUME};
 
 const CAPTURE_BUFFER_DURATION_100NS: i64 = 2_000_000;
 const CHANNELS: usize = 2;
@@ -28,12 +27,19 @@ const SAMPLE_RATE: f32 = 48_000.0;
 /// Bounds how far a source's buffer can grow if the render thread falls
 /// behind, so a stalled render loop can't leak memory indefinitely.
 pub(crate) const MAX_BUFFERED_SAMPLES: usize = 48_000 * CHANNELS * 2;
-/// How often a routed app's sessions are checked and turned down again
-/// (apps create new sessions as they go, e.g. browsers per tab).
+/// How often a routed app's known sessions are checked and turned down
+/// again if something (the app, the Windows mixer) turned them back up.
+/// Cheap: reads each known session's volume.
 const ROUTE_ENFORCE_INTERVAL: Duration = Duration::from_millis(100);
-/// How often an app's audio processes are looked up again, since helper
-/// processes come and go (see [`crate::process_tree`]).
-const APP_RESCAN_INTERVAL: Duration = Duration::from_secs(1);
+/// How often an app's audio processes and sessions are looked up again,
+/// since apps create sessions and helper processes as they go (see
+/// [`crate::process_tree`]). Costly: walks every session on every device
+/// and the process list (~17 ms measured), so it runs far less often
+/// than enforcement.
+const APP_RESCAN_INTERVAL: Duration = Duration::from_secs(3);
+/// How soon after the last look-up to look again when the captured audio
+/// shows a session that isn't turned down yet (e.g. a new browser tab).
+const APP_RESCAN_SOON: Duration = Duration::from_millis(500);
 /// A turned-down app can't produce samples above `ROUTED_VOLUME` times its
 /// own peak; apps with hot float output can exceed full scale a little, so
 /// allow this much before treating a packet as not turned down.
@@ -498,16 +504,36 @@ impl Drop for LoopbackCapture {
     }
 }
 
-/// The processes making up app `pid`'s audio and the one to capture it
-/// from (see [`crate::process_tree`]). Falls back to just `pid` if the
-/// processes or sessions can't be read.
-fn app_audio(pid: u32) -> (HashSet<u32>, u32) {
-    match (ProcessTree::snapshot(), session_owners()) {
-        (Ok(tree), Ok(owners)) => (
+/// What makes up an app's audio right now (see [`crate::process_tree`]).
+struct AppAudio {
+    /// The app and its helper processes that own audio sessions.
+    processes: HashSet<u32>,
+    /// The process to capture the app's audio from.
+    target: u32,
+    /// Every audio session of `processes`.
+    sessions: Vec<OwnedSession>,
+}
+
+/// Looks up app `pid`'s audio in one pass over the sessions. Falls back to
+/// just `pid` if the process list can't be read.
+fn app_audio(pid: u32) -> AppAudio {
+    let all = session_volume::all_sessions().unwrap_or_default();
+    let owners: HashSet<u32> = all.iter().map(|&(owner, _)| owner).collect();
+    let (processes, target) = match ProcessTree::snapshot() {
+        Ok(tree) => (
             tree.app_audio_processes(pid, &owners),
             tree.capture_target(pid, &owners),
         ),
-        _ => (HashSet::from([pid]), pid),
+        Err(_) => (HashSet::from([pid]), pid),
+    };
+    let sessions = all
+        .into_iter()
+        .filter(|(owner, _)| processes.contains(owner))
+        .collect();
+    AppAudio {
+        processes,
+        target,
+        sessions,
     }
 }
 
@@ -525,8 +551,8 @@ fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: mpsc::Sender
         }
     };
 
-    let (mut processes, target) = app_audio(pid);
-    let mut capture = match LoopbackCapture::start(target) {
+    let app = app_audio(pid);
+    let mut capture = match LoopbackCapture::start(app.target) {
         Ok(capture) => {
             let _ = ready_tx.send(Ok(()));
             capture
@@ -536,7 +562,10 @@ fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: mpsc::Sender
             return;
         }
     };
+    let mut found = Some(app);
+    let mut sessions = Vec::new();
     let mut last_scan = Instant::now();
+    let mut next_scan = last_scan + APP_RESCAN_INTERVAL;
 
     // Apps create new sessions as they go, which start at full volume, so
     // keep turning every session down. The capture is only boosted while
@@ -548,29 +577,38 @@ fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: mpsc::Sender
     let mut boosted = Vec::new();
 
     while !source.stop.load(Ordering::Relaxed) {
-        if last_scan.elapsed() >= APP_RESCAN_INTERVAL {
-            let target;
-            (processes, target) = app_audio(pid);
+        if found.is_none() && Instant::now() >= next_scan {
+            found = Some(app_audio(pid));
+        }
+        if let Some(app) = found.take() {
             // Keep the old capture if the new one can't start.
-            if target != capture.pid {
-                if let Ok(new_capture) = LoopbackCapture::start(target) {
+            if app.target != capture.pid {
+                if let Ok(new_capture) = LoopbackCapture::start(app.target) {
                     capture = new_capture;
                 }
             }
-            last_scan = Instant::now();
-        }
-        if last_routed.elapsed() >= ROUTE_ENFORCE_INTERVAL {
             let mut routed = source.routed.lock().unwrap();
             if source.stop.load(Ordering::Relaxed) {
                 break;
             }
             // Give back processes that stopped being part of the app.
-            let gone: HashSet<u32> = routed.difference(&processes).copied().collect();
+            let gone: HashSet<u32> = routed.difference(&app.processes).copied().collect();
             if !gone.is_empty() {
                 session_volume::unroute(&gone);
             }
-            routed.clone_from(&processes);
-            all_routed = session_volume::route(&processes);
+            session_volume::record_originals(&app.sessions);
+            *routed = app.processes;
+            sessions = app.sessions;
+            last_scan = Instant::now();
+            next_scan = last_scan + APP_RESCAN_INTERVAL;
+            last_routed = Instant::now() - ROUTE_ENFORCE_INTERVAL;
+        }
+        if last_routed.elapsed() >= ROUTE_ENFORCE_INTERVAL {
+            let _routed = source.routed.lock().unwrap();
+            if source.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            all_routed = session_volume::enforce(&sessions);
             last_routed = Instant::now();
         }
 
@@ -612,9 +650,10 @@ fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: mpsc::Sender
                 let turned_down = raw_peak <= ROUTED_VOLUME * ROUTED_HEADROOM;
                 if all_routed && !turned_down {
                     // Louder than a turned-down app can be: some of its audio
-                    // isn't turned down. Don't boost; re-check right away.
+                    // isn't turned down, likely a session we haven't found
+                    // yet. Don't boost; look for it soon.
                     boost_blocked_until = Instant::now() + BOOST_BLOCK;
-                    last_routed = Instant::now() - ROUTE_ENFORCE_INTERVAL;
+                    next_scan = next_scan.min(last_scan + APP_RESCAN_SOON);
                 }
                 let gain = if all_routed && turned_down && Instant::now() >= boost_blocked_until {
                     ROUTED_BOOST
