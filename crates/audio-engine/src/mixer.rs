@@ -56,7 +56,10 @@ pub(crate) struct SourceInner {
     bus: Mutex<String>,
     gain: AtomicF32,
     muted: AtomicBool,
-    pub(crate) level: AtomicF32,
+    /// Peak since the UI last looked, measured by the render thread.
+    level: AtomicF32,
+    /// The capture device, for the microphone; `None` is the system default.
+    input_device: Option<String>,
     pub(crate) samples: Mutex<VecDeque<f32>>,
     pub(crate) stop: Arc<AtomicBool>,
     /// The app's audio processes currently turned down. Held while turning
@@ -80,6 +83,7 @@ impl SourceInner {
 struct BusInner {
     gain: AtomicF32,
     muted: AtomicBool,
+    /// Peak since the UI last looked.
     level: AtomicF32,
     eq: Mutex<EqBands>,
     /// `None` renders to the system default output device.
@@ -104,7 +108,11 @@ pub struct SourceInfo {
     pub bus: String,
     pub gain: f32,
     pub muted: bool,
+    /// Peak since the previous snapshot.
     pub level: f32,
+    /// The microphone's capture device; `None` is the system default (and
+    /// always `None` for apps).
+    pub input_device: Option<String>,
 }
 
 /// A snapshot of one bus's current state for UI display.
@@ -112,6 +120,7 @@ pub struct BusInfo {
     pub name: String,
     pub gain: f32,
     pub muted: bool,
+    /// Peak since the previous snapshot.
     pub level: f32,
     pub eq_gains_db: [f32; EQ_BAND_COUNT],
     /// `None` means this bus renders to the system default output device.
@@ -219,6 +228,7 @@ impl Mixer {
             gain: AtomicF32::new(1.0),
             muted: AtomicBool::new(false),
             level: AtomicF32::new(0.0),
+            input_device: None,
             samples: Mutex::new(VecDeque::new()),
             stop: Arc::new(AtomicBool::new(false)),
             routed: Mutex::default(),
@@ -242,10 +252,16 @@ impl Mixer {
         Ok(id)
     }
 
-    /// Starts capturing the default microphone, denoised through RNNoise,
-    /// into the named bus. Same activation/blocking contract as
-    /// [`Self::add_source`].
-    pub fn add_mic_source(&self, name: impl Into<String>, bus: impl Into<String>) -> Result<u64> {
+    /// Starts capturing a microphone (`device_id` from
+    /// [`crate::devices::list_input_devices`], or the system default when
+    /// `None`), denoised through RNNoise, into the named bus. Same
+    /// activation/blocking contract as [`Self::add_source`].
+    pub fn add_mic_source(
+        &self,
+        name: impl Into<String>,
+        bus: impl Into<String>,
+        device_id: Option<String>,
+    ) -> Result<u64> {
         let bus_name = bus.into();
         self.ensure_bus(&bus_name);
 
@@ -256,6 +272,7 @@ impl Mixer {
             gain: AtomicF32::new(1.0),
             muted: AtomicBool::new(false),
             level: AtomicF32::new(0.0),
+            input_device: device_id.clone(),
             samples: Mutex::new(VecDeque::new()),
             stop: Arc::new(AtomicBool::new(false)),
             routed: Mutex::default(),
@@ -265,7 +282,7 @@ impl Mixer {
         let thread_source = inner.clone();
         std::thread::Builder::new()
             .name("capture-mic".into())
-            .spawn(move || run_mic_capture_thread(thread_source, ready_tx))
+            .spawn(move || run_mic_capture_thread(thread_source, device_id, ready_tx))
             .expect("spawn mic capture thread");
 
         ready_rx
@@ -275,6 +292,22 @@ impl Mixer {
         let id = self.next_id();
         self.sources.lock().unwrap().insert(id, inner);
         Ok(id)
+    }
+
+    /// Switches microphone source `id` to another capture device, keeping
+    /// its bus, gain and mute. Returns the source's new id. On failure the
+    /// old capture keeps running.
+    pub fn set_mic_device(&self, id: u64, device_id: Option<String>) -> Result<u64> {
+        let old = self.sources.lock().unwrap().get(&id).filter(|s| s.pid.is_none()).cloned();
+        let Some(old) = old else {
+            return Err(Error::from(E_INVALIDARG));
+        };
+        let bus = old.bus.lock().unwrap().clone();
+        let new_id = self.add_mic_source(old.name.clone(), bus, device_id)?;
+        self.set_source_gain(new_id, old.gain.load());
+        self.set_source_muted(new_id, old.muted.load(Ordering::Relaxed));
+        self.remove_source(id);
+        Ok(new_id)
     }
 
     /// Stops capturing `id`; its thread exits and cleans up its WASAPI
@@ -353,19 +386,6 @@ impl Mixer {
         }
     }
 
-    /// Writes every currently-known bus's EQ settings to disk, so they're
-    /// restored next time that bus name is used.
-    pub fn save_eq_presets(&self) -> std::io::Result<()> {
-        let mut presets = common::load_presets();
-        for (name, bus) in self.buses.lock().unwrap().iter() {
-            let gains_db = bus.eq.lock().unwrap().gains();
-            presets
-                .eq
-                .insert(name.clone(), common::EqPreset { gains_db });
-        }
-        common::save_presets(&presets)
-    }
-
     pub fn set_master_gain(&self, gain: f32) {
         self.master_gain.store(gain.max(0.0));
     }
@@ -374,8 +394,9 @@ impl Mixer {
         self.master_gain.load()
     }
 
+    /// Peak of the final mix since the previous call.
     pub fn master_level(&self) -> f32 {
-        self.master_level.load()
+        self.master_level.take()
     }
 
     pub fn sources(&self) -> Vec<SourceInfo> {
@@ -390,7 +411,8 @@ impl Mixer {
                 bus: s.bus.lock().unwrap().clone(),
                 gain: s.gain.load(),
                 muted: s.muted.load(Ordering::Relaxed),
-                level: s.level.load(),
+                level: s.level.take(),
+                input_device: s.input_device.clone(),
             })
             .collect()
     }
@@ -404,27 +426,23 @@ impl Mixer {
                 name: name.clone(),
                 gain: b.gain.load(),
                 muted: b.muted.load(Ordering::Relaxed),
-                level: b.level.load(),
+                level: b.level.take(),
                 eq_gains_db: b.eq.lock().unwrap().gains(),
                 device_id: b.device_id.lock().unwrap().clone(),
             })
             .collect()
     }
 
-    /// Creates `name`'s bus state if it doesn't exist yet, restoring its
-    /// saved EQ preset (or flat/0dB if none was ever saved). Safe to call
-    /// up front for buses that should always be shown (e.g. a fixed set of
-    /// channels in the UI) even before anything is routed to them.
+    /// Creates `name`'s bus state (flat EQ, unity gain, default device) if
+    /// it doesn't exist yet. Safe to call up front for buses that should
+    /// always be shown (e.g. a fixed set of channels in the UI) even before
+    /// anything is routed to them.
     pub fn ensure_bus(&self, name: &str) {
         let mut buses = self.buses.lock().unwrap();
         if buses.contains_key(name) {
             return;
         }
-        let gains_db = common::load_presets()
-            .eq
-            .get(name)
-            .map(|preset| preset.gains_db)
-            .unwrap_or([0.0; EQ_BAND_COUNT]);
+        let gains_db = [0.0; EQ_BAND_COUNT];
         buses.insert(
             name.to_string(),
             Arc::new(BusInner {
@@ -662,7 +680,6 @@ fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: mpsc::Sender
                 };
                 boosted.clear();
                 boosted.extend(samples.iter().map(|&s| s * gain));
-                source.level.store(raw_peak * gain);
 
                 let mut buffer = source.samples.lock().unwrap();
                 buffer.extend(boosted.iter().copied());
@@ -878,19 +895,19 @@ fn run_render_loop(
             }
         }
 
-        // A pass where no device had room rendered nothing; storing its
-        // all-zero peaks would make every meter flicker to empty.
         if !rendered_any {
             std::thread::sleep(Duration::from_millis(5));
             continue;
         }
+        // Levels accumulate until the UI takes them, so it sees every
+        // block's peak however often it looks.
         for (bus_idx, BusSnapshot { bus, members, .. }) in bus_snapshot.iter().enumerate() {
-            bus.level.store(bus_peaks[bus_idx]);
+            bus.level.raise_to(bus_peaks[bus_idx]);
             for (src_idx, source) in members.iter().enumerate() {
-                source.level.store(source_peaks[bus_idx][src_idx]);
+                source.level.raise_to(source_peaks[bus_idx][src_idx]);
             }
         }
-        master_level.store(master_peak);
+        master_level.raise_to(master_peak);
     }
 
     for output in device_outputs.values() {

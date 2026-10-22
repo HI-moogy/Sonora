@@ -13,7 +13,7 @@ fn main() -> windows::core::Result<()> {
     println!("routing target: {}", headset.name);
 
     let mixer = Mixer::start()?;
-    let mic_id = mixer.add_mic_source("Microphone", "Chat")?;
+    let mic_id = mixer.add_mic_source("Microphone", "Chat", None)?;
     println!("mic added to Chat bus (default device)");
 
     std::thread::sleep(Duration::from_millis(500));

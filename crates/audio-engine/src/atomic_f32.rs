@@ -18,4 +18,15 @@ impl AtomicF32 {
     pub fn store(&self, value: f32) {
         self.0.store(value.to_bits(), Ordering::Relaxed);
     }
+
+    /// Raises the value to `level` if that's higher. For levels (never
+    /// negative): non-negative floats order the same as their bit patterns.
+    pub fn raise_to(&self, level: f32) {
+        self.0.fetch_max(level.max(0.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Returns the value and resets it to zero.
+    pub fn take(&self) -> f32 {
+        f32::from_bits(self.0.swap(0.0f32.to_bits(), Ordering::Relaxed))
+    }
 }

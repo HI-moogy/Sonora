@@ -1,13 +1,13 @@
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::{
-    eRender, IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    eCapture, eRender, EDataFlow, IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL, STGM_READ};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
 #[derive(Debug, Clone)]
-pub struct OutputDevice {
+pub struct AudioDevice {
     pub id: String,
     pub name: String,
 }
@@ -20,11 +20,19 @@ const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {
 };
 
 /// Lists every currently active audio render (output/playback) device.
-pub fn list_output_devices() -> windows::core::Result<Vec<OutputDevice>> {
+pub fn list_output_devices() -> windows::core::Result<Vec<AudioDevice>> {
+    list_devices(eRender)
+}
+
+/// Lists every currently active audio capture (microphone/line-in) device.
+pub fn list_input_devices() -> windows::core::Result<Vec<AudioDevice>> {
+    list_devices(eCapture)
+}
+
+fn list_devices(flow: EDataFlow) -> windows::core::Result<Vec<AudioDevice>> {
     unsafe {
         let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let collection: IMMDeviceCollection =
-            enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
+        let collection: IMMDeviceCollection = enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE)?;
         let count = collection.GetCount()?;
 
         let mut devices = Vec::with_capacity(count as usize);
@@ -38,7 +46,7 @@ pub fn list_output_devices() -> windows::core::Result<Vec<OutputDevice>> {
                 Err(_) => id.clone(),
             };
 
-            devices.push(OutputDevice { id, name });
+            devices.push(AudioDevice { id, name });
         }
         Ok(devices)
     }

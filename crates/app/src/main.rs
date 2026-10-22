@@ -1,19 +1,26 @@
+// Release builds are a GUI app only: no console window alongside.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use audio_engine::{
-    enumerate_sessions, list_output_devices, Mixer, OutputDevice, EQ_BAND_COUNT, EQ_BAND_FREQUENCIES,
-    EQ_GAIN_RANGE_DB,
+    enumerate_sessions, list_input_devices, list_output_devices, AudioDevice, Mixer, EQ_BAND_COUNT,
+    EQ_BAND_FREQUENCIES, EQ_GAIN_RANGE_DB,
 };
 use eframe::egui;
 
 mod clips;
 mod hotkey;
+mod meter;
 mod moments;
+mod setup;
 mod single_instance;
 mod sounds;
 
+use meter::level_meter;
 use moments::Moments;
+use setup::MixerPersistence;
 
 /// The five channels always shown as faders, matching SteelSeries Sonar's
 /// own channel naming plus a dedicated Mic channel.
@@ -57,11 +64,16 @@ struct MixerApp {
     tab: Tab,
     available_sessions: Vec<AvailableSession>,
     last_session_refresh: Instant,
-    output_devices: Vec<OutputDevice>,
+    output_devices: Vec<AudioDevice>,
+    input_devices: Vec<AudioDevice>,
     last_device_refresh: Instant,
     last_route_recovery: Instant,
     selected_bus: Option<String>,
-    save_status: Option<String>,
+    /// The last action that failed, shown in the channel panel.
+    status: Option<String>,
+    persistence: MixerPersistence,
+    /// Problems loading settings, shown until dismissed.
+    config_notices: Vec<String>,
 }
 
 impl MixerApp {
@@ -75,6 +87,7 @@ impl MixerApp {
         for bus in FIXED_BUSES {
             mixer.ensure_bus(bus);
         }
+        let persistence = MixerPersistence::restore(&mixer);
         let moments = Moments::new(ctx, &mixer);
         Ok(Self {
             mixer,
@@ -83,10 +96,13 @@ impl MixerApp {
             available_sessions: Vec::new(),
             last_session_refresh: Instant::now() - SESSION_REFRESH_INTERVAL,
             output_devices: Vec::new(),
+            input_devices: Vec::new(),
             last_device_refresh: Instant::now() - DEVICE_REFRESH_INTERVAL,
             last_route_recovery: Instant::now(),
             selected_bus: None,
-            save_status: None,
+            status: None,
+            persistence,
+            config_notices: common::take_config_notices(),
         })
     }
 
@@ -121,18 +137,13 @@ impl MixerApp {
         if let Ok(devices) = list_output_devices() {
             self.output_devices = devices;
         }
+        if let Ok(devices) = list_input_devices() {
+            self.input_devices = devices;
+        }
     }
 }
 
-fn level_meter(ui: &mut egui::Ui, level: f32) {
-    ui.add(
-        egui::ProgressBar::new(level.clamp(0.0, 1.0))
-            .desired_width(90.0)
-            .desired_height(10.0),
-    );
-}
-
-fn eq_controls(ui: &mut egui::Ui, mixer: &Mixer, bus_name: &str, gains_db: [f32; EQ_BAND_COUNT], save_status: &mut Option<String>) {
+fn eq_controls(ui: &mut egui::Ui, mixer: &Mixer, bus_name: &str, gains_db: [f32; EQ_BAND_COUNT]) {
     ui.horizontal(|ui| {
         for band in 0..EQ_BAND_COUNT {
             ui.vertical(|ui| {
@@ -156,12 +167,34 @@ fn eq_controls(ui: &mut egui::Ui, mixer: &Mixer, bus_name: &str, gains_db: [f32;
             });
         }
     });
-    if ui.button("Save EQ presets").clicked() {
-        *save_status = Some(match mixer.save_eq_presets() {
-            Ok(()) => "Saved.".to_string(),
-            Err(e) => format!("Save failed: {e}"),
-        });
-    }
+}
+
+/// A device menu (playback devices for a bus, or microphones and line-ins
+/// for the Mic channel) showing `current` (`None`: `none_label`). Returns the
+/// device just picked, `Some(None)` being the system default.
+fn device_choice(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    devices: &[AudioDevice],
+    current: Option<&str>,
+    none_label: &str,
+) -> Option<Option<String>> {
+    let current_name = match current {
+        Some(id) => devices.iter().find(|d| d.id == id).map_or("(disconnected device)", |d| d.name.as_str()),
+        None => none_label,
+    };
+    let mut picked = None;
+    egui::ComboBox::from_id_salt(id_salt).selected_text(current_name).show_ui(ui, |ui| {
+        if ui.selectable_label(current.is_none(), "System Default").clicked() {
+            picked = Some(None);
+        }
+        for device in devices {
+            if ui.selectable_label(current == Some(device.id.as_str()), &device.name).clicked() {
+                picked = Some(Some(device.id.clone()));
+            }
+        }
+    });
+    picked
 }
 
 impl eframe::App for MixerApp {
@@ -173,10 +206,13 @@ impl eframe::App for MixerApp {
             self.mixer.recover_routed_volumes();
         }
 
+        // Levels are peaks since the previous read: read each once a frame.
         let buses = self.mixer.buses();
         let sources = self.mixer.sources();
+        let master_level = self.mixer.master_level();
+        self.persistence.tick(&self.mixer, &buses, &sources, &self.available_sessions);
 
-        let meters_active = self.mixer.master_level() > METER_ACTIVITY_THRESHOLD
+        let meters_active = master_level > METER_ACTIVITY_THRESHOLD
             || buses.iter().any(|b| b.level > METER_ACTIVITY_THRESHOLD)
             || sources.iter().any(|s| s.level > METER_ACTIVITY_THRESHOLD);
         ui.ctx().request_repaint_after(if meters_active {
@@ -190,6 +226,14 @@ impl eframe::App for MixerApp {
                 ui.selectable_value(&mut self.tab, Tab::Mixer, "Mixer");
                 ui.selectable_value(&mut self.tab, Tab::Clips, "Clips");
             });
+            if !self.config_notices.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.colored_label(egui::Color32::from_rgb(230, 170, 60), self.config_notices.join(" "));
+                    if ui.small_button("Dismiss").clicked() {
+                        self.config_notices.clear();
+                    }
+                });
+            }
         });
         if self.tab == Tab::Clips {
             self.moments.tab(ui, &self.mixer);
@@ -203,8 +247,8 @@ impl eframe::App for MixerApp {
         if let Some(selected) = self.selected_bus.clone() {
             egui::Panel::right("bus_detail").min_size(380.0).show(ui, |ui| {
                 ui.heading(&selected);
-                if let Some(status) = &self.save_status {
-                    ui.label(status.clone());
+                if let Some(status) = &self.status {
+                    ui.colored_label(egui::Color32::from_rgb(230, 100, 100), status);
                 }
                 ui.separator();
 
@@ -212,38 +256,41 @@ impl eframe::App for MixerApp {
                     return;
                 };
 
-                ui.horizontal(|ui| {
-                    ui.strong("Output device");
-                    let current_name = bus
-                        .device_id
-                        .as_ref()
-                        .and_then(|id| self.output_devices.iter().find(|d| &d.id == id))
-                        .map(|d| d.name.clone())
-                        .unwrap_or_else(|| "System Default".to_string());
-                    egui::ComboBox::from_id_salt("device-choice")
-                        .selected_text(current_name)
-                        .show_ui(ui, |ui| {
-                            if ui.selectable_label(bus.device_id.is_none(), "System Default").clicked() {
-                                self.mixer.set_bus_device(&selected, None);
-                            }
-                            for device in &self.output_devices {
-                                let is_selected = bus.device_id.as_deref() == Some(device.id.as_str());
-                                if ui.selectable_label(is_selected, &device.name).clicked() {
-                                    self.mixer.set_bus_device(&selected, Some(device.id.clone()));
-                                }
-                            }
-                        });
-                });
+                if selected == "Mic" {
+                    // The Mic channel's device is the microphone it records.
+                    let mic = sources.iter().find(|s| s.pid.is_none());
+                    ui.horizontal(|ui| {
+                        ui.strong("Input device");
+                        let current = mic.and_then(|m| m.input_device.as_deref());
+                        let none_label = if mic.is_some() { "System Default" } else { "Not added" };
+                        if let Some(picked) = device_choice(ui, "input-device", &self.input_devices, current, none_label) {
+                            let result = match mic {
+                                Some(mic) => self.mixer.set_mic_device(mic.id, picked),
+                                None => self.mixer.add_mic_source("Microphone", "Mic", picked),
+                            };
+                            self.status = result.err().map(|e| format!("Couldn't open that microphone: {}", e.message()));
+                        }
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.strong("Output device");
+                        let current = bus.device_id.as_deref();
+                        if let Some(picked) = device_choice(ui, "output-device", &self.output_devices, current, "System Default") {
+                            self.mixer.set_bus_device(&selected, picked);
+                        }
+                    });
+                }
                 ui.separator();
 
                 ui.collapsing("EQ", |ui| {
-                    eq_controls(ui, &self.mixer, &selected, bus.eq_gains_db, &mut self.save_status);
+                    eq_controls(ui, &self.mixer, &selected, bus.eq_gains_db);
                 });
                 ui.separator();
 
                 if selected == "Mic" && !mic_already_added {
                     if ui.button("Add Microphone").clicked() {
-                        let _ = self.mixer.add_mic_source("Microphone", "Mic");
+                        let result = self.mixer.add_mic_source("Microphone", "Mic", None);
+                        self.status = result.err().map(|e| format!("Couldn't open the microphone: {}", e.message()));
                     }
                     ui.separator();
                 }
@@ -261,9 +308,19 @@ impl eframe::App for MixerApp {
                         if ui.add(egui::Slider::new(&mut gain, 0.0..=2.0)).changed() {
                             self.mixer.set_source_gain(source.id, gain);
                         }
-                        level_meter(ui, source.level);
+                        level_meter(ui, ("source", source.id), source.level);
                         if ui.button("Remove").clicked() {
                             self.mixer.remove_source(source.id);
+                        }
+                    });
+                }
+                let waiting: Vec<String> = self.persistence.waiting_apps(&selected).map(str::to_string).collect();
+                for app in waiting {
+                    ui.horizontal(|ui| {
+                        ui.label(&app);
+                        ui.weak("not running · routed when it starts");
+                        if ui.button("Remove").clicked() {
+                            self.persistence.forget_waiting_app(&selected, &app);
                         }
                     });
                 }
@@ -295,7 +352,7 @@ impl eframe::App for MixerApp {
                 if ui.add(egui::Slider::new(&mut gain, 0.0..=2.0).text("gain")).changed() {
                     self.mixer.set_master_gain(gain);
                 }
-                level_meter(ui, self.mixer.master_level());
+                level_meter(ui, "master", master_level);
             });
             ui.add_space(24.0);
 
@@ -304,7 +361,7 @@ impl eframe::App for MixerApp {
                     let bus = buses.iter().find(|b| b.name == bus_name);
                     let mut gain = bus.map(|b| b.gain).unwrap_or(1.0);
                     let level = bus.map(|b| b.level).unwrap_or(0.0);
-                    let color = BUS_COLORS[i % BUS_COLORS.len()];
+                    let color = self.persistence.bus_color(bus_name).unwrap_or(BUS_COLORS[i % BUS_COLORS.len()]);
 
                     ui.vertical(|ui| {
                         ui.set_width(70.0);
@@ -316,7 +373,7 @@ impl eframe::App for MixerApp {
                                 if ui.add_sized([36.0, 180.0], slider).changed() {
                                     self.mixer.set_bus_gain(bus_name, gain);
                                 }
-                                level_meter(ui, level);
+                                level_meter(ui, ("bus", bus_name), level);
                                 let selected = self.selected_bus.as_deref() == Some(bus_name);
                                 if ui.selectable_label(selected, bus_name).clicked() {
                                     self.selected_bus = Some(bus_name.to_string());
@@ -327,6 +384,10 @@ impl eframe::App for MixerApp {
                 }
             });
         });
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persistence.save_now(&self.mixer);
     }
 }
 

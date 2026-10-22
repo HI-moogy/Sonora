@@ -8,7 +8,7 @@ fn main() -> windows::core::Result<()> {
     // --- Phase 1: mic capture is alive and feeding the mixer ---
     {
         let mixer = Mixer::start()?;
-        let id = mixer.add_mic_source("Microphone", "Mic")?;
+        let id = mixer.add_mic_source("Microphone", "Mic", None)?;
         println!("mic source added: id={id}");
 
         for _ in 0..6 {
@@ -35,28 +35,6 @@ fn main() -> windows::core::Result<()> {
         assert!((gains[0] - 6.0).abs() < 0.001, "band 0 should be 6.0");
         assert!((gains[4] - (-4.0)).abs() < 0.001, "band 4 should be -4.0");
 
-        // --- Phase 3: persistence ---
-        mixer.save_eq_presets().expect("save presets");
-        println!("saved presets");
-
-        mixer.remove_source(id);
-    } // mixer (and its threads) drop here
-
-    std::thread::sleep(Duration::from_millis(200));
-
-    // --- Phase 4: a fresh Mixer restores the saved EQ for the same bus name ---
-    {
-        let mixer = Mixer::start()?;
-        let id = mixer.add_mic_source("Microphone", "Mic")?;
-        let gains = mixer
-            .buses()
-            .into_iter()
-            .find(|b| b.name == "Mic")
-            .map(|b| b.eq_gains_db)
-            .expect("Mic bus should exist");
-        println!("Mic EQ after restart: {gains:?}");
-        assert!((gains[0] - 6.0).abs() < 0.001, "band 0 should restore to 6.0");
-        assert!((gains[4] - (-4.0)).abs() < 0.001, "band 4 should restore to -4.0");
         mixer.remove_source(id);
     }
 

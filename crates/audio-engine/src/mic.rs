@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 
 use nnnoiseless::DenoiseState;
-use windows::core::Result;
+use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     eCapture, eConsole, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
@@ -33,12 +33,21 @@ fn mono_format() -> WAVEFORMATEX {
     }
 }
 
-fn open_default_capture_client(
+/// Opens `device_id` (from [`crate::devices::list_input_devices`]), or the
+/// system default microphone when `None`.
+fn open_capture_client(
+    device_id: Option<&str>,
     format: &WAVEFORMATEX,
 ) -> Result<(IAudioClient, IAudioCaptureClient, HANDLE)> {
     unsafe {
         let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let device = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)?;
+        let device = match device_id {
+            Some(id) => {
+                let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+                enumerator.GetDevice(PCWSTR(wide.as_ptr()))?
+            }
+            None => enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)?,
+        };
         let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
         let event = CreateEventW(None, false, false, None)?;
         client.Initialize(
@@ -56,7 +65,7 @@ fn open_default_capture_client(
     }
 }
 
-/// Runs entirely on its own thread: captures the default microphone, runs
+/// Runs entirely on its own thread: captures the microphone, runs
 /// it through RNNoise in RNNoise's native 10ms/480-sample mono frames, and
 /// pushes the cleaned audio (duplicated to stereo) into `source.samples`
 /// for the mixer to pick up, exactly like a process capture source.
@@ -64,7 +73,11 @@ fn open_default_capture_client(
 /// RNNoise expects samples pre-scaled to 16-bit PCM range
 /// (`[-32768.0, 32767.0]`), not the `[-1.0, 1.0]` range the rest of this
 /// engine uses, so samples are scaled up before and back down after.
-pub(crate) fn run_mic_capture_thread(source: Arc<SourceInner>, ready_tx: mpsc::Sender<Result<()>>) {
+pub(crate) fn run_mic_capture_thread(
+    source: Arc<SourceInner>,
+    device_id: Option<String>,
+    ready_tx: mpsc::Sender<Result<()>>,
+) {
     let _com = match ComGuard::init() {
         Ok(com) => com,
         Err(error) => {
@@ -74,7 +87,7 @@ pub(crate) fn run_mic_capture_thread(source: Arc<SourceInner>, ready_tx: mpsc::S
     };
 
     let format = mono_format();
-    let setup = open_default_capture_client(&format);
+    let setup = open_capture_client(device_id.as_deref(), &format);
     let (capture_client, capture_service, event) = match setup {
         Ok(triple) => {
             let _ = ready_tx.send(Ok(()));
@@ -130,18 +143,14 @@ pub(crate) fn run_mic_capture_thread(source: Arc<SourceInner>, ready_tx: mpsc::S
                 denoiser.process_frame(&mut out_frame, &in_frame);
 
                 let mut buffer = source.samples.lock().unwrap();
-                let mut peak = 0.0f32;
                 for &cleaned in out_frame.iter() {
                     let sample = (cleaned / 32768.0).clamp(-1.0, 1.0);
-                    peak = peak.max(sample.abs());
                     buffer.push_back(sample); // left
                     buffer.push_back(sample); // right (mono duplicated to stereo)
                 }
                 while buffer.len() > MAX_BUFFERED_SAMPLES {
                     buffer.pop_front();
                 }
-                drop(buffer);
-                source.level.store(peak);
             }
         }
     }
