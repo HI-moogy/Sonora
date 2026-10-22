@@ -7,17 +7,20 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
+use crate::audio::{self, AudioInput, AudioRings, AudioShared};
 use crate::com::MfThread;
 use crate::convert::Converter;
 use crate::d3d::open_primary_output;
 use crate::duplication::{Desktop, Poll};
 use crate::encoder::{EncoderConfig, H264Encoder};
 use crate::h264::to_access_unit;
-use crate::mux::{write_clip, ClipVideo};
+use crate::mux::{write_clip, Clip};
 use crate::ring::{VideoRing, VideoSample};
 use crate::{SaveError, StartError, VideoSettings};
 
 const HNS_PER_SECOND: i64 = 10_000_000;
+/// Comfortably more than the audio pipeline's lag (block wait + one block).
+const AUDIO_CATCH_UP: Duration = Duration::from_millis(250);
 
 enum Command {
     Save { dir: PathBuf, reply: Sender<Result<PathBuf, SaveError>> },
@@ -48,26 +51,67 @@ impl RecorderStatus {
     }
 }
 
-/// Continuously records the primary monitor into a rolling in-memory buffer
-/// of hardware-encoded H.264. Dropping it stops recording.
+/// Continuously records the primary monitor (hardware-encoded H.264) and the
+/// audio tracks fed through [`Recorder::audio_input`] into rolling in-memory
+/// buffers. Dropping it stops recording.
 pub struct Recorder {
     commands: Option<Sender<Command>>,
     worker: Option<JoinHandle<()>>,
+    audio: Arc<AudioShared>,
+    audio_worker: Option<JoinHandle<()>>,
     status: Arc<RecorderStatus>,
 }
 
 impl Recorder {
-    pub fn start(settings: VideoSettings) -> Result<Self, StartError> {
+    /// `tracks` names the audio tracks clips get after the mix track, in
+    /// order (for sonar-rs: the buses).
+    pub fn start(settings: VideoSettings, tracks: &[&str]) -> Result<Self, StartError> {
+        let epoch = Instant::now();
+        let span = settings.buffer_secs as i64 * HNS_PER_SECOND;
+        let status = Arc::new(RecorderStatus::default());
+        let audio = AudioShared::new(epoch, tracks);
+        let rings = audio::new_rings(tracks.len(), span);
+
+        let audio_worker = {
+            let (audio, rings, status) = (audio.clone(), rings.clone(), status.clone());
+            std::thread::Builder::new()
+                .name("moments-audio".into())
+                .spawn(move || {
+                    if let Err(error) = audio::run(audio, rings) {
+                        *status.error.lock().unwrap() = Some(format!("audio: {error}"));
+                    }
+                })
+                .expect("spawn moments audio thread")
+        };
+
         let (commands, command_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
-        let status = Arc::new(RecorderStatus::default());
         let worker_status = status.clone();
         let worker = std::thread::Builder::new()
             .name("moments-video".into())
-            .spawn(move || run(settings, command_rx, ready_tx, worker_status))
+            .spawn(move || run(settings, epoch, rings, command_rx, ready_tx, worker_status))
             .expect("spawn moments video thread");
+        let recorder = Self {
+            commands: Some(commands),
+            worker: Some(worker),
+            audio,
+            audio_worker: Some(audio_worker),
+            status,
+        };
+        // On failure, dropping `recorder` stops and joins both threads.
         ready_rx.recv().map_err(|_| StartError::ThreadExited)??;
-        Ok(Self { commands: Some(commands), worker: Some(worker), status })
+        Ok(recorder)
+    }
+
+    /// Handle for feeding audio tracks (cheap to clone, safe to call from a
+    /// real-time thread).
+    pub fn audio_input(&self) -> AudioInput {
+        AudioInput(self.audio.clone())
+    }
+
+    /// Scales one track in saved clips (and its share of the mix track).
+    pub fn set_track_volume(&self, track: &str, volume: f32) {
+        self.audio.set_volume(track, volume);
     }
 
     pub fn status(&self) -> &RecorderStatus {
@@ -88,9 +132,10 @@ impl Recorder {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
-        // Closing the channel tells the worker to stop.
+        // Closing the channel tells the video worker to stop.
         self.commands = None;
-        if let Some(worker) = self.worker.take() {
+        self.audio.stop();
+        for worker in [self.worker.take(), self.audio_worker.take()].into_iter().flatten() {
             let _ = worker.join();
         }
     }
@@ -98,6 +143,8 @@ impl Drop for Recorder {
 
 fn run(
     settings: VideoSettings,
+    epoch: Instant,
+    rings: AudioRings,
     commands: Receiver<Command>,
     ready: Sender<Result<(), StartError>>,
     status: Arc<RecorderStatus>,
@@ -109,7 +156,7 @@ fn run(
             return;
         }
     };
-    let mut session = match Session::open(&settings) {
+    let mut session = match Session::open(&settings, epoch, rings) {
         Ok(session) => {
             let _ = ready.send(Ok(()));
             session
@@ -134,10 +181,12 @@ struct Session {
     ring: VideoRing,
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
+    epoch: Instant,
+    audio: AudioRings,
 }
 
 impl Session {
-    fn open(settings: &VideoSettings) -> Result<Self, StartError> {
+    fn open(settings: &VideoSettings, epoch: Instant, audio: AudioRings) -> Result<Self, StartError> {
         let primary = open_primary_output()?;
         let desktop = Desktop::new(primary.device.clone(), primary.context.clone(), primary.output)?;
         let (width, height) = settings.resolution.size();
@@ -162,6 +211,8 @@ impl Session {
             ring: VideoRing::new(settings.buffer_secs as i64 * HNS_PER_SECOND),
             sps: None,
             pps: None,
+            epoch,
+            audio,
         })
     }
 
@@ -172,8 +223,8 @@ impl Session {
         status: &RecorderStatus,
     ) -> windows::core::Result<()> {
         let interval = Duration::from_secs(1) / settings.fps;
-        let epoch = Instant::now();
-        let mut next_due = epoch;
+        let epoch = self.epoch;
+        let mut next_due = Instant::now();
 
         loop {
             match commands.try_recv() {
@@ -223,7 +274,8 @@ impl Session {
             }
 
             status.buffered_ms.store((self.ring.duration() / 10_000) as u64, Ordering::Relaxed);
-            status.buffered_bytes.store(self.ring.bytes(), Ordering::Relaxed);
+            let audio_bytes: usize = self.audio.lock().unwrap().iter().map(|ring| ring.bytes()).sum();
+            status.buffered_bytes.store(self.ring.bytes() + audio_bytes, Ordering::Relaxed);
         }
     }
 
@@ -248,18 +300,32 @@ impl Session {
             let _ = reply.send(Err(SaveError::Empty));
             return;
         };
+        let frames = self.ring.snapshot(settings.buffer_secs as i64 * HNS_PER_SECOND);
+        let frame_duration = HNS_PER_SECOND / settings.fps as i64;
         let (width, height) = settings.resolution.size();
-        let clip = ClipVideo {
+        let mut clip = Clip {
             width: width as u16,
             height: height as u16,
             sps,
             pps,
-            frames: self.ring.snapshot(settings.buffer_secs as i64 * HNS_PER_SECOND),
-            frame_duration: HNS_PER_SECOND / settings.fps as i64,
+            frames,
+            frame_duration,
+            tracks: Vec::new(),
+            mix: Vec::new(),
         };
+        let audio = self.audio.clone();
         std::thread::Builder::new()
             .name("moments-save".into())
             .spawn(move || {
+                // Audio is encoded a little behind real time (it waits for
+                // late pushes), so give it time to reach the video's end.
+                std::thread::sleep(AUDIO_CATCH_UP);
+                if let (Some(first), Some(last)) = (clip.frames.first(), clip.frames.last()) {
+                    let end = last.pts + clip.frame_duration;
+                    let rings = audio.lock().unwrap();
+                    clip.mix = rings[0].snapshot(first.pts, end);
+                    clip.tracks = rings[1..].iter().map(|ring| ring.snapshot(first.pts, end)).collect();
+                }
                 let _ = reply.send(save_to(&dir, &clip));
             })
             .expect("spawn clip save thread");
@@ -268,7 +334,7 @@ impl Session {
 
 /// Writes under a temporary name first so a half-written file never shows
 /// up as a clip.
-fn save_to(dir: &Path, clip: &ClipVideo) -> Result<PathBuf, SaveError> {
+fn save_to(dir: &Path, clip: &Clip) -> Result<PathBuf, SaveError> {
     std::fs::create_dir_all(dir)?;
     let path = unique_clip_path(dir);
     let partial = path.with_extension("mp4.partial");

@@ -1,4 +1,4 @@
-﻿use std::mem::ManuallyDrop;
+use std::mem::ManuallyDrop;
 
 use windows::core::{Interface, Result, GUID};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};

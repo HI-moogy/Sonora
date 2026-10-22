@@ -1,6 +1,8 @@
 //! Moments: always-on recording of the primary monitor into a rolling
 //! buffer, saved to MP4 on demand.
 
+mod aac;
+mod audio;
 mod com;
 mod convert;
 mod d3d;
@@ -16,6 +18,7 @@ use std::path::PathBuf;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{FOLDERID_Videos, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 
+pub use audio::{AudioInput, MIX_TRACK};
 pub use recorder::{Recorder, RecorderStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

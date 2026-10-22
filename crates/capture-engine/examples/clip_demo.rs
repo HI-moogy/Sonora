@@ -1,5 +1,9 @@
-//! Records the primary monitor for a few seconds and saves a clip.
+//! Records the primary monitor for a few seconds, with synthetic test tones
+//! on the audio tracks, and saves a clip.
 //! Usage: clip_demo [seconds to record] [buffer seconds] [fps] [720|1080|1440|2160]
+//!
+//! Tracks: Game 440 Hz, Chat 880 Hz at 50% clip volume, Aux and Media
+//! silent, Mic 220 Hz; all tones at amplitude 0.5.
 
 use std::time::{Duration, Instant};
 
@@ -28,8 +32,33 @@ fn main() {
     println!("settings: {settings:?}, bitrate {} bps", settings.bitrate());
 
     let started = Instant::now();
-    let recorder = Recorder::start(settings).expect("start recorder");
+    let tracks = ["Game", "Chat", "Aux", "Media", "Mic"];
+    let recorder = Recorder::start(settings, &tracks).expect("start recorder");
     println!("recorder started in {:?}", started.elapsed());
+    recorder.set_track_volume("Chat", 0.5);
+
+    let input = recorder.audio_input();
+    std::thread::spawn(move || {
+        let tones = [("Game", 440.0f32), ("Chat", 880.0), ("Aux", 0.0), ("Media", 0.0), ("Mic", 220.0)];
+        let mut phase = [0.0f32; 5];
+        let chunk = 480; // 10 ms at 48 kHz
+        let begun = Instant::now();
+        let mut n = 0u64;
+        loop {
+            n += 1;
+            for (i, &(track, freq)) in tones.iter().enumerate() {
+                let mut samples = Vec::with_capacity(chunk * 2);
+                for _ in 0..chunk {
+                    let value = if freq > 0.0 { 0.5 * (phase[i] * std::f32::consts::TAU).sin() } else { 0.0 };
+                    phase[i] = (phase[i] + freq / 48_000.0).fract();
+                    samples.extend([value, value]);
+                }
+                input.push(track, &samples);
+            }
+            let due = begun + Duration::from_millis(10 * n);
+            std::thread::sleep(due.saturating_duration_since(Instant::now()));
+        }
+    });
 
     for _ in 0..record_secs {
         std::thread::sleep(Duration::from_secs(1));

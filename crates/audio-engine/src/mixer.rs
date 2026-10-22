@@ -48,6 +48,16 @@ struct BusInner {
     device_id: Mutex<Option<String>>,
 }
 
+/// Receives every bus's audio as the mixer renders it: after the bus's EQ,
+/// before its volume fader and mute, so recordings don't depend on how loud
+/// you're listening. Called on the render thread, so it must be cheap.
+pub trait BusTap: Send + Sync {
+    /// `samples` is interleaved stereo f32 at 48 kHz.
+    fn bus_audio(&self, bus: &str, samples: &[f32]);
+}
+
+type SharedTap = Arc<Mutex<Option<Arc<dyn BusTap>>>>;
+
 /// A snapshot of one source's current state for UI display.
 pub struct SourceInfo {
     pub id: u64,
@@ -82,6 +92,7 @@ pub struct Mixer {
     master_gain: Arc<AtomicF32>,
     master_level: Arc<AtomicF32>,
     render_stop: Arc<AtomicBool>,
+    bus_tap: SharedTap,
 }
 
 impl Mixer {
@@ -91,6 +102,7 @@ impl Mixer {
         let master_gain = Arc::new(AtomicF32::new(1.0));
         let master_level = Arc::new(AtomicF32::new(0.0));
         let render_stop = Arc::new(AtomicBool::new(false));
+        let bus_tap: SharedTap = Arc::new(Mutex::new(None));
 
         {
             let sources = sources.clone();
@@ -98,11 +110,12 @@ impl Mixer {
             let master_gain = master_gain.clone();
             let master_level = master_level.clone();
             let render_stop = render_stop.clone();
+            let bus_tap = bus_tap.clone();
             std::thread::Builder::new()
                 .name("mixer-render".into())
                 .spawn(move || {
                     if let Err(error) =
-                        run_render_loop(sources, buses, master_gain, master_level, render_stop)
+                        run_render_loop(sources, buses, master_gain, master_level, render_stop, bus_tap)
                     {
                         eprintln!("mixer render thread exited with error: {error:?}");
                     }
@@ -117,7 +130,14 @@ impl Mixer {
             master_gain,
             master_level,
             render_stop,
+            bus_tap,
         })
+    }
+
+    /// Starts (or with `None`, stops) handing every bus's rendered audio to
+    /// `tap`.
+    pub fn set_bus_tap(&self, tap: Option<Arc<dyn BusTap>>) {
+        *self.bus_tap.lock().unwrap() = tap;
     }
 
     fn next_id(&self) -> u64 {
@@ -479,6 +499,14 @@ fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: mpsc::Sender
     }
 }
 
+/// One bus as seen by a single render tick.
+struct BusSnapshot {
+    name: String,
+    bus: Arc<BusInner>,
+    members: Vec<Arc<SourceInner>>,
+    device_id: Option<String>,
+}
+
 /// One opened output device's WASAPI client, kept alive only while at
 /// least one bus currently targets it.
 struct DeviceOutput {
@@ -498,15 +526,18 @@ fn run_render_loop(
     master_gain: Arc<AtomicF32>,
     master_level: Arc<AtomicF32>,
     stop: Arc<AtomicBool>,
+    bus_tap: SharedTap,
 ) -> Result<()> {
     let _com = ComGuard::init()?;
     let format = standard_format();
     let mut device_outputs: HashMap<Option<String>, DeviceOutput> = HashMap::new();
+    // Reused across ticks so tapping doesn't allocate on the render thread.
+    let mut tap_buffers: Vec<Vec<f32>> = Vec::new();
 
     while !stop.load(Ordering::Relaxed) {
         // Snapshot once per render tick (not per sample), grouped by bus so
         // each bus's EQ runs once on that bus's own summed signal.
-        let bus_snapshot: Vec<(Arc<BusInner>, Vec<Arc<SourceInner>>, Option<String>)> = {
+        let bus_snapshot: Vec<BusSnapshot> = {
             let sources = sources.lock().unwrap();
             let buses = buses.lock().unwrap();
             buses
@@ -518,7 +549,7 @@ fn run_render_loop(
                         .filter(|s| *s.bus.lock().unwrap() == *name)
                         .cloned()
                         .collect();
-                    (bus.clone(), members, device_id)
+                    BusSnapshot { name: name.clone(), bus: bus.clone(), members, device_id }
                 })
                 .collect()
         };
@@ -526,7 +557,7 @@ fn run_render_loop(
         // Open any newly-needed device clients; close ones no bus targets
         // anymore.
         let needed_devices: std::collections::HashSet<Option<String>> =
-            bus_snapshot.iter().map(|(_, _, device_id)| device_id.clone()).collect();
+            bus_snapshot.iter().map(|snapshot| snapshot.device_id.clone()).collect();
         for device_id in &needed_devices {
             if device_outputs.contains_key(device_id) {
                 continue;
@@ -561,8 +592,13 @@ fn run_render_loop(
         let master_gain_value = master_gain.load();
         let mut master_peak = 0.0f32;
         let mut source_peaks: Vec<Vec<f32>> =
-            bus_snapshot.iter().map(|(_, members, _)| vec![0.0f32; members.len()]).collect();
+            bus_snapshot.iter().map(|snapshot| vec![0.0f32; snapshot.members.len()]).collect();
         let mut bus_peaks: Vec<f32> = vec![0.0f32; bus_snapshot.len()];
+        let tap = bus_tap.lock().unwrap().clone();
+        if tap.is_some() {
+            tap_buffers.resize_with(bus_snapshot.len(), Vec::new);
+            tap_buffers.iter_mut().for_each(Vec::clear);
+        }
         let mut rendered_any = false;
 
         for (device_id, output) in device_outputs.iter() {
@@ -578,7 +614,7 @@ fn run_render_loop(
             for frame in 0..available as usize {
                 let mut device_mix = [0.0f32; CHANNELS];
 
-                for (bus_idx, (bus, members, bus_device)) in bus_snapshot.iter().enumerate() {
+                for (bus_idx, BusSnapshot { bus, members, device_id: bus_device, .. }) in bus_snapshot.iter().enumerate() {
                     if bus_device != device_id {
                         continue;
                     }
@@ -605,6 +641,9 @@ fn run_render_loop(
                     }
 
                     bus.eq.lock().unwrap().process(&mut bus_mix);
+                    if tap.is_some() {
+                        tap_buffers[bus_idx].extend_from_slice(&bus_mix);
+                    }
                     let bus_frame_peak = bus_mix.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
                     bus_peaks[bus_idx] = bus_peaks[bus_idx].max(bus_frame_peak);
 
@@ -630,7 +669,15 @@ fn run_render_loop(
             }
         }
 
-        for (bus_idx, (bus, members, _)) in bus_snapshot.iter().enumerate() {
+        if let Some(tap) = &tap {
+            for (snapshot, samples) in bus_snapshot.iter().zip(&tap_buffers) {
+                if !samples.is_empty() {
+                    tap.bus_audio(&snapshot.name, samples);
+                }
+            }
+        }
+
+        for (bus_idx, BusSnapshot { bus, members, .. }) in bus_snapshot.iter().enumerate() {
             bus.level.store(bus_peaks[bus_idx]);
             for (src_idx, source) in members.iter().enumerate() {
                 source.level.store(source_peaks[bus_idx][src_idx]);

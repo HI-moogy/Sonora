@@ -1,11 +1,13 @@
-//! Decodes a clip with Windows' own MP4 demuxer and H.264 decoder (independent
-//! of sonar-rs's writer) and reports what it finds. Writes the frame nearest
-//! the middle to `<clip>.mid.bmp`.
+//! Decodes a clip with Windows' own MP4 demuxer and H.264/AAC decoders
+//! (independent of sonar-rs's writer) and reports what it finds: video frame
+//! count and rate, and for each audio track its length, loudness (RMS) and
+//! dominant pitch (from zero crossings). Writes the frame nearest the middle
+//! to `<clip>.mid.bmp`.
 //! Usage: probe_clip <path.mp4>
 
 use windows::core::HSTRING;
 use windows::Win32::Media::MediaFoundation::{
-    IMFSample, MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Audio,
+    IMFSample, IMFSourceReader, MFAudioFormat_Float, MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Audio,
     MFMediaType_Video, MFStartup, MFVideoFormat_RGB32, MFSTARTUP_FULL, MF_MT_DEFAULT_STRIDE,
     MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
     MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_VERSION,
@@ -14,6 +16,7 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 const FIRST_VIDEO_STREAM: u32 = 0xFFFF_FFFC;
 const MEDIA_SOURCE: u32 = 0xFFFF_FFFF;
+const ALL_STREAMS: u32 = 0xFFFF_FFFE;
 
 fn main() -> windows::core::Result<()> {
     let path = std::env::args().nth(1).expect("usage: probe_clip <path.mp4>");
@@ -33,12 +36,21 @@ fn main() -> windows::core::Result<()> {
     println!("duration: {:.3}s", duration_hns as f64 / 1e7);
 
     let mut stream = 0;
+    let mut audio_streams = Vec::new();
     while let Ok(native) = unsafe { reader.GetNativeMediaType(stream, 0) } {
         let major = unsafe { native.GetGUID(&MF_MT_MAJOR_TYPE)? };
         let kind = if major == MFMediaType_Video { "video" } else if major == MFMediaType_Audio { "audio" } else { "other" };
         let subtype = unsafe { native.GetGUID(&MF_MT_SUBTYPE)? };
-        println!("stream {stream}: {kind} subtype {subtype:?}");
+        let selected = unsafe { reader.GetStreamSelection(stream) }.map(|b| b.as_bool()).unwrap_or(false);
+        println!("stream {stream}: {kind} subtype {subtype:?}{}", if selected { "  [selected by default]" } else { "" });
+        if major == MFMediaType_Audio {
+            audio_streams.push(stream);
+        }
         stream += 1;
+    }
+    for &audio in &audio_streams {
+        let reader = unsafe { MFCreateSourceReaderFromURL(&HSTRING::from(path.as_str()), None)? };
+        analyze_audio(&reader, audio)?;
     }
 
     let rgb = unsafe { MFCreateMediaType()? };
@@ -74,6 +86,45 @@ fn main() -> windows::core::Result<()> {
     if saved {
         println!("middle frame written to {path}.mid.bmp");
     }
+    Ok(())
+}
+
+fn analyze_audio(reader: &IMFSourceReader, stream: u32) -> windows::core::Result<()> {
+    let float = unsafe { MFCreateMediaType()? };
+    unsafe {
+        reader.SetStreamSelection(ALL_STREAMS, false)?;
+        reader.SetStreamSelection(stream, true)?;
+        float.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        float.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_Float)?;
+        reader.SetCurrentMediaType(stream, None, &float)?;
+    }
+    let mut left: Vec<f32> = Vec::new();
+    let mut first_ts = None;
+    loop {
+        let (mut flags, mut timestamp, mut sample): (u32, i64, Option<IMFSample>) = (0, 0, None);
+        unsafe { reader.ReadSample(stream, 0, None, Some(&mut flags), Some(&mut timestamp), Some(&mut sample))? };
+        if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+            break;
+        }
+        let Some(sample) = sample else { continue };
+        first_ts.get_or_insert(timestamp);
+        let buffer = unsafe { sample.ConvertToContiguousBuffer()? };
+        let (mut data, mut len) = (std::ptr::null_mut(), 0u32);
+        unsafe { buffer.Lock(&mut data, None, Some(&mut len))? };
+        let floats = unsafe { std::slice::from_raw_parts(data as *const f32, len as usize / 4) };
+        left.extend(floats.iter().step_by(2));
+        unsafe { buffer.Unlock()? };
+    }
+    let secs = left.len() as f64 / 48_000.0;
+    // Skip the encoder's start-up silence when judging level and pitch.
+    let body = &left[left.len().min(4_800)..];
+    let rms = (body.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / body.len().max(1) as f64).sqrt();
+    let crossings = body.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count();
+    let pitch = crossings as f64 / 2.0 / (body.len() as f64 / 48_000.0).max(1e-9);
+    println!(
+        "audio stream {stream}: {secs:.3}s, first sample at {:.3}s, RMS {rms:.3}, ~{pitch:.0} Hz",
+        first_ts.unwrap_or(0) as f64 / 1e7
+    );
     Ok(())
 }
 
