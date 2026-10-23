@@ -6,10 +6,7 @@ use windows::Win32::System::Threading::{
     CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsIconic, SetForegroundWindow, ShowWindow,
-    SW_RESTORE,
-};
+use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, GetWindowThreadProcessId};
 
 /// The main window's title; also how a second launch finds the first window.
 pub const WINDOW_TITLE: &str = "sonar-rs";
@@ -52,11 +49,9 @@ fn focus_existing_window() {
     let mut search = Search { own_exe, found: None };
     unsafe {
         let _ = EnumWindows(Some(match_window), LPARAM(&mut search as *mut Search as isize));
+        // It may be hidden in the tray, not just minimized.
         if let Some(hwnd) = search.found {
-            if IsIconic(hwnd).as_bool() {
-                let _ = ShowWindow(hwnd, SW_RESTORE);
-            }
-            let _ = SetForegroundWindow(hwnd);
+            crate::tray::show_window(hwnd);
         }
     }
 }

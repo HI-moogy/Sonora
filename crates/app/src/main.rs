@@ -2,6 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use audio_engine::{
@@ -10,6 +12,7 @@ use audio_engine::{
 };
 use eframe::egui;
 
+mod autostart;
 mod clips;
 mod hotkey;
 mod meter;
@@ -17,10 +20,12 @@ mod moments;
 mod setup;
 mod single_instance;
 mod sounds;
+mod tray;
 
 use meter::level_meter;
 use moments::Moments;
 use setup::MixerPersistence;
+use tray::{Tray, TrayCommand};
 
 /// The five channels always shown as faders, matching SteelSeries Sonar's
 /// own channel naming plus a dedicated Mic channel.
@@ -46,6 +51,11 @@ const ROUTE_RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const ACTIVE_REPAINT_INTERVAL: Duration = Duration::from_millis(33);
 const IDLE_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
 const METER_ACTIVITY_THRESHOLD: f32 = 0.001;
+/// While hidden to the tray nothing is drawn; the app only wakes this often
+/// for its background work (routing apps as they start, restoring volumes).
+const HIDDEN_WAKE_INTERVAL: Duration = Duration::from_secs(1);
+/// How many first frames a sign-in start keeps its window hidden for.
+const START_HIDDEN_FRAMES: u32 = 5;
 
 struct AvailableSession {
     pid: u32,
@@ -74,6 +84,19 @@ struct MixerApp {
     persistence: MixerPersistence,
     /// Problems loading settings, shown until dismissed.
     config_notices: Vec<String>,
+    /// `None` if the tray icon couldn't be added; closing the window then
+    /// quits, since there'd be no way to bring it back.
+    tray: Option<Tray>,
+    /// Set by the tray's Quit, so closing the window really exits.
+    quitting: Arc<AtomicBool>,
+    /// Whether this run already said it keeps running in the tray.
+    tray_hint_shown: bool,
+    /// The main window's handle, found on first use.
+    window: Option<windows::Win32::Foundation::HWND>,
+    /// Started at sign-in: frames left during which to keep the window
+    /// hidden, since eframe shows it once after its first frame whatever it
+    /// was created with.
+    start_hidden_frames: u32,
 }
 
 impl MixerApp {
@@ -82,13 +105,29 @@ impl MixerApp {
     // calls work fine under that apartment, so this thread doesn't need its
     // own ComGuard. Only the mixer's dedicated capture/render threads need
     // (and independently set up) their own COM apartment.
-    fn new(ctx: &egui::Context) -> windows::core::Result<Self> {
+    fn new(ctx: &egui::Context, start_hidden: bool) -> windows::core::Result<Self> {
         let mixer = Mixer::start()?;
         for bus in FIXED_BUSES {
             mixer.ensure_bus(bus);
         }
         let persistence = MixerPersistence::restore(&mixer);
         let moments = Moments::new(ctx, &mixer);
+        let quitting = Arc::new(AtomicBool::new(false));
+        let tray = {
+            let ctx = ctx.clone();
+            let quitting = quitting.clone();
+            Tray::start(move |command| {
+                match command {
+                    TrayCommand::Open => tray::show_main_window(),
+                    TrayCommand::Quit => {
+                        quitting.store(true, Ordering::Relaxed);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+                ctx.request_repaint();
+            })
+            .ok()
+        };
         Ok(Self {
             mixer,
             moments,
@@ -103,6 +142,11 @@ impl MixerApp {
             status: None,
             persistence,
             config_notices: common::take_config_notices(),
+            tray,
+            quitting,
+            tray_hint_shown: false,
+            window: None,
+            start_hidden_frames: if start_hidden { START_HIDDEN_FRAMES } else { 0 },
         })
     }
 
@@ -199,6 +243,21 @@ fn device_choice(
 
 impl eframe::App for MixerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Closing the window hides it to the tray: routing and clip
+        // recording keep running. The tray's Quit exits.
+        if ui.ctx().input(|i| i.viewport().close_requested()) && !self.quitting.load(Ordering::Relaxed) {
+            if let Some(tray) = &self.tray {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                tray::hide_main_window();
+                if !self.tray_hint_shown {
+                    tray.notify(
+                        "sonar-rs is still running",
+                        "It keeps routing audio and recording clips. Right-click its tray icon to quit.",
+                    );
+                    self.tray_hint_shown = true;
+                }
+            }
+        }
         self.refresh_sessions();
         self.refresh_devices();
         if self.last_route_recovery.elapsed() >= ROUTE_RECOVERY_INTERVAL {
@@ -211,6 +270,22 @@ impl eframe::App for MixerApp {
         let sources = self.mixer.sources();
         let master_level = self.mixer.master_level();
         self.persistence.tick(&self.mixer, &buses, &sources, &self.available_sessions);
+
+        if self.window.is_none() {
+            self.window = tray::main_window();
+        }
+        if self.start_hidden_frames > 0 && self.tray.is_some() {
+            if let Some(window) = self.window {
+                tray::hide_window(window);
+            }
+            self.start_hidden_frames -= 1;
+            ui.ctx().request_repaint();
+            return;
+        }
+        if self.window.is_some_and(|window| !tray::is_shown(window)) {
+            ui.ctx().request_repaint_after(HIDDEN_WAKE_INTERVAL);
+            return;
+        }
 
         let meters_active = master_level > METER_ACTIVITY_THRESHOLD
             || buses.iter().any(|b| b.level > METER_ACTIVITY_THRESHOLD)
@@ -412,9 +487,12 @@ fn main() -> eframe::Result<()> {
     };
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
         .expect("bundled icon.png is a valid PNG");
+    // Started at sign-in: stay in the tray until opened.
+    let background = std::env::args().any(|arg| arg == autostart::BACKGROUND_ARG);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 700.0])
+            .with_visible(!background)
             .with_icon(icon),
         ..Default::default()
     };
@@ -422,7 +500,7 @@ fn main() -> eframe::Result<()> {
         single_instance::WINDOW_TITLE,
         options,
         Box::new(|cc| {
-            let app = MixerApp::new(&cc.egui_ctx).expect("failed to start audio mixer");
+            let app = MixerApp::new(&cc.egui_ctx, background).expect("failed to start audio mixer");
             Ok(Box::new(app))
         }),
     )
