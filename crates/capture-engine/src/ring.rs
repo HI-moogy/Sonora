@@ -37,6 +37,21 @@ impl VideoRing {
         }
     }
 
+    /// Drops video from before `cutoff` (whole GOPs, so the oldest kept
+    /// frame is still a keyframe). While nothing is being recorded no new
+    /// frames push old ones out, so the recorder ages them out with this.
+    pub(crate) fn prune(&mut self, cutoff: i64) {
+        if self.frames.back().is_some_and(|newest| newest.pts < cutoff) {
+            self.frames.clear();
+            self.bytes = 0;
+            return;
+        }
+        let start = self.start_index_at(cutoff);
+        for dropped in self.frames.drain(..start) {
+            self.bytes -= dropped.data.len();
+        }
+    }
+
     /// The frames covering at least the last `span`, starting on a keyframe.
     pub(crate) fn snapshot(&self, span: i64) -> Vec<VideoSample> {
         self.frames.range(self.start_index(span)..).cloned().collect()
@@ -60,7 +75,11 @@ impl VideoRing {
         let Some(newest) = self.frames.back() else {
             return 0;
         };
-        let cutoff = newest.pts - span;
+        self.start_index_at(newest.pts - span)
+    }
+
+    /// The latest keyframe at or before `cutoff`, or the oldest frame.
+    fn start_index_at(&self, cutoff: i64) -> usize {
         self.frames
             .iter()
             .enumerate()
@@ -107,6 +126,17 @@ mod tests {
         assert!(kept.first().unwrap().keyframe);
         assert_eq!(kept.last().unwrap().pts, 190);
         assert_eq!(ring.bytes(), kept.len() * 10);
+    }
+
+    #[test]
+    fn pruning_keeps_whole_gops_and_empties_once_all_is_old() {
+        let mut ring = VideoRing::new(1_000);
+        filled(&mut ring, 20); // keyframes at 0,40,80,120,160; newest 190
+        ring.prune(130);
+        assert_eq!(ring.snapshot(1_000).first().unwrap().pts, 120);
+        ring.prune(200);
+        assert!(ring.snapshot(1_000).is_empty());
+        assert_eq!(ring.bytes(), 0);
     }
 
     #[test]

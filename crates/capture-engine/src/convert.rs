@@ -7,7 +7,7 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
     ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIDEO_COLOR, D3D11_VIDEO_COLOR_0,
-    D3D11_VIDEO_COLOR_YCbCrA, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+    D3D11_VIDEO_COLOR_RGBA, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
@@ -99,13 +99,13 @@ impl Converter {
                 true,
                 Some(&fit_rect((in_width, in_height), (out_width, out_height))),
             );
-            // Black bars when the desktop's aspect ratio differs from 16:9.
+            // Black bars when the image's aspect ratio differs from 16:9
+            // (a window, or a non-16:9 monitor). Given as RGB: the AMD
+            // driver read a YCbCr black as RGB and drew teal bars.
             let black = D3D11_VIDEO_COLOR {
-                Anonymous: D3D11_VIDEO_COLOR_0 {
-                    YCbCr: D3D11_VIDEO_COLOR_YCbCrA { Y: 16.0 / 255.0, Cb: 0.5, Cr: 0.5, A: 1.0 },
-                },
+                Anonymous: D3D11_VIDEO_COLOR_0 { RGBA: D3D11_VIDEO_COLOR_RGBA { R: 0.0, G: 0.0, B: 0.0, A: 1.0 } },
             };
-            video_context.VideoProcessorSetOutputBackgroundColor(&processor, true, &black);
+            video_context.VideoProcessorSetOutputBackgroundColor(&processor, false, &black);
         }
 
         Ok(Self {

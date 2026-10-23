@@ -13,6 +13,7 @@ use crate::desktop;
 use crate::convert::Converter;
 use crate::d3d::open_primary_output;
 use crate::duplication::{Desktop, Poll};
+use crate::window_capture::WindowCapture;
 use crate::encoder::{EncoderConfig, H264Encoder};
 use crate::h264::to_access_unit;
 use crate::mux::{write_clip, Clip};
@@ -25,7 +26,20 @@ const AUDIO_CATCH_UP: Duration = Duration::from_millis(250);
 
 enum Command {
     Save { dir: PathBuf, reply: Sender<Result<PathBuf, SaveError>> },
+    Target(CaptureTarget),
     Stop,
+}
+
+/// What the recorder captures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureTarget {
+    /// The whole primary monitor.
+    Screen,
+    /// One window (a raw `HWND`): only its own content, even while covered.
+    Window(isize),
+    /// Nothing: no video is recorded, and what was recorded ages out as the
+    /// clip length passes, so a clip can still be saved just after.
+    Nothing,
 }
 
 /// A cheap, cloneable handle for saving clips from any thread (e.g. a
@@ -160,6 +174,13 @@ impl Recorder {
     pub fn save_clip(&self, dir: impl Into<PathBuf>) -> Receiver<Result<PathBuf, SaveError>> {
         self.saver().save(dir)
     }
+
+    /// Switches what's recorded. A window that can't be captured (or that
+    /// closes) records nothing until another target is set; see
+    /// [`RecorderStatus::error`] for why.
+    pub fn set_target(&self, target: CaptureTarget) {
+        let _ = self.commands.send(Command::Target(target));
+    }
 }
 
 impl Drop for Recorder {
@@ -203,10 +224,20 @@ fn run(
     }
 }
 
+/// Where frames currently come from.
+enum Source {
+    Screen(Desktop),
+    Window(WindowCapture),
+    Nothing,
+}
+
 /// Everything the recording loop owns.
 struct Session {
-    desktop: Desktop,
-    converter: Converter,
+    source: Source,
+    /// The primary monitor, to capture again after a window.
+    output: windows::Win32::Graphics::Dxgi::IDXGIOutput5,
+    /// `None` while there's no source.
+    converter: Option<Converter>,
     encoder: H264Encoder,
     device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
     context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
@@ -220,7 +251,7 @@ struct Session {
 impl Session {
     fn open(settings: &VideoSettings, epoch: Instant, audio: AudioRings) -> Result<Self, StartError> {
         let primary = open_primary_output()?;
-        let desktop = Desktop::new(primary.device.clone(), primary.context.clone(), primary.output)?;
+        let desktop = Desktop::new(primary.device.clone(), primary.context.clone(), primary.output.clone())?;
         let (width, height) = settings.resolution.size();
         let converter = Converter::new(
             &primary.device,
@@ -235,8 +266,9 @@ impl Session {
             &EncoderConfig { width, height, fps: settings.fps, bitrate: settings.bitrate() },
         )?;
         Ok(Self {
-            desktop,
-            converter,
+            source: Source::Screen(desktop),
+            output: primary.output,
+            converter: Some(converter),
             encoder,
             device: primary.device,
             context: primary.context,
@@ -261,6 +293,7 @@ impl Session {
         loop {
             match commands.try_recv() {
                 Ok(Command::Save { dir, reply }) => self.save(settings, dir, reply),
+                Ok(Command::Target(target)) => self.switch(target, settings, status),
                 Err(TryRecvError::Empty) => {}
                 Ok(Command::Stop) | Err(TryRecvError::Disconnected) => return Ok(()),
             }
@@ -273,29 +306,37 @@ impl Session {
             if !wait.is_zero() {
                 std::thread::sleep(wait);
             }
-            if self.desktop.poll(Duration::ZERO)? == Poll::Resized {
-                self.converter = Converter::new(
-                    &self.device,
-                    &self.context,
-                    &self.desktop.latest,
-                    (self.desktop.width, self.desktop.height),
-                    settings.resolution.size(),
-                    settings.fps,
-                )?;
+            let polled = match &mut self.source {
+                Source::Screen(desktop) => desktop.poll(Duration::ZERO)?,
+                Source::Window(window) if !window.is_open() => {
+                    self.source = Source::Nothing;
+                    self.converter = None;
+                    Poll::Unchanged
+                }
+                Source::Window(window) => window.poll()?,
+                Source::Nothing => Poll::Unchanged,
+            };
+            if polled == Poll::Resized {
+                self.converter = Some(self.converter_for_source(settings)?);
             }
 
             self.collect_encoded()?;
 
             let now = Instant::now();
+            let pts = (now - epoch).as_nanos() as i64 / 100;
+            if matches!(self.source, Source::Nothing) {
+                self.ring.prune(pts - settings.buffer_secs as i64 * HNS_PER_SECOND);
+            }
             if now >= next_due {
-                let pts = (now - epoch).as_nanos() as i64 / 100;
                 // Only spend GPU time converting when the encoder can take
                 // the frame.
-                if self.encoder.wants_input() {
-                    let frame = self.converter.convert()?;
-                    self.encoder.try_encode(&frame, pts)?;
-                } else {
-                    status.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                if let Some(converter) = &mut self.converter {
+                    if self.encoder.wants_input() {
+                        let frame = converter.convert()?;
+                        self.encoder.try_encode(&frame, pts)?;
+                    } else {
+                        status.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 next_due += interval;
                 if now > next_due + interval {
@@ -309,6 +350,53 @@ impl Session {
             let audio_bytes: usize = self.audio.lock().unwrap().iter().map(|ring| ring.bytes()).sum();
             status.buffered_bytes.store(self.ring.bytes() + audio_bytes, Ordering::Relaxed);
         }
+    }
+
+    /// Changes what's captured. A window that can't be captured records
+    /// nothing and says why in `status`.
+    fn switch(&mut self, target: CaptureTarget, settings: &VideoSettings, status: &RecorderStatus) {
+        let current = match &self.source {
+            Source::Screen(_) => CaptureTarget::Screen,
+            Source::Window(window) => CaptureTarget::Window(window.window),
+            Source::Nothing => CaptureTarget::Nothing,
+        };
+        if current == target {
+            return;
+        }
+        // Release the old capture before starting the new one.
+        self.source = Source::Nothing;
+        self.converter = None;
+        let source = match target {
+            CaptureTarget::Screen => {
+                Desktop::new(self.device.clone(), self.context.clone(), self.output.clone()).map(Source::Screen)
+            }
+            CaptureTarget::Window(window) => {
+                WindowCapture::new(self.device.clone(), self.context.clone(), window).map(Source::Window)
+            }
+            CaptureTarget::Nothing => Ok(Source::Nothing),
+        };
+        let started = source.and_then(|source| {
+            self.source = source;
+            if !matches!(self.source, Source::Nothing) {
+                self.converter = Some(self.converter_for_source(settings)?);
+            }
+            Ok(())
+        });
+        *status.error.lock().unwrap() = started.err().map(|error| format!("couldn't start capturing: {error}"));
+        if status.error.lock().unwrap().is_some() {
+            self.source = Source::Nothing;
+            self.converter = None;
+        }
+    }
+
+    /// A converter from the current source's image to the encode size.
+    fn converter_for_source(&self, settings: &VideoSettings) -> windows::core::Result<Converter> {
+        let (image, size) = match &self.source {
+            Source::Screen(desktop) => (&desktop.latest, (desktop.width, desktop.height)),
+            Source::Window(window) => (&window.latest, (window.width, window.height)),
+            Source::Nothing => unreachable!("no converter without a source"),
+        };
+        Converter::new(&self.device, &self.context, image, size, settings.resolution.size(), settings.fps)
     }
 
     fn collect_encoded(&mut self) -> windows::core::Result<()> {
@@ -333,6 +421,10 @@ impl Session {
             return;
         };
         let frames = self.ring.snapshot(settings.buffer_secs as i64 * HNS_PER_SECOND);
+        if frames.is_empty() {
+            let _ = reply.send(Err(SaveError::Empty));
+            return;
+        }
         let frame_duration = HNS_PER_SECOND / settings.fps as i64;
         let (width, height) = settings.resolution.size();
         let mut clip = Clip {

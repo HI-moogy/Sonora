@@ -127,7 +127,7 @@ fn mode_size(duplication: &IDXGIOutputDuplication) -> (u32, u32) {
     (desc.ModeDesc.Width, desc.ModeDesc.Height)
 }
 
-fn create_image(device: &ID3D11Device, width: u32, height: u32) -> Result<ID3D11Texture2D> {
+pub(crate) fn create_image(device: &ID3D11Device, width: u32, height: u32) -> Result<ID3D11Texture2D> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width,
         Height: height,

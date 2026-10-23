@@ -114,6 +114,23 @@ pub struct MomentsConfig {
     /// Clip volume per track (bus name); a missing track is at 100%.
     pub track_volumes: HashMap<String, f32>,
     pub hotkey: Hotkey,
+    /// What clips record; `None` until you pick (the Clips tab asks),
+    /// recording the whole screen meanwhile.
+    pub record: Option<RecordMode>,
+    /// Apps (lowercase executable names) recorded like games.
+    pub always_record: Vec<String>,
+    /// Detected games (lowercase executable names) never recorded.
+    pub never_record: Vec<String>,
+}
+
+/// What clips record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecordMode {
+    /// The whole primary monitor, always.
+    Screen,
+    /// Only the window of a running game (or an app you chose), and
+    /// nothing while none is open.
+    Games,
 }
 
 impl Default for MomentsConfig {
@@ -126,6 +143,9 @@ impl Default for MomentsConfig {
             clips_dir: None,
             track_volumes: HashMap::new(),
             hotkey: Hotkey::default(),
+            record: None,
+            always_record: Vec::new(),
+            never_record: Vec::new(),
         }
     }
 }

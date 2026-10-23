@@ -15,6 +15,7 @@ use eframe::egui;
 mod autostart;
 mod clips;
 mod eq_presets;
+mod games;
 mod hotkey;
 mod meter;
 mod moments;
@@ -384,6 +385,7 @@ impl eframe::App for MixerApp {
         let sources = self.mixer.sources();
         let master_level = self.mixer.master_level();
         self.persistence.tick(&self.mixer, &buses, &sources, &self.available_sessions);
+        self.moments.tick();
 
         if self.window.is_none() {
             self.window = tray::main_window();

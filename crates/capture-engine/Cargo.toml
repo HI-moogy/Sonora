@@ -22,6 +22,14 @@ windows = { version = "0.62.2", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Variant",
     "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Foundation",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
 ] }
 windows-core = "=0.62.2"
 

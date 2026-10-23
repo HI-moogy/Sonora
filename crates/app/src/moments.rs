@@ -3,16 +3,21 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use audio_engine::{BusTap, Mixer};
-use capture_engine::{default_clips_dir, AudioInput, ClipSaver, Recorder, Resolution, VideoSettings, DESKTOP_TRACK};
-use common::MomentsConfig;
+use capture_engine::{
+    default_clips_dir, AudioInput, CaptureTarget, ClipSaver, Recorder, Resolution, VideoSettings, DESKTOP_TRACK,
+};
+use common::{MomentsConfig, RecordMode};
 use eframe::egui;
 
 use crate::clips::editor::{ClipEditor, EditorAction};
 use crate::clips::{self, ClipList, Thumbnails};
+use crate::games::{self, AppWindow, GameFinder};
 use crate::hotkey::{self, GlobalHotkey};
 use crate::{sounds, FIXED_BUSES};
 
 const CLIP_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+/// How often to look for games (and which one is in front) to record.
+const GAME_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// On-screen size of a clip's thumbnail in the Clips tab.
 const CARD_THUMBNAIL: egui::Vec2 = egui::vec2(256.0, 144.0);
 
@@ -86,6 +91,12 @@ pub struct Moments {
     /// The clip open in the editor, shown instead of the clip list.
     editor: Option<ClipEditor>,
     ctx: egui::Context,
+    games: GameFinder,
+    /// Running apps' windows as of the last check.
+    apps: Vec<AppWindow>,
+    /// What the recorder was last told to capture.
+    target: CaptureTarget,
+    last_game_check: Option<Instant>,
 }
 
 impl Moments {
@@ -104,6 +115,10 @@ impl Moments {
             show_settings: false,
             editor: None,
             ctx: ctx.clone(),
+            games: GameFinder::new(),
+            apps: Vec::new(),
+            target: CaptureTarget::Screen,
+            last_game_check: None,
         };
         *moments.shared.dir.lock().unwrap() = moments.clips_dir();
         moments.restart_recorder(mixer);
@@ -145,9 +160,57 @@ impl Moments {
                 mixer.set_bus_tap(Some(Arc::new(BusesToRecorder(recorder.audio_input()))));
                 *self.shared.saver.lock().unwrap() = Some(recorder.saver());
                 self.recorder = Some(recorder);
+                // A new recorder starts on the whole screen; switch now
+                // rather than recording the desktop until the next check.
+                self.target = CaptureTarget::Screen;
+                self.last_game_check = None;
+                self.tick();
             }
             Err(error) => self.start_error = Some(error.to_string()),
         }
+    }
+
+    /// Keeps the recorder on the right target: the whole screen, or the
+    /// game (or chosen app) in front. Runs every frame, also while the
+    /// window is hidden in the tray, and checks about once a second.
+    pub fn tick(&mut self) {
+        if self.last_game_check.is_some_and(|at| at.elapsed() < GAME_CHECK_INTERVAL) {
+            return;
+        }
+        self.last_game_check = Some(Instant::now());
+        let target = match self.config.record {
+            Some(RecordMode::Games) => {
+                self.apps = self.games.app_windows();
+                let current = match self.target {
+                    CaptureTarget::Window(window) => Some(window),
+                    _ => None,
+                };
+                games::pick_window(&self.apps, &self.config.always_record, &self.config.never_record, current)
+                    .map_or(CaptureTarget::Nothing, |app| CaptureTarget::Window(app.window))
+            }
+            Some(RecordMode::Screen) | None => CaptureTarget::Screen,
+        };
+        if target != self.target {
+            if let Some(recorder) = &self.recorder {
+                recorder.set_target(target);
+            }
+            self.target = target;
+        }
+    }
+
+    /// The app being recorded in games mode, if any.
+    fn recording_app(&self) -> Option<&AppWindow> {
+        match self.target {
+            CaptureTarget::Window(window) => self.apps.iter().find(|app| app.window == window),
+            _ => None,
+        }
+    }
+
+    fn set_record_mode(&mut self, mode: RecordMode) {
+        self.config.record = Some(mode);
+        self.persist();
+        self.last_game_check = None;
+        self.tick();
     }
 
     fn register_hotkey(&mut self) {
@@ -183,9 +246,16 @@ impl Moments {
             return (format!("Stopped: {error}"), true);
         }
         let buffered = status.buffered().min(Duration::from_secs(self.config.buffer_secs as u64));
+        let what = match self.config.record {
+            Some(RecordMode::Games) => match self.recording_app() {
+                Some(app) => format!("Recording {} · ", app.title),
+                None => "No game open, nothing being recorded · ".to_string(),
+            },
+            _ => String::new(),
+        };
         (
             format!(
-                "Buffering {} of {} · {}",
+                "{what}Buffering {} of {} · {}",
                 clips::format_duration(buffered),
                 clips::format_duration(Duration::from_secs(self.config.buffer_secs as u64)),
                 clips::format_size(status.buffered_bytes() as u64),
@@ -246,6 +316,18 @@ impl Moments {
         ui.separator();
 
         egui::Grid::new("moments-settings").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
+            ui.label("Record");
+            ui.horizontal(|ui| {
+                let mode = self.config.record.unwrap_or(RecordMode::Screen);
+                if ui.radio(mode == RecordMode::Screen, "Whole screen").clicked() {
+                    self.set_record_mode(RecordMode::Screen);
+                }
+                if ui.radio(mode == RecordMode::Games, "Only games and apps I choose").clicked() {
+                    self.set_record_mode(RecordMode::Games);
+                }
+            });
+            ui.end_row();
+
             ui.label("Clip length");
             let mut secs = self.config.buffer_secs;
             let response = ui.add(
@@ -330,6 +412,11 @@ impl Moments {
             }
         });
 
+        if self.config.record == Some(RecordMode::Games) {
+            ui.separator();
+            self.games_ui(ui);
+        }
+
         ui.separator();
         ui.strong("Clip audio");
         ui.weak("How loud each track is in saved clips. This doesn't change what you hear.");
@@ -354,6 +441,96 @@ impl Moments {
             }
         });
 
+    }
+
+    /// Which games and apps get recorded: what's open now, and the apps
+    /// you added or left out.
+    fn games_ui(&mut self, ui: &mut egui::Ui) {
+        ui.strong("Games and apps");
+        ui.weak(
+            "Games are found automatically. Only the game's own window is recorded (not the rest of the screen), \
+             and nothing while no game is open. The one in front is recorded.",
+        );
+        let mut changed = false;
+        ui.label("Open now");
+        let mut seen = std::collections::HashSet::new();
+        let apps: Vec<AppWindow> = self.apps.iter().filter(|app| seen.insert(app.exe.clone())).cloned().collect();
+        egui::Grid::new("moments-apps").num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
+            for app in &apps {
+                let recording = self.recording_app().is_some_and(|r| r.exe == app.exe);
+                let label = if recording { format!("● {}", app.title) } else { app.title.clone() };
+                ui.label(label).on_hover_text(&app.exe);
+                let always = self.config.always_record.contains(&app.exe);
+                let never = self.config.never_record.contains(&app.exe);
+                if app.is_game {
+                    ui.weak(if never { "game, left out" } else { "game" });
+                    if never {
+                        if ui.small_button("Record it").clicked() {
+                            self.config.never_record.retain(|exe| exe != &app.exe);
+                            changed = true;
+                        }
+                    } else if ui.small_button("Don't record").clicked() {
+                        self.config.never_record.push(app.exe.clone());
+                        changed = true;
+                    }
+                } else {
+                    ui.weak(if always { "added" } else { "" });
+                    if always {
+                        if ui.small_button("Stop recording").clicked() {
+                            self.config.always_record.retain(|exe| exe != &app.exe);
+                            changed = true;
+                        }
+                    } else if ui.small_button("Record it").clicked() {
+                        self.config.always_record.push(app.exe.clone());
+                        changed = true;
+                    }
+                }
+                ui.end_row();
+            }
+        });
+        // Choices for apps that aren't open right now.
+        let open: Vec<&str> = apps.iter().map(|app| app.exe.as_str()).collect();
+        for (list, verb) in [(&mut self.config.always_record, "Recorded"), (&mut self.config.never_record, "Left out")] {
+            let closed: Vec<String> = list.iter().filter(|exe| !open.contains(&exe.as_str())).cloned().collect();
+            if closed.is_empty() {
+                continue;
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("{verb} when open:"));
+                for exe in closed {
+                    if ui.small_button(format!("{exe} ✕")).on_hover_text("Forget this choice").clicked() {
+                        list.retain(|e| e != &exe);
+                        changed = true;
+                    }
+                }
+            });
+        }
+        if changed {
+            self.persist();
+            self.last_game_check = None;
+            self.tick();
+        }
+    }
+
+    /// Asks once what clips should record.
+    fn record_mode_question(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.strong("What should clips record?");
+            ui.label(
+                "The whole screen catches everything, including other apps and notifications. \
+                 Games only records just the game's window, automatically whenever a game is open.",
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Whole screen").clicked() {
+                    self.set_record_mode(RecordMode::Screen);
+                }
+                if ui.button("Only games and apps I choose").clicked() {
+                    self.set_record_mode(RecordMode::Games);
+                    self.show_settings = true;
+                }
+            });
+            ui.weak("You can change this later in ⚙ settings.");
+        });
     }
 
     /// Where clips are saved, the recording status, and every saved clip as
@@ -390,9 +567,22 @@ impl Moments {
                 }
             });
         });
+        if self.config.record.is_none() && self.recorder.is_some() {
+            self.record_mode_question(ui);
+        }
         let (status, is_error) = self.status();
         if is_error {
             ui.colored_label(ERROR_COLOR, status);
+        } else if self.config.record == Some(RecordMode::Games) && self.recorder.is_some() {
+            ui.weak(match self.recording_app() {
+                Some(app) => format!(
+                    "Recording {} · press {} anywhere to save the last {}",
+                    app.title,
+                    hotkey::label(self.config.hotkey),
+                    clips::format_duration(Duration::from_secs(self.config.buffer_secs as u64)),
+                ),
+                None => "No game open, so nothing is being recorded. Open a game to start.".to_string(),
+            });
         } else if self.recorder.is_some() {
             ui.weak(format!(
                 "Recording the last {} · press {} anywhere to save it",

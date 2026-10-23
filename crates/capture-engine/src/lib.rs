@@ -15,6 +15,7 @@ mod mux;
 mod preview;
 mod recorder;
 mod ring;
+mod window_capture;
 
 use std::path::PathBuf;
 
@@ -24,7 +25,7 @@ use windows::Win32::UI::Shell::{FOLDERID_Videos, SHGetKnownFolderPath, KF_FLAG_D
 pub use audio::{AudioInput, DESKTOP_TRACK};
 pub use edit::{decode_clip_audio, save_edited_clip, ClipAudio, ClipEdit, EditError, TrackAudio};
 pub use preview::{PreviewFrame, VideoPreview};
-pub use recorder::{ClipSaver, Recorder, RecorderStatus};
+pub use recorder::{CaptureTarget, ClipSaver, Recorder, RecorderStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {
