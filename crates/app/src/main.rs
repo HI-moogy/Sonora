@@ -19,6 +19,7 @@ mod games;
 mod hotkey;
 mod meter;
 mod moments;
+mod noise;
 mod setup;
 mod single_instance;
 mod sounds;
@@ -462,6 +463,7 @@ impl eframe::App for MixerApp {
                             self.status = result.err().map(|e| format!("Couldn't open that microphone: {}", e.message()));
                         }
                     });
+                    noise::noise_controls(ui, self.mixer.mic_cleanup(), mic.is_some());
                 } else {
                     ui.horizontal(|ui| {
                         ui.strong("Output device");

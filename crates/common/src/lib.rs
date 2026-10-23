@@ -44,6 +44,33 @@ pub struct Presets {
     /// EQ settings you saved by name.
     #[serde(default)]
     pub eq_presets: Vec<NamedEq>,
+    #[serde(default)]
+    pub mic: MicConfig,
+}
+
+/// How the microphone is cleaned up before it reaches the mix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MicConfig {
+    pub noise_suppression: NoiseSuppression,
+    /// Also turn down voices well below yours (people further from the
+    /// microphone). A level heuristic, not speaker recognition.
+    pub quiet_far_voices: bool,
+}
+
+/// How hard the microphone's noise removal works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum NoiseSuppression {
+    Off,
+    /// RNNoise: the lightest on CPU and memory; handles steady noise (fans,
+    /// hum) but lets more keyboard clatter through.
+    Light,
+    /// DeepFilterNet 3, holding back from removing everything so voices
+    /// keep some room sound.
+    Standard,
+    /// DeepFilterNet 3 at full strength, like Krisp.
+    #[default]
+    Strong,
 }
 
 /// The mixer as it was left: levels, devices, and which apps (and
@@ -304,12 +331,14 @@ fn parse_sections(text: &str) -> (Presets, Vec<String>) {
             T::default()
         })
     }
-    let (eq, moments, mixer, eq_presets) = (section("eq"), section("moments"), section("mixer"), section("eq_presets"));
+    let (eq, moments, mixer, eq_presets, mic) =
+        (section("eq"), section("moments"), section("mixer"), section("eq_presets"), section("mic"));
     let presets = Presets {
         eq: parse("EQ", eq, &mut broken),
         moments: parse("clip settings", moments, &mut broken),
         mixer: parse("mixer", mixer, &mut broken),
         eq_presets: parse("EQ presets", eq_presets, &mut broken),
+        mic: parse("microphone noise removal", mic, &mut broken),
     };
     (presets, broken)
 }
@@ -465,6 +494,14 @@ mod tests {
         let (presets, notices) = load_from(&path);
         assert_eq!(presets.mixer, MixerSetup::default());
         assert!(notices[0].contains("reset to defaults"), "{notices:?}");
+    }
+
+    #[test]
+    fn settings_from_before_noise_removal_get_strong() {
+        let (presets, broken) = parse_sections(r#"{ "eq": {} }"#);
+        assert!(broken.is_empty());
+        assert_eq!(presets.mic.noise_suppression, NoiseSuppression::Strong);
+        assert!(!presets.mic.quiet_far_voices);
     }
 
     #[test]
