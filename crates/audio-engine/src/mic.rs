@@ -12,8 +12,8 @@ use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::com::ComGuard;
-use crate::denoise::{LiveDenoiser, MicCleanup, FRAME};
-use crate::mixer::{SourceInner, MAX_BUFFERED_SAMPLES};
+use crate::denoise::{MicCleanup, MicPipeline};
+use crate::mixer::SourceInner;
 
 const CAPTURE_BUFFER_DURATION_100NS: i64 = 2_000_000;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
@@ -65,11 +65,9 @@ fn open_capture_client(
     }
 }
 
-/// Runs entirely on its own thread: captures the microphone, cleans it up
-/// as `cleanup` says in 10ms/480-sample mono frames (see
-/// [`crate::denoise`]), and pushes the cleaned audio (duplicated to stereo)
-/// into `source.samples` for the mixer to pick up, exactly like a process
-/// capture source.
+/// Runs entirely on its own thread: captures the microphone and hands it to
+/// a [`MicPipeline`], which cleans it up as `cleanup` says and queues it for
+/// the mixer like an app's audio.
 pub(crate) fn run_mic_capture_thread(
     source: Arc<SourceInner>,
     device_id: Option<String>,
@@ -97,21 +95,14 @@ pub(crate) fn run_mic_capture_thread(
         }
     };
 
-    let mut denoiser = LiveDenoiser::new(cleanup);
-    let mut staging: Vec<f32> = Vec::with_capacity(FRAME * 4);
-    let mut out_frame = vec![0.0f32; FRAME];
+    let mut pipeline = MicPipeline::new(cleanup);
 
     while !source.stop.load(Ordering::Relaxed) {
         let wait_result = unsafe { WaitForSingleObject(event, 100) };
         if wait_result != WAIT_OBJECT_0 {
             continue;
         }
-        // Loading a model takes a moment, during which audio piles up:
-        // drop it rather than play the mic late from then on.
-        let discard = denoiser.apply_setting();
-        if discard {
-            staging.clear();
-        }
+        let discard = pipeline.begin_batch();
 
         loop {
             let packet_size = match unsafe { capture_service.GetNextPacketSize() } {
@@ -133,25 +124,10 @@ pub(crate) fn run_mic_capture_thread(
             if num_frames > 0 && !data_ptr.is_null() && !discard {
                 let samples =
                     unsafe { std::slice::from_raw_parts(data_ptr as *const f32, num_frames as usize) };
-                staging.extend_from_slice(samples);
+                pipeline.push(samples, &source);
             }
             unsafe {
                 let _ = capture_service.ReleaseBuffer(num_frames);
-            }
-
-            while staging.len() >= FRAME {
-                denoiser.process(&staging[..FRAME], &mut out_frame);
-                staging.drain(..FRAME);
-
-                let mut buffer = source.samples.lock().unwrap();
-                for &cleaned in out_frame.iter() {
-                    let sample = cleaned.clamp(-1.0, 1.0);
-                    buffer.push_back(sample); // left
-                    buffer.push_back(sample); // right (mono duplicated to stereo)
-                }
-                while buffer.len() > MAX_BUFFERED_SAMPLES {
-                    buffer.pop_front();
-                }
             }
         }
     }

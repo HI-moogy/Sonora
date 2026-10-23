@@ -10,6 +10,9 @@ use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 pub struct AudioDevice {
     pub id: String,
     pub name: String,
+    /// For an output that's a virtual cable (VB-Audio's): the microphone
+    /// its other end shows up as in Discord and games.
+    pub voice_cable_mic: Option<String>,
 }
 
 // DEVPKEY_Device_FriendlyName, defined in devpkey.h; not bound by the
@@ -46,10 +49,17 @@ fn list_devices(flow: EDataFlow) -> windows::core::Result<Vec<AudioDevice>> {
                 Err(_) => id.clone(),
             };
 
-            devices.push(AudioDevice { id, name });
+            let voice_cable_mic = (flow == eRender && is_virtual_cable(&name)).then(|| "CABLE Output".to_string());
+            devices.push(AudioDevice { id, name, voice_cable_mic });
         }
         Ok(devices)
     }
+}
+
+/// Whether an output device is VB-Audio Virtual Cable's input side, which
+/// apps record from as "CABLE Output".
+fn is_virtual_cable(name: &str) -> bool {
+    name.contains("CABLE Input") || name.contains("VB-Audio Virtual Cable")
 }
 
 unsafe fn propvariant_to_string(value: &PROPVARIANT) -> String {

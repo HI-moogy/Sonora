@@ -1,0 +1,4 @@
+# Shell scripts and desktop entries run on Linux: keep LF endings even in a
+# Windows checkout.
+*.sh text eol=lf
+*.desktop text eol=lf

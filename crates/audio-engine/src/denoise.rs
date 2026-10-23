@@ -11,12 +11,11 @@ use std::time::Duration;
 use common::NoiseSuppression;
 use df::tract::{DfParams, DfTract, RuntimeParams};
 use nnnoiseless::DenoiseState;
-use windows::core::Result;
 
 use crate::atomic_f32::AtomicF32;
-use crate::com::ComGuard;
-use crate::loopback::standard_format;
-use crate::render::open_default_render_client;
+use crate::error::Result;
+use crate::mixer::{SourceInner, MAX_BUFFERED_SAMPLES};
+use crate::platform::DeviceOutput;
 
 /// Samples per frame (10 ms at 48 kHz), the native frame of both models.
 pub const FRAME: usize = 480;
@@ -390,37 +389,75 @@ impl LiveDenoiser {
     }
 }
 
+/// A microphone's audio on its way into the mix: cut into 10 ms frames,
+/// cleaned up, and pushed (duplicated to stereo) into its source's queue,
+/// exactly like an app's audio. Each platform's capture feeds it.
+pub(crate) struct MicPipeline {
+    denoiser: LiveDenoiser,
+    staging: Vec<f32>,
+    out_frame: Vec<f32>,
+}
+
+impl MicPipeline {
+    pub(crate) fn new(cleanup: Arc<MicCleanup>) -> Self {
+        Self { denoiser: LiveDenoiser::new(cleanup), staging: Vec::with_capacity(FRAME * 4), out_frame: vec![0.0; FRAME] }
+    }
+
+    /// Applies a changed setting; call before each batch of captured audio.
+    /// Returns true if the batch should be dropped: loading a model takes a
+    /// moment, during which audio piles up, and playing it would leave the
+    /// mic late from then on.
+    pub(crate) fn begin_batch(&mut self) -> bool {
+        let discard = self.denoiser.apply_setting();
+        if discard {
+            self.staging.clear();
+        }
+        discard
+    }
+
+    /// Takes mono 48 kHz samples as captured.
+    pub(crate) fn push(&mut self, mono: &[f32], source: &SourceInner) {
+        self.staging.extend_from_slice(mono);
+        while self.staging.len() >= FRAME {
+            self.denoiser.process(&self.staging[..FRAME], &mut self.out_frame);
+            self.staging.drain(..FRAME);
+            let mut buffer = source.samples.lock().unwrap();
+            for &cleaned in &self.out_frame {
+                let sample = cleaned.clamp(-1.0, 1.0);
+                buffer.push_back(sample);
+                buffer.push_back(sample);
+            }
+            while buffer.len() > MAX_BUFFERED_SAMPLES {
+                buffer.pop_front();
+            }
+        }
+    }
+}
+
 /// Plays mono 48 kHz `audio` on the default output device.
 fn play_mono(audio: &[f32], playback: &Playback) -> Result<()> {
-    let _com = ComGuard::init()?;
-    let format = standard_format();
-    let (client, render) = open_default_render_client(&format)?;
-    let buffer_frames = unsafe { client.GetBufferSize()? };
-    unsafe { client.Start()? };
+    let _thread = crate::platform::audio_thread()?;
+    let mut output = DeviceOutput::open(None)?;
+    // A quarter second queued at a time: plenty, and stopping is quick.
+    let chunk = (SAMPLE_RATE / 4) as u32;
+    let mut stereo = Vec::new();
     let mut position = 0;
     while position < audio.len() && !playback.stop.load(Ordering::Relaxed) {
-        let padding = unsafe { client.GetCurrentPadding()? };
-        let frames = (buffer_frames - padding).min((audio.len() - position) as u32);
+        let room = output.capacity_frames().min(chunk).saturating_sub(output.queued_frames()?);
+        let frames = (room as usize).min(audio.len() - position);
         if frames > 0 {
-            let buffer = unsafe { render.GetBuffer(frames)? } as *mut f32;
-            for i in 0..frames as usize {
-                let sample = audio[position + i];
-                unsafe {
-                    *buffer.add(i * 2) = sample;
-                    *buffer.add(i * 2 + 1) = sample;
-                }
-            }
-            unsafe { render.ReleaseBuffer(frames, 0)? };
-            position += frames as usize;
+            stereo.clear();
+            stereo.extend(audio[position..position + frames].iter().flat_map(|&s| [s, s]));
+            output.write(&stereo)?;
+            position += frames;
             playback.progress.store(position as f32 / audio.len() as f32);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     // Let what's queued finish playing.
-    while !playback.stop.load(Ordering::Relaxed) && unsafe { client.GetCurrentPadding()? } > 0 {
+    while !playback.stop.load(Ordering::Relaxed) && output.queued_frames()? > 0 {
         std::thread::sleep(Duration::from_millis(10));
     }
-    unsafe { client.Stop()? };
     Ok(())
 }
 

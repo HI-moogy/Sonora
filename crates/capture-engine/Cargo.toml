@@ -7,6 +7,14 @@ edition.workspace = true
 bytes = "1"
 mp4 = "0.14.0"
 thiserror = "2.0.21"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62.2", features = ["Win32_UI_HiDpi", "Win32_System_Com_StructuredStorage", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+# Screen capture and encoding use Windows' own APIs; elsewhere the crate is
+# empty.
+[target.'cfg(windows)'.dependencies]
+windows-core = "=0.62.2"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
@@ -31,7 +39,3 @@ windows = { version = "0.62.2", features = [
     "Graphics_DirectX",
     "Graphics_DirectX_Direct3D11",
 ] }
-windows-core = "=0.62.2"
-
-[dev-dependencies]
-windows = { version = "0.62.2", features = ["Win32_UI_HiDpi", "Win32_System_Com_StructuredStorage", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

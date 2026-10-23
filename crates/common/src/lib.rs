@@ -343,10 +343,17 @@ impl Default for Hotkey {
     }
 }
 
-/// `%APPDATA%\sonora`, where every Sonora settings file lives.
+/// Where every Sonora settings file lives: `%APPDATA%\sonora` on Windows,
+/// `~/.config/sonora` (or `$XDG_CONFIG_HOME/sonora`) elsewhere.
 pub fn config_dir() -> PathBuf {
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(base).join("sonora")
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+    base.unwrap_or_else(|| PathBuf::from(".")).join("sonora")
 }
 
 fn config_path() -> PathBuf {

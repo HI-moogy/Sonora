@@ -1,5 +1,6 @@
 //! Moments: always-on recording of the primary monitor into a rolling
 //! buffer, saved to MP4 on demand.
+#![cfg(windows)]
 
 mod aac;
 mod audio;

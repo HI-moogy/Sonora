@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Sonora
+GenericName=Audio mixer
+Comment=Per-app volume, EQ and outputs, with a cleaned-up mic
+Exec="@PROGRAM@"
+Icon=sonora
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+Keywords=mixer;volume;equalizer;sonar;microphone;noise;
+StartupWMClass=sonora

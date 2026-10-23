@@ -14,27 +14,38 @@ use common::Priority;
 use eframe::egui;
 
 mod appearance;
+#[cfg_attr(target_os = "linux", path = "autostart_linux.rs")]
 mod autostart;
+#[cfg(windows)]
 mod clips;
 mod eq_presets;
+#[cfg(windows)]
 mod games;
 mod guide;
+#[cfg(windows)]
 mod hotkey;
+#[cfg(windows)]
 mod icons;
 mod meter;
+#[cfg(windows)]
 mod moments;
 mod noise;
+#[cfg(windows)]
 mod rename;
 mod setup;
+#[cfg_attr(target_os = "linux", path = "single_instance_linux.rs")]
 mod single_instance;
+#[cfg(windows)]
 mod sounds;
 mod strip;
 mod theme;
+#[cfg_attr(target_os = "linux", path = "tray_linux.rs")]
 mod tray;
 
 use meter::level_meter;
-use strip::Strip;
+#[cfg(windows)]
 use moments::Moments;
+use strip::Strip;
 use setup::MixerPersistence;
 use tray::{Tray, TrayCommand};
 
@@ -72,6 +83,8 @@ enum Tab {
 
 struct MixerApp {
     mixer: Mixer,
+    /// Clips (Windows only for now).
+    #[cfg(windows)]
     moments: Moments,
     tab: Tab,
     available_sessions: Vec<AvailableSession>,
@@ -94,8 +107,6 @@ struct MixerApp {
     /// Whether this run already said it keeps running in the tray.
     tray_hint_shown: bool,
     eq_presets: EqPresetState,
-    /// The main window's handle, found on first use.
-    window: Option<windows::Win32::Foundation::HWND>,
     /// Started at sign-in: frames left during which to keep the window
     /// hidden, since eframe shows it once after its first frame whatever it
     /// was created with.
@@ -110,7 +121,7 @@ impl MixerApp {
     // calls work fine under that apartment, so this thread doesn't need its
     // own ComGuard. Only the mixer's dedicated capture/render threads need
     // (and independently set up) their own COM apartment.
-    fn new(ctx: &egui::Context, start_hidden: bool) -> windows::core::Result<Self> {
+    fn new(ctx: &egui::Context, start_hidden: bool) -> audio_engine::Result<Self> {
         let mixer = Mixer::start()?;
         for bus in FIXED_BUSES {
             mixer.ensure_bus(bus);
@@ -127,6 +138,7 @@ impl MixerApp {
             mixer.set_bus_priority(bus, Priority::High);
         }
         let persistence = MixerPersistence::restore(&mixer);
+        #[cfg(windows)]
         let moments = Moments::new(ctx, &mixer);
         let quitting = Arc::new(AtomicBool::new(false));
         let tray = {
@@ -134,7 +146,7 @@ impl MixerApp {
             let quitting = quitting.clone();
             Tray::start(move |command| {
                 match command {
-                    TrayCommand::Open => tray::show_main_window(),
+                    TrayCommand::Open => tray::show_main_window(&ctx),
                     TrayCommand::Quit => {
                         if tray::confirm_quit() {
                             quitting.store(true, Ordering::Relaxed);
@@ -148,6 +160,7 @@ impl MixerApp {
         };
         Ok(Self {
             mixer,
+            #[cfg(windows)]
             moments,
             tab: Tab::Mixer,
             available_sessions: Vec::new(),
@@ -164,7 +177,6 @@ impl MixerApp {
             quitting,
             tray_hint_shown: false,
             eq_presets: EqPresetState::load(),
-            window: None,
             start_hidden_frames: if start_hidden { START_HIDDEN_FRAMES } else { 0 },
             colors_window: appearance::ColorsWindow::default(),
             guide: {
@@ -199,6 +211,14 @@ impl MixerApp {
         sessions.sort_by_key(|s| s.pid);
         sessions.dedup_by_key(|s| s.pid);
         self.available_sessions = sessions;
+    }
+
+    /// The save-a-clip hotkey, for the guide ("" where there are no clips).
+    fn clip_hotkey(&self) -> String {
+        #[cfg(windows)]
+        return self.moments.hotkey_label();
+        #[cfg(not(windows))]
+        String::new()
     }
 
     fn channel_color(&self, bus: &str) -> egui::Color32 {
@@ -425,7 +445,7 @@ impl MixerApp {
     /// Where the Mic channel sends your processed voice: a virtual cable
     /// that Discord and games then use as a microphone, or nowhere.
     fn voice_send_ui(&mut self, ui: &mut egui::Ui, bus_name: &str, bus: &audio_engine::BusInfo) {
-        let cable = self.output_devices.iter().find(|d| is_virtual_cable(&d.name)).cloned();
+        let cable = self.output_devices.iter().find(|d| d.voice_cable_mic.is_some()).cloned();
         let sending_to = bus.heard.then(|| bus.device_id.clone());
         let label = match &sending_to {
             None => "Nowhere".to_string(),
@@ -445,7 +465,7 @@ impl MixerApp {
                 }
                 // The cable first: it's what this is for.
                 let mut devices: Vec<&AudioDevice> = self.output_devices.iter().collect();
-                devices.sort_by_key(|d| !is_virtual_cable(&d.name));
+                devices.sort_by_key(|d| d.voice_cable_mic.is_none());
                 for device in devices {
                     let selected = sending_to.as_ref().and_then(|s| s.as_deref()) == Some(device.id.as_str());
                     if ui.selectable_label(selected, &device.name).clicked() {
@@ -460,8 +480,9 @@ impl MixerApp {
         }
         let to_cable = matches!(&sending_to, Some(Some(id)) if cable.as_ref().is_some_and(|c| &c.id == id));
         match (&cable, to_cable) {
-            (Some(_), true) => {
-                ui.weak("In Discord and games, pick \"CABLE Output\" as your microphone.");
+            (Some(cable), true) => {
+                let mic = cable.voice_cable_mic.as_deref().unwrap_or_default();
+                ui.weak(format!("In Discord and games, pick \"{mic}\" as your microphone."));
             }
             (Some(cable), false) => {
                 ui.horizontal(|ui| {
@@ -472,6 +493,7 @@ impl MixerApp {
                     }
                 });
             }
+            #[cfg(windows)]
             (None, _) => {
                 ui.horizontal_wrapped(|ui| {
                     ui.weak(
@@ -482,6 +504,11 @@ impl MixerApp {
                         clips::open_url("https://vb-audio.com/Cable/");
                     }
                 });
+            }
+            // Sonora sets up its own virtual microphone on Linux.
+            #[cfg(not(windows))]
+            (None, _) => {
+                ui.weak("Sonora couldn't set up its virtual microphone. Restarting Sonora may help.");
             }
         }
     }
@@ -649,12 +676,6 @@ fn app_label(name: &str) -> &str {
     }
 }
 
-/// Whether an output device is a virtual cable whose other end apps can
-/// record from (VB-Audio Virtual Cable's input side).
-fn is_virtual_cable(name: &str) -> bool {
-    name.contains("CABLE Input") || name.contains("VB-Audio Virtual Cable")
-}
-
 /// A device menu (playback devices for a bus, or microphones and line-ins
 /// for the Mic channel) showing `current` (`None`: `none_label`). Returns the
 /// device just picked, `Some(None)` being the system default.
@@ -690,7 +711,7 @@ impl eframe::App for MixerApp {
         if ui.ctx().input(|i| i.viewport().close_requested()) && !self.quitting.load(Ordering::Relaxed) {
             if let Some(tray) = &self.tray {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                tray::hide_main_window();
+                tray::hide_main_window(ui.ctx());
                 if !self.tray_hint_shown {
                     tray.notify(
                         "Sonora is still running",
@@ -712,20 +733,16 @@ impl eframe::App for MixerApp {
         let sources = self.mixer.sources();
         let master_level = self.mixer.master_level();
         self.persistence.tick(&self.mixer, &buses, &sources, &self.available_sessions);
+        #[cfg(windows)]
         self.moments.tick();
 
-        if self.window.is_none() {
-            self.window = tray::main_window();
-        }
         if self.start_hidden_frames > 0 && self.tray.is_some() {
-            if let Some(window) = self.window {
-                tray::hide_window(window);
-            }
+            tray::hide_main_window(ui.ctx());
             self.start_hidden_frames -= 1;
             ui.ctx().request_repaint();
             return;
         }
-        if self.window.is_some_and(|window| !tray::is_shown(window)) {
+        if tray::main_window_shown() == Some(false) {
             ui.ctx().request_repaint_after(HIDDEN_WAKE_INTERVAL);
             return;
         }
@@ -749,7 +766,7 @@ impl eframe::App for MixerApp {
             None => {}
         }
         self.colors_window.show(ui.ctx());
-        if let Some(guide::Outcome::Done) = self.guide.show(ui.ctx(), &self.moments.hotkey_label()) {
+        if let Some(guide::Outcome::Done) = self.guide.show(ui.ctx(), &self.clip_hotkey()) {
             self.tab = Tab::Mixer;
             self.selected_bus = None;
             if let Err(error) = common::update_presets(|presets| presets.guide.seen = true) {
@@ -765,7 +782,10 @@ impl eframe::App for MixerApp {
                     ui.label(egui::RichText::new("Sonora").size(21.0).strong().color(theme::text()));
                     ui.label(egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).small().color(theme::text_muted()));
                     ui.add_space(18.0);
-                    for (tab, label) in [(Tab::Mixer, "Mixer"), (Tab::Clips, "Clips")] {
+                    // Clips are Windows-only for now.
+                    let tabs: &[(Tab, &str)] =
+                        if cfg!(windows) { &[(Tab::Mixer, "Mixer"), (Tab::Clips, "Clips")] } else { &[(Tab::Mixer, "Mixer")] };
+                    for &(tab, label) in tabs {
                         let selected = self.tab == tab;
                         let text = egui::RichText::new(label).size(14.5);
                         let button = if selected {
@@ -817,6 +837,7 @@ impl eframe::App for MixerApp {
                     });
                 }
             });
+        #[cfg(windows)]
         if self.tab == Tab::Clips {
             self.moments.tab(ui, &self.mixer);
             return;
@@ -923,11 +944,28 @@ impl eframe::App for MixerApp {
     }
 }
 
+/// Whether there's an X server to use and the keyboard library winit needs
+/// for it (desktops have it; minimal systems may only have Wayland's).
+#[cfg(target_os = "linux")]
+fn x11_usable() -> bool {
+    const LIBRARY: &str = "libxkbcommon-x11.so.0";
+    let dirs = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    std::env::var_os("DISPLAY").is_some()
+        && dirs
+            .split(':')
+            .filter(|dir| !dir.is_empty())
+            .chain(["/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib", "/lib/x86_64-linux-gnu", "/lib64"])
+            .any(|dir| std::path::Path::new(dir).join(LIBRARY).exists())
+}
+
 fn main() -> eframe::Result<()> {
     let Some(_instance) = single_instance::acquire() else {
         return Ok(());
     };
+    #[cfg(windows)]
     let rename_notes = rename::move_from_sonar_rs();
+    #[cfg(not(windows))]
+    let rename_notes = Vec::new();
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
         .expect("bundled icon.png is a valid PNG");
     // Started at sign-in: stay in the tray until opened.
@@ -937,7 +975,17 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([760.0, 560.0])
             .with_visible(!background)
-            .with_icon(icon),
+            .with_icon(icon)
+            .with_app_id("sonora"),
+        // On Linux, prefer X11 (XWayland under Wayland): there a window can
+        // be hidden to the tray and shown again.
+        #[cfg(target_os = "linux")]
+        event_loop_builder: Some(Box::new(|builder| {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            if x11_usable() {
+                builder.with_x11();
+            }
+        })),
         ..Default::default()
     };
     eframe::run_native(
@@ -945,6 +993,8 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             theme::load(&cc.egui_ctx);
+            #[cfg(target_os = "linux")]
+            single_instance::listen(cc.egui_ctx.clone());
             let mut app = MixerApp::new(&cc.egui_ctx, background).expect("failed to start audio mixer");
             app.config_notices.extend(rename_notes);
             Ok(Box::new(app))

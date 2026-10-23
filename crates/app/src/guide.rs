@@ -16,7 +16,26 @@ pub enum View {
     Clips,
 }
 
+/// Which systems a step is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum On {
+    All,
+    Windows,
+    Linux,
+}
+
+impl On {
+    fn here(self) -> bool {
+        match self {
+            On::All => true,
+            On::Windows => cfg!(windows),
+            On::Linux => cfg!(target_os = "linux"),
+        }
+    }
+}
+
 struct Step {
+    on: On,
     title: &'static str,
     /// `{hotkey}` is replaced with the clip hotkey.
     body: &'static str,
@@ -27,6 +46,7 @@ struct Step {
 
 const STEPS: &[Step] = &[
     Step {
+        on: On::All,
         title: "Welcome to Sonora",
         body: "Sonora splits what you hear into channels, each with its own volume, EQ and output, cleans up \
                your mic, and keeps the last moments of your game ready to save as a clip.\n\n\
@@ -35,6 +55,7 @@ const STEPS: &[Step] = &[
         view: View::Mixer(None),
     },
     Step {
+        on: On::All,
         title: "Your channels",
         body: "Game, Chat, Aux and Media are what you hear. Mic is your voice.\n\n\
                Drag a fader to change a channel's volume (double-click it for 100%), and Mute silences it. \
@@ -43,6 +64,7 @@ const STEPS: &[Step] = &[
         view: View::Mixer(None),
     },
     Step {
+        on: On::All,
         title: "Put apps in a channel",
         body: "Click a channel to open its settings here.\n\n\
                Under Add an app, click Add next to a game, Discord, Spotify or anything else playing sound. \
@@ -51,6 +73,7 @@ const STEPS: &[Step] = &[
         view: View::Mixer(Some("Game")),
     },
     Step {
+        on: On::Windows,
         title: "Your mic",
         body: "Pick your microphone here, turn on Noise removal, and use Listen to my mic to hear how you sound.\n\n\
                For Discord and games to get the cleaned-up voice, install the free VB-Audio Virtual Cable, \
@@ -59,12 +82,23 @@ const STEPS: &[Step] = &[
         view: View::Mixer(Some("Mic")),
     },
     Step {
+        on: On::Linux,
+        title: "Your mic",
+        body: "Pick your microphone here, turn on Noise removal, and use Listen to my mic to hear how you sound.\n\n\
+               For Discord and games to get the cleaned-up voice, set Send my voice to \"Sonora Virtual \
+               Microphone\", and choose it as your mic in Discord too. Nothing to install.",
+        target: Some("channel-panel"),
+        view: View::Mixer(Some("Mic")),
+    },
+    Step {
+        on: On::All,
         title: "Master volume",
         body: "Master turns everything you hear up or down at once. It doesn't change the voice you send.",
         target: Some("master"),
         view: View::Mixer(None),
     },
     Step {
+        on: On::Windows,
         title: "Clips",
         body: "Sonora keeps the last moments of your screen ready. Press {hotkey} right after something \
                happens to save it as a clip; a sound plays when it's saved.\n\n\
@@ -74,6 +108,7 @@ const STEPS: &[Step] = &[
         view: View::Clips,
     },
     Step {
+        on: On::Windows,
         title: "Clip settings",
         body: "The gear has what to record (the whole screen, or only games), how many seconds to keep, \
                the hotkey, and where clips are saved.",
@@ -81,6 +116,7 @@ const STEPS: &[Step] = &[
         view: View::Clips,
     },
     Step {
+        on: On::Windows,
         title: "It keeps running",
         body: "Closing the window keeps Sonora in the tray by the clock, so your audio keeps flowing and clips \
                keep recording. Right-click the tray icon for Start with Windows and Quit.\n\n\
@@ -88,7 +124,25 @@ const STEPS: &[Step] = &[
         target: Some("menu"),
         view: View::Mixer(None),
     },
+    Step {
+        on: On::Linux,
+        title: "It keeps running",
+        body: "Closing the window keeps Sonora in the tray, so your audio keeps flowing. Right-click the tray \
+               icon for Start at login and Quit. (No tray on your desktop? Then closing the window quits.)\n\n\
+               Menu has Colors, to make Sonora look the way you like, and this guide if you want it again.",
+        target: Some("menu"),
+        view: View::Mixer(None),
+    },
 ];
+
+/// The steps for this system, in order.
+fn steps() -> impl Iterator<Item = &'static Step> {
+    STEPS.iter().filter(|step| step.on.here())
+}
+
+fn step_count() -> usize {
+    steps().count()
+}
 
 /// The card's width.
 const CARD_WIDTH: f32 = 400.0;
@@ -130,13 +184,14 @@ impl Guide {
 
     /// Where the app should be for the current step.
     pub fn view(&self) -> Option<View> {
-        self.step.map(|step| STEPS[step].view)
+        self.step.and_then(|step| steps().nth(step)).map(|step| step.view)
     }
 
     /// Draws the spotlight and the step's card over everything.
     pub fn show(&mut self, ctx: &egui::Context, hotkey: &str) -> Option<Outcome> {
         let index = self.step?;
-        let step = &STEPS[index];
+        let step = steps().nth(index)?;
+        let count = step_count();
         let screen = ctx.content_rect();
         let spotlight = step.target.and_then(|name| target_rect(ctx, name)).map(|rect| rect.expand(6.0).intersect(screen));
         if step.target.is_some() && spotlight.is_none() {
@@ -184,20 +239,20 @@ impl Guide {
                 .show(ui, |ui| {
                     ui.set_width(CARD_WIDTH - 36.0);
                     ui.label(
-                        egui::RichText::new(format!("{} of {}", index + 1, STEPS.len())).small().color(theme::text_muted()),
+                        egui::RichText::new(format!("{} of {count}", index + 1)).small().color(theme::text_muted()),
                     );
                     ui.label(egui::RichText::new(step.title).size(18.0).strong().color(theme::text()));
                     ui.add_space(2.0);
                     ui.label(egui::RichText::new(step.body.replace("{hotkey}", hotkey)).color(theme::text()));
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if index + 1 < STEPS.len()
+                        if index + 1 < count
                             && ui.add(egui::Button::new(egui::RichText::new("Skip tour").color(theme::text_muted())).frame(false)).clicked()
                         {
                             next = Some(None);
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let last = index + 1 == STEPS.len();
+                            let last = index + 1 == count;
                             if ui.add(theme::primary_button(if last { "Start using Sonora" } else { "Next" })).clicked() {
                                 next = Some((!last).then_some(index + 1));
                             }
@@ -214,7 +269,7 @@ impl Guide {
         });
         match keys {
             (true, ..) => next = Some(None),
-            (_, true, _) if next.is_none() => next = Some((index + 1 < STEPS.len()).then_some(index + 1)),
+            (_, true, _) if next.is_none() => next = Some((index + 1 < count).then_some(index + 1)),
             (_, _, true) if next.is_none() && index > 0 => next = Some(Some(index - 1)),
             _ => {}
         }
@@ -276,9 +331,13 @@ mod tests {
 
     #[test]
     fn the_tour_starts_with_a_welcome_and_every_step_has_words() {
-        assert!(STEPS.first().is_some_and(|step| step.target.is_none()));
+        assert!(steps().next().is_some_and(|step| step.target.is_none()));
         for step in STEPS {
             assert!(!step.title.is_empty() && !step.body.is_empty());
+        }
+        // Clips are Windows-only, so Linux's tour never goes to them.
+        if !cfg!(windows) {
+            assert!(steps().all(|step| step.view != View::Clips));
         }
     }
 }

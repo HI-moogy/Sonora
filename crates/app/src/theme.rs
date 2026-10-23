@@ -226,6 +226,7 @@ pub fn warning() -> Color32 {
     color(colors().warning)
 }
 /// The clip editor's desktop audio track.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn desktop_track() -> Color32 {
     color(colors().desktop_track)
 }

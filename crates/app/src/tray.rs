@@ -3,9 +3,11 @@
 //! hides it; the tray icon brings it back (left-click) or offers Open,
 //! Start with Windows and Quit (right-click).
 
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
+use eframe::egui;
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -291,7 +293,18 @@ pub fn confirm_quit() -> bool {
 
 /// This process's main window, found by title (it can't be reached
 /// through eframe from the tray thread).
-pub fn main_window() -> Option<HWND> {
+fn main_window() -> Option<HWND> {
+    static FOUND: AtomicIsize = AtomicIsize::new(0);
+    let found = FOUND.load(Ordering::Relaxed);
+    if found != 0 {
+        return Some(HWND(found as _));
+    }
+    let window = find_main_window()?;
+    FOUND.store(window.0 as isize, Ordering::Relaxed);
+    Some(window)
+}
+
+fn find_main_window() -> Option<HWND> {
     struct Search(Option<HWND>);
     unsafe extern "system" fn check(window: HWND, lparam: LPARAM) -> BOOL {
         let search = &mut *(lparam.0 as *mut Search);
@@ -321,25 +334,22 @@ pub fn show_window(window: HWND) {
     }
 }
 
-pub fn show_main_window() {
+pub fn show_main_window(_ctx: &egui::Context) {
     if let Some(window) = main_window() {
         show_window(window);
     }
 }
 
-/// Whether `window` is shown (not hidden to the tray).
-pub fn is_shown(window: HWND) -> bool {
-    unsafe { IsWindowVisible(window) }.as_bool()
-}
-
-pub fn hide_window(window: HWND) {
-    unsafe {
-        let _ = ShowWindow(window, SW_HIDE);
-    }
-}
-
-pub fn hide_main_window() {
+pub fn hide_main_window(_ctx: &egui::Context) {
     if let Some(window) = main_window() {
-        hide_window(window);
+        unsafe {
+            let _ = ShowWindow(window, SW_HIDE);
+        }
     }
+}
+
+/// Whether the main window is shown (not hidden to the tray); `None`
+/// until it's been created.
+pub fn main_window_shown() -> Option<bool> {
+    main_window().map(|window| unsafe { IsWindowVisible(window) }.as_bool())
 }
