@@ -178,7 +178,7 @@ is laid out.
 ## License
 
 The code is under the [MIT license](LICENSE). The **Sonora name and logo**
-belong to Jorge and aren't covered by it: if you share a modified version,
+belong to Moogy and aren't covered by it: if you share a modified version,
 please give it a different name and icon.
 
 Sonora builds on open-source libraries, including
