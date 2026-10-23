@@ -1,7 +1,6 @@
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 
-use nnnoiseless::DenoiseState;
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
@@ -13,6 +12,7 @@ use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::com::ComGuard;
+use crate::denoise::{LiveDenoiser, MicCleanup, FRAME};
 use crate::mixer::{SourceInner, MAX_BUFFERED_SAMPLES};
 
 const CAPTURE_BUFFER_DURATION_100NS: i64 = 2_000_000;
@@ -65,17 +65,15 @@ fn open_capture_client(
     }
 }
 
-/// Runs entirely on its own thread: captures the microphone, runs
-/// it through RNNoise in RNNoise's native 10ms/480-sample mono frames, and
-/// pushes the cleaned audio (duplicated to stereo) into `source.samples`
-/// for the mixer to pick up, exactly like a process capture source.
-///
-/// RNNoise expects samples pre-scaled to 16-bit PCM range
-/// (`[-32768.0, 32767.0]`), not the `[-1.0, 1.0]` range the rest of this
-/// engine uses, so samples are scaled up before and back down after.
+/// Runs entirely on its own thread: captures the microphone, cleans it up
+/// as `cleanup` says in 10ms/480-sample mono frames (see
+/// [`crate::denoise`]), and pushes the cleaned audio (duplicated to stereo)
+/// into `source.samples` for the mixer to pick up, exactly like a process
+/// capture source.
 pub(crate) fn run_mic_capture_thread(
     source: Arc<SourceInner>,
     device_id: Option<String>,
+    cleanup: Arc<MicCleanup>,
     ready_tx: mpsc::Sender<Result<()>>,
 ) {
     let _com = match ComGuard::init() {
@@ -99,15 +97,20 @@ pub(crate) fn run_mic_capture_thread(
         }
     };
 
-    let mut denoiser = DenoiseState::new();
-    let mut staging: Vec<f32> = Vec::with_capacity(DenoiseState::FRAME_SIZE * 4);
-    let mut in_frame = vec![0.0f32; DenoiseState::FRAME_SIZE];
-    let mut out_frame = vec![0.0f32; DenoiseState::FRAME_SIZE];
+    let mut denoiser = LiveDenoiser::new(cleanup);
+    let mut staging: Vec<f32> = Vec::with_capacity(FRAME * 4);
+    let mut out_frame = vec![0.0f32; FRAME];
 
     while !source.stop.load(Ordering::Relaxed) {
         let wait_result = unsafe { WaitForSingleObject(event, 100) };
         if wait_result != WAIT_OBJECT_0 {
             continue;
+        }
+        // Loading a model takes a moment, during which audio piles up:
+        // drop it rather than play the mic late from then on.
+        let discard = denoiser.apply_setting();
+        if discard {
+            staging.clear();
         }
 
         loop {
@@ -127,7 +130,7 @@ pub(crate) fn run_mic_capture_thread(
             {
                 break;
             }
-            if num_frames > 0 && !data_ptr.is_null() {
+            if num_frames > 0 && !data_ptr.is_null() && !discard {
                 let samples =
                     unsafe { std::slice::from_raw_parts(data_ptr as *const f32, num_frames as usize) };
                 staging.extend_from_slice(samples);
@@ -136,15 +139,13 @@ pub(crate) fn run_mic_capture_thread(
                 let _ = capture_service.ReleaseBuffer(num_frames);
             }
 
-            while staging.len() >= DenoiseState::FRAME_SIZE {
-                for (dst, src) in in_frame.iter_mut().zip(staging.drain(..DenoiseState::FRAME_SIZE)) {
-                    *dst = src * 32768.0;
-                }
-                denoiser.process_frame(&mut out_frame, &in_frame);
+            while staging.len() >= FRAME {
+                denoiser.process(&staging[..FRAME], &mut out_frame);
+                staging.drain(..FRAME);
 
                 let mut buffer = source.samples.lock().unwrap();
                 for &cleaned in out_frame.iter() {
-                    let sample = (cleaned / 32768.0).clamp(-1.0, 1.0);
+                    let sample = cleaned.clamp(-1.0, 1.0);
                     buffer.push_back(sample); // left
                     buffer.push_back(sample); // right (mono duplicated to stereo)
                 }

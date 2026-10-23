@@ -16,6 +16,7 @@ use crate::atomic_f32::AtomicF32;
 use crate::com::ComGuard;
 use crate::eq::{EqBands, EQ_BAND_COUNT};
 use crate::loopback::{activate_process_loopback_client, standard_format};
+use crate::denoise::MicCleanup;
 use crate::mic::run_mic_capture_thread;
 use crate::process_tree::ProcessTree;
 use crate::render::open_render_client_for_device;
@@ -150,6 +151,7 @@ pub struct Mixer {
     master_level: Arc<AtomicF32>,
     render_stop: Arc<AtomicBool>,
     bus_tap: SharedTap,
+    mic_cleanup: Arc<MicCleanup>,
 }
 
 impl Mixer {
@@ -196,7 +198,13 @@ impl Mixer {
             master_level,
             render_stop,
             bus_tap,
+            mic_cleanup: Arc::default(),
         })
+    }
+
+    /// The microphone's noise removal settings and before/after test.
+    pub fn mic_cleanup(&self) -> &MicCleanup {
+        &self.mic_cleanup
     }
 
     /// Starts (or with `None`, stops) handing every bus's rendered audio to
@@ -264,7 +272,7 @@ impl Mixer {
 
     /// Starts capturing a microphone (`device_id` from
     /// [`crate::devices::list_input_devices`], or the system default when
-    /// `None`), denoised through RNNoise, into the named bus. Same
+    /// `None`), cleaned up as [`Self::mic_cleanup`] says, into the named bus. Same
     /// activation/blocking contract as [`Self::add_source`].
     pub fn add_mic_source(
         &self,
@@ -290,9 +298,10 @@ impl Mixer {
 
         let (ready_tx, ready_rx) = mpsc::channel();
         let thread_source = inner.clone();
+        let cleanup = self.mic_cleanup.clone();
         std::thread::Builder::new()
             .name("capture-mic".into())
-            .spawn(move || run_mic_capture_thread(thread_source, device_id, ready_tx))
+            .spawn(move || run_mic_capture_thread(thread_source, device_id, cleanup, ready_tx))
             .expect("spawn mic capture thread");
 
         ready_rx

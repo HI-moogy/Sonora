@@ -6,6 +6,15 @@ edition.workspace = true
 [dependencies]
 common = { version = "0.1.0", path = "../common" }
 nnnoiseless = { version = "0.5.2", default-features = false }
+# DeepFilterNet 3 with its model built in. Not on crates.io past 0.2 (no
+# real-time model there), so pinned to the upstream commit. It needs the
+# tract and ndarray versions it was written against.
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "d375b2d8309e0935d165700c91da9de862a99c31", default-features = false, features = ["tract", "default-model"] }
+tract-core = "=0.21.4"
+tract-onnx = "=0.21.4"
+tract-pulse = "=0.21.4"
+tract-hir = "=0.21.4"
+ndarray = "0.15"
 thiserror = "2.0.21"
 windows = { version = "0.62.2", features = ["Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_Media_KernelStreaming", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Foundation", "Win32_System_Ole", "Win32_Security", "Win32_UI_Shell_PropertiesSystem"] }
 windows-core = "=0.62.2"

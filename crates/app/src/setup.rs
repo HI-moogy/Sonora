@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use audio_engine::{process_executable_name, BusInfo, Mixer, SourceInfo, EQ_BAND_COUNT};
-use common::{EqPreset, MixerSetup, SavedBus, SavedSource};
+use common::{EqPreset, MicConfig, MixerSetup, SavedBus, SavedSource};
 use eframe::egui;
 
 use crate::AvailableSession;
@@ -17,11 +17,12 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// How often to retry a saved microphone that couldn't be opened.
 const MIC_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// What gets saved: the mixer section plus the EQ section.
+/// What gets saved: the mixer, EQ and microphone sections.
 #[derive(PartialEq)]
 struct Snapshot {
     mixer: MixerSetup,
     eq: HashMap<String, EqPreset>,
+    mic: MicConfig,
 }
 
 pub struct MixerPersistence {
@@ -61,6 +62,8 @@ impl MixerPersistence {
                 mixer.set_bus_eq_band(name, band, gain_db);
             }
         }
+        mixer.mic_cleanup().set_mode(presets.mic.noise_suppression);
+        mixer.mic_cleanup().set_quiet_far_voices(presets.mic.quiet_far_voices);
         let colors = setup.buses.iter().filter_map(|(name, bus)| Some((name.clone(), bus.color.clone()?))).collect();
         let mut persistence = Self {
             pending: setup.sources,
@@ -142,14 +145,17 @@ impl MixerPersistence {
     }
 
     fn save_if_changed(&mut self, mixer: &Mixer, buses: &[BusInfo], sources: &[SourceInfo]) {
-        let snapshot = self.snapshot(mixer.master_gain(), buses, sources);
+        let cleanup = mixer.mic_cleanup();
+        let mic = MicConfig { noise_suppression: cleanup.mode(), quiet_far_voices: cleanup.quiet_far_voices() };
+        let snapshot = self.snapshot(mixer.master_gain(), buses, sources, mic);
         if self.saved.as_ref() == Some(&snapshot) {
             return;
         }
-        let Snapshot { mixer, eq } = &snapshot;
+        let Snapshot { mixer, eq, mic } = &snapshot;
         let result = common::update_presets(|presets| {
             presets.mixer = mixer.clone();
             presets.eq = eq.clone();
+            presets.mic = *mic;
         });
         // On failure, try again on the next check.
         if result.is_ok() {
@@ -157,7 +163,7 @@ impl MixerPersistence {
         }
     }
 
-    fn snapshot(&mut self, master_gain: f32, buses: &[BusInfo], sources: &[SourceInfo]) -> Snapshot {
+    fn snapshot(&mut self, master_gain: f32, buses: &[BusInfo], sources: &[SourceInfo], mic: MicConfig) -> Snapshot {
         self.exe_names.retain(|id, _| sources.iter().any(|s| s.id == *id));
         let mut saved_sources: Vec<SavedSource> = sources
             .iter()
@@ -203,6 +209,7 @@ impl MixerPersistence {
         Snapshot {
             mixer: MixerSetup { master_gain, buses: buses_saved, sources: saved_sources },
             eq,
+            mic,
         }
     }
 }

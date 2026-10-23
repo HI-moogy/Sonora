@@ -19,6 +19,7 @@ mod games;
 mod hotkey;
 mod meter;
 mod moments;
+mod noise;
 mod setup;
 mod single_instance;
 mod sounds;
@@ -469,13 +470,14 @@ impl eframe::App for MixerApp {
                     if ui
                         .checkbox(&mut heard, "Listen to my mic")
                         .on_hover_text(
-                            "Plays your mic back to you, with its EQ, to check how you sound. \
+                            "Plays your mic back to you, with its EQ and noise removal, to check how you sound. \
                              Nobody else hears this. Turn it off when you're done.",
                         )
                         .changed()
                     {
                         self.mixer.set_bus_heard(&selected, heard);
                     }
+                    noise::noise_controls(ui, self.mixer.mic_cleanup(), mic.is_some());
                 } else {
                     ui.horizontal(|ui| {
                         ui.strong("Output device");
