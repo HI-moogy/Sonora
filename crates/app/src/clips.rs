@@ -417,16 +417,6 @@ pub fn display_name(name: &str) -> &str {
     name.strip_prefix("Sonora ").or_else(|| name.strip_prefix("sonar-rs ")).unwrap_or(name)
 }
 
-/// Opens `url` in the default browser.
-pub fn open_url(url: &str) {
-    let _ = Command::new("explorer").arg(url).spawn();
-}
-
-pub fn open_folder(dir: &Path) {
-    let _ = std::fs::create_dir_all(dir);
-    let _ = Command::new("explorer").arg(dir).spawn();
-}
-
 /// Shows the standard Windows folder picker starting at `start`. Blocks
 /// until the user picks a folder (`Some`) or cancels (`None`).
 pub fn pick_folder(start: &Path) -> Option<PathBuf> {

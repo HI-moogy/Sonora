@@ -670,7 +670,7 @@ impl Moments {
             ui.label("Saved to");
             ui.strong(dir.display().to_string());
             if ui.button("Open folder").clicked() {
-                clips::open_folder(&dir);
+                crate::support::open_folder(&dir);
             }
             if ui.button("Change folder…").clicked() {
                 if let Some(picked) = clips::pick_folder(&dir) {

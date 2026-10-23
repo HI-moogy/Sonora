@@ -38,6 +38,7 @@ mod single_instance;
 #[cfg(windows)]
 mod sounds;
 mod strip;
+mod support;
 mod theme;
 #[cfg_attr(target_os = "linux", path = "tray_linux.rs")]
 mod tray;
@@ -112,6 +113,7 @@ struct MixerApp {
     /// was created with.
     start_hidden_frames: u32,
     colors_window: appearance::ColorsWindow,
+    about_window: support::AboutWindow,
     guide: guide::Guide,
 }
 
@@ -179,6 +181,7 @@ impl MixerApp {
             eq_presets: EqPresetState::load(),
             start_hidden_frames: if start_hidden { START_HIDDEN_FRAMES } else { 0 },
             colors_window: appearance::ColorsWindow::default(),
+            about_window: support::AboutWindow::default(),
             guide: {
                 // The tour shows once, the first time Sonora opens.
                 let mut guide = guide::Guide::default();
@@ -501,7 +504,7 @@ impl MixerApp {
                          Cable, then pick it here.",
                     );
                     if ui.small_button("Get it").clicked() {
-                        clips::open_url("https://vb-audio.com/Cable/");
+                        support::open_url("https://vb-audio.com/Cable/");
                     }
                 });
             }
@@ -766,6 +769,7 @@ impl eframe::App for MixerApp {
             None => {}
         }
         self.colors_window.show(ui.ctx());
+        self.about_window.show(ui.ctx());
         if let Some(guide::Outcome::Done) = self.guide.show(ui.ctx(), &self.clip_hotkey()) {
             self.tab = Tab::Mixer;
             self.selected_bus = None;
@@ -809,6 +813,11 @@ impl eframe::App for MixerApp {
                         }
                         if ui.button("Getting started guide").clicked() {
                             self.guide.start();
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("About and bug reports…").clicked() {
+                            self.about_window.open();
                             ui.close();
                         }
                     });
@@ -959,6 +968,7 @@ fn x11_usable() -> bool {
 }
 
 fn main() -> eframe::Result<()> {
+    support::install_crash_reports();
     let Some(_instance) = single_instance::acquire() else {
         return Ok(());
     };
