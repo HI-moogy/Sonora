@@ -279,6 +279,21 @@ impl eframe::App for MixerApp {
                             self.mixer.set_bus_device(&selected, picked);
                         }
                     });
+                    if bus.device_id.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.label("If it disconnects");
+                            let mut fallback = bus.fallback_to_default;
+                            egui::ComboBox::from_id_salt("disconnect-choice")
+                                .selected_text(if fallback { "Play on default output" } else { "Go silent" })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut fallback, true, "Play on default output");
+                                    ui.selectable_value(&mut fallback, false, "Go silent");
+                                });
+                            if fallback != bus.fallback_to_default {
+                                self.mixer.set_bus_fallback(&selected, fallback);
+                            }
+                        });
+                    }
                 }
                 ui.separator();
 

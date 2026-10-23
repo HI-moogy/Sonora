@@ -50,6 +50,7 @@ impl MixerPersistence {
             mixer.set_bus_gain(name, bus.gain);
             mixer.set_bus_muted(name, bus.muted);
             mixer.set_bus_device(name, bus.device.clone());
+            mixer.set_bus_fallback(name, bus.fallback_to_default);
         }
         for (name, preset) in &presets.eq {
             mixer.ensure_bus(name);
@@ -188,6 +189,7 @@ impl MixerPersistence {
                     gain: bus.gain,
                     muted: bus.muted,
                     device: bus.device_id.clone(),
+                    fallback_to_default: bus.fallback_to_default,
                     color: self.colors.get(&bus.name).cloned(),
                 };
                 (bus.name.clone(), saved)

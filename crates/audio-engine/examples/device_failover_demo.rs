@@ -3,8 +3,9 @@
 //! demo takes that device over in exclusive mode (which breaks shared-mode
 //! streams on it, as unplugging would) and later lets it go. The bus should
 //! fall back to the default device and then return. Its audio is a quiet
-//! (-66 dB) tone from a child process.
-//! Usage: device_failover_demo <part of the device's name>
+//! (-66 dB) tone from a child process. With `silent`, the bus is set to go
+//! silent instead, so its level should drop to 0 while the device is taken.
+//! Usage: device_failover_demo <part of the device's name> [silent]
 
 use std::time::{Duration, Instant};
 
@@ -167,6 +168,7 @@ fn main() -> windows::core::Result<()> {
     let mixer = Mixer::start()?;
     mixer.ensure_bus(BUS);
     mixer.set_bus_device(BUS, Some(device.id.clone()));
+    mixer.set_bus_fallback(BUS, std::env::args().nth(2).as_deref() != Some("silent"));
     mixer.add_source(tone.0.id(), "tone", BUS)?;
 
     report(&mixer, "on test device", 3);

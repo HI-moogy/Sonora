@@ -88,6 +88,9 @@ struct BusInner {
     eq: Mutex<EqBands>,
     /// `None` renders to the system default output device.
     device_id: Mutex<Option<String>>,
+    /// Whether the bus plays on the default device while its own device is
+    /// unavailable, rather than going silent.
+    fallback_to_default: AtomicBool,
 }
 
 /// Receives every bus's audio as the mixer renders it: after the bus's EQ,
@@ -125,6 +128,8 @@ pub struct BusInfo {
     pub eq_gains_db: [f32; EQ_BAND_COUNT],
     /// `None` means this bus renders to the system default output device.
     pub device_id: Option<String>,
+    /// See [`Mixer::set_bus_fallback`].
+    pub fallback_to_default: bool,
 }
 
 /// Captures audio from any number of processes (plus optionally the
@@ -392,6 +397,17 @@ impl Mixer {
         }
     }
 
+    /// What `bus` does while its output device is unavailable (unplugged,
+    /// turned off, taken over by another app): play on the default device
+    /// until it's back (`true`, the default), or go silent (`false`). Other
+    /// buses keep playing either way.
+    pub fn set_bus_fallback(&self, bus: &str, fallback_to_default: bool) {
+        if let Some(bus) = self.buses.lock().unwrap().get(bus) {
+            bus.fallback_to_default
+                .store(fallback_to_default, Ordering::Relaxed);
+        }
+    }
+
     pub fn set_master_gain(&self, gain: f32) {
         self.master_gain.store(gain.max(0.0));
     }
@@ -435,6 +451,7 @@ impl Mixer {
                 level: b.level.take(),
                 eq_gains_db: b.eq.lock().unwrap().gains(),
                 device_id: b.device_id.lock().unwrap().clone(),
+                fallback_to_default: b.fallback_to_default.load(Ordering::Relaxed),
             })
             .collect()
     }
@@ -457,6 +474,7 @@ impl Mixer {
                 level: AtomicF32::new(0.0),
                 eq: Mutex::new(EqBands::from_gains(SAMPLE_RATE, gains_db)),
                 device_id: Mutex::new(None),
+                fallback_to_default: AtomicBool::new(true),
             }),
         );
     }
@@ -803,8 +821,8 @@ fn run_render_loop(
         };
 
         // Open the devices buses ask for; a bus whose device can't be opened
-        // plays on the default device until it can. Then close devices no
-        // bus plays on anymore.
+        // plays on the default device until it can, or goes silent if it's
+        // set to. Then close devices no bus plays on anymore.
         let now = Instant::now();
         let mut ensure_open = |device_id: &Option<String>| {
             if device_outputs.contains_key(device_id) {
@@ -830,7 +848,9 @@ fn run_render_loop(
             }
         };
         for snapshot in &mut bus_snapshot {
-            if !ensure_open(&snapshot.device_id) {
+            if !ensure_open(&snapshot.device_id)
+                && snapshot.bus.fallback_to_default.load(Ordering::Relaxed)
+            {
                 snapshot.device_id = None;
                 ensure_open(&None);
             }

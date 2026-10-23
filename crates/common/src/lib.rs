@@ -61,13 +61,16 @@ pub struct SavedBus {
     /// Output device id as Windows reports it; `None` plays to the system
     /// default device.
     pub device: Option<String>,
+    /// When `device` disconnects: play on the default device until it's
+    /// back (true), or go silent (false).
+    pub fallback_to_default: bool,
     /// `#RRGGBB` shown for the bus instead of its built-in color.
     pub color: Option<String>,
 }
 
 impl Default for SavedBus {
     fn default() -> Self {
-        Self { gain: 1.0, muted: false, device: None, color: None }
+        Self { gain: 1.0, muted: false, device: None, fallback_to_default: true, color: None }
     }
 }
 
@@ -313,6 +316,14 @@ mod tests {
     }
 
     #[test]
+    fn buses_saved_before_the_disconnect_choice_keep_playing_on_default() {
+        let old = r#"{ "gain": 0.5, "muted": false, "device": "{0.0.0.00000000}.{tv}" }"#;
+        let bus: SavedBus = serde_json::from_str(old).unwrap();
+        assert!(bus.fallback_to_default);
+        assert_eq!(bus.device.as_deref(), Some("{0.0.0.00000000}.{tv}"));
+    }
+
+    #[test]
     fn mixer_setup_round_trips() {
         let mut presets = Presets::default();
         presets.mixer.sources.push(SavedSource {
@@ -331,7 +342,7 @@ mod tests {
         });
         presets.mixer.buses.insert(
             "Aux".into(),
-            SavedBus { gain: 0.5, muted: false, device: Some("{0.0.0.00000000}.{tv}".into()), color: Some("#A855F7".into()) },
+            SavedBus { gain: 0.5, muted: false, device: Some("{0.0.0.00000000}.{tv}".into()), fallback_to_default: false, color: Some("#A855F7".into()) },
         );
         let json = serde_json::to_string(&presets).unwrap();
         let loaded: Presets = serde_json::from_str(&json).unwrap();
