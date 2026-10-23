@@ -574,7 +574,9 @@ impl eframe::App for MixerApp {
                         ui.set_width(70.0);
                         egui::Frame::new().fill(color.gamma_multiply(0.35)).inner_margin(6.0).show(ui, |ui| {
                             ui.vertical_centered(|ui| {
-                                let slider = egui::Slider::new(&mut gain, 2.0..=0.0)
+                                // Vertical sliders already put the start of the
+                                // range at the bottom: louder is up.
+                                let slider = egui::Slider::new(&mut gain, 0.0..=2.0)
                                     .vertical()
                                     .show_value(false);
                                 if ui.add_sized([36.0, 180.0], slider).changed() {
