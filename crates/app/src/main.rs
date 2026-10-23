@@ -248,15 +248,12 @@ fn eq_preset_controls(
                     }
                 };
                 item(ui, eq_presets::FLAT.name, eq_presets::FLAT.gains_db);
-                ui.separator();
-                ui.weak("Music");
-                for preset in eq_presets::MUSIC {
-                    item(ui, preset.name, preset.gains_db);
-                }
-                ui.separator();
-                ui.weak("Games and voice");
-                for preset in eq_presets::GENERAL {
-                    item(ui, preset.name, preset.gains_db);
+                for category in eq_presets::categories_for(bus_name) {
+                    ui.separator();
+                    ui.weak(category.name);
+                    for preset in category.presets {
+                        item(ui, preset.name, preset.gains_db);
+                    }
                 }
                 if !presets.saved.is_empty() {
                     ui.separator();
