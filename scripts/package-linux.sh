@@ -12,8 +12,6 @@ cd "$root"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/app/Cargo.toml | head -n 1)
 target_dir="${CARGO_TARGET_DIR:-$root/target}"
 
-cargo build --release --locked -p app
-
 name="sonora-$version-linux-x86_64"
 # Staged in a temporary folder, where file modes stick (they don't on a
 # Windows drive under WSL).
@@ -21,11 +19,16 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 stage="$work/$name"
 mkdir -p "$stage" "$root/dist"
+
+# The licenses go in the archive and inside the program (About and bug
+# reports > Open-source licenses).
+python3 scripts/third_party_notices.py --target x86_64-unknown-linux-gnu > "$stage/THIRD-PARTY-NOTICES.txt"
+SONORA_NOTICES="$stage/THIRD-PARTY-NOTICES.txt" cargo build --release --locked -p app
+
 cp "$target_dir/release/sonora" "$stage/"
 cp crates/app/assets/icon.png "$stage/sonora.png"
 cp packaging/linux/sonora.desktop packaging/linux/install.sh packaging/linux/uninstall.sh "$stage/"
 cp README.md CHANGELOG.md LICENSE "$stage/"
-python3 scripts/third_party_notices.py --target x86_64-unknown-linux-gnu > "$stage/THIRD-PARTY-NOTICES.txt"
 chmod 644 "$stage"/*
 chmod 755 "$stage/sonora" "$stage/install.sh" "$stage/uninstall.sh"
 tar -C "$work" -czf "$root/dist/$name.tar.gz" "$name"

@@ -22,19 +22,21 @@ Get the latest build from the [Releases](../../releases) page:
 
 | System | File |
 | --- | --- |
-| Windows 11, 64-bit | `sonora-<version>-windows-x64.zip` |
+| Windows 11, 64-bit | `Sonora.exe` |
 | Linux, 64-bit (PipeWire or PulseAudio) | `sonora-<version>-linux-x86_64.tar.gz` |
 
 ## Install
 
 ### Windows
 
-1. Unzip anywhere you like (for example `Documents\Sonora`).
-2. Run `sonora.exe`.
-3. Windows may say "Windows protected your PC" because the app isn't signed
+1. Put `Sonora.exe` anywhere you like (for example a `Documents\Sonora`
+   folder) and run it. It's the whole app: nothing gets installed.
+2. Windows may say "Windows protected your PC" because the app isn't signed
    yet. Click **More info**, then **Run anyway**.
 
-Nothing else is installed; settings live in `%APPDATA%\sonora`.
+To update, quit Sonora (tray icon > **Quit**) and replace the file with the
+new `Sonora.exe`; **Start with Windows** keeps working. Settings live in
+`%APPDATA%\sonora`.
 
 You need Windows 11 (sending apps to channels relies on a Windows feature
 most Windows 10 versions lack). For clips, a graphics card that can encode
@@ -136,7 +138,7 @@ recording) keeps going. Click the icon to open it again; right-click it for
 ## Uninstall
 
 - **Windows:** right-click the tray icon, untick **Start with Windows**,
-  then **Quit**. Delete the Sonora folder, and `%APPDATA%\sonora` for the
+  then **Quit**. Delete `Sonora.exe`, and `%APPDATA%\sonora` for the
   settings.
 - **Linux:** run `./uninstall.sh` from the download (or delete
   `~/.local/bin/sonora` and `~/.local/share/applications/sonora.desktop`),
@@ -185,5 +187,7 @@ Sonora builds on open-source libraries, including
 [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) and
 [RNNoise](https://github.com/xiph/rnnoise) (via nnnoiseless) for noise
 removal and [egui](https://github.com/emilk/egui) for its interface; their
-licenses ship with every release in `THIRD-PARTY-NOTICES.txt`. Sonora isn't
+licenses are built into Sonora (**Menu > About and bug reports >
+Open-source licenses**) and ship with Linux releases in
+`THIRD-PARTY-NOTICES.txt`. Sonora isn't
 affiliated with SteelSeries.

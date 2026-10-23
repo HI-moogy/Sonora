@@ -13,6 +13,7 @@
 - **A getting-started tour** the first time Sonora opens (Menu > Getting started guide).
 - **Clips**: clips in subfolders show too; sort by date or game and filter by game; the game is read from Radeon and SteelSeries file names. The editor has previous/next clip buttons, skip to start/end, and drawn controls.
 - **Bug reports**: Menu > About and bug reports copies your version and system, and Sonora writes a crash report if it crashes.
+- **Windows download is one file**: `Sonora.exe`, nothing to unzip or install. Replace it to update.
 
 ### Changed
 
@@ -23,6 +24,10 @@
 - You no longer hear your own mic unless you turn on **Listen to my mic**.
 - Channel faders were upside down.
 - Clip settings no longer hide behind the clip list; editor sliders fit.
+- One unreadable setting no longer resets all your settings.
+- An app removed from a channel during a device change could stay almost silent with nothing to turn it back up.
+- A damaged clip file no longer stops every clip's thumbnail, or leaves the editor stuck on Loading.
+- Sonora says why if its audio can't start, instead of closing.
 
 ## 0.1.0-alpha.1 (2026-10-22)
 

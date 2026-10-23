@@ -12,6 +12,25 @@ use crate::theme;
 /// The GitHub repository, from Cargo.toml's `repository` (empty until set).
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 
+/// Sonora's own license, and those of the libraries built into it.
+const LICENSE: &str = include_str!("../../../LICENSE");
+const NOTICES: &str = include_str!(concat!(env!("OUT_DIR"), "/notices.txt"));
+
+/// Writes the licenses Sonora carries to the settings folder and opens
+/// them in the default text viewer.
+fn open_licenses() {
+    let path = common::config_dir().join("licenses.txt");
+    let text = format!("Sonora
+
+{LICENSE}
+
+{NOTICES}");
+    let _ = std::fs::create_dir_all(common::config_dir());
+    if std::fs::write(&path, text).is_ok() {
+        open_url(&path.to_string_lossy());
+    }
+}
+
 /// Where crash reports are written.
 pub fn crash_dir() -> PathBuf {
     common::config_dir().join("crashes")
@@ -84,7 +103,7 @@ fn os_name() -> String {
     format!("{distro}, {} desktop, {} session", var("XDG_CURRENT_DESKTOP"), var("XDG_SESSION_TYPE"))
 }
 
-/// Opens `url` in the default browser.
+/// Opens `url` in the default browser (or a file in its default app).
 pub fn open_url(url: &str) {
     #[cfg(windows)]
     let _ = Command::new("explorer").arg(url).spawn();
@@ -148,6 +167,13 @@ impl AboutWindow {
                     }
                     if ui.button("Settings folder").clicked() {
                         open_folder(&common::config_dir());
+                    }
+                });
+                theme::section(ui, "Licenses");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Sonora's code is MIT licensed; the Sonora name and logo aren't.");
+                    if ui.button("Open-source licenses").on_hover_text("Sonora's license and those of the libraries it's built with").clicked() {
+                        open_licenses();
                     }
                 });
                 if self.copied {
