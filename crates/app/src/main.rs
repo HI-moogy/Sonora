@@ -550,7 +550,7 @@ impl eframe::App for MixerApp {
 
         // --- Main fader bank ---
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("sonar-rs");
+            ui.heading(concat!("sonar-rs ", env!("CARGO_PKG_VERSION")));
             ui.separator();
 
             ui.horizontal(|ui| {

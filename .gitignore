@@ -5,3 +5,6 @@
 
 # Windows ISO and Media Creation Tool for the test VM.
 /driver/vm-setup/
+
+# Alpha downloads built for sharing.
+/dist/

@@ -213,7 +213,7 @@ fn add_icon(window: HWND) -> bool {
     data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     data.uCallbackMessage = CALLBACK_MESSAGE;
     data.hIcon = app_icon();
-    copy_into(&mut data.szTip, "sonar-rs");
+    copy_into(&mut data.szTip, concat!("sonar-rs ", env!("CARGO_PKG_VERSION")));
     let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool();
     if !data.hIcon.is_invalid() {
         // The shell keeps its own copy.
