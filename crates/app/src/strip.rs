@@ -55,23 +55,23 @@ impl Strip<'_> {
         let fill = if self.selected {
             self.color.linear_multiply(0.10)
         } else if hovered {
-            theme::RAISED.linear_multiply(0.8)
+            theme::raised().linear_multiply(0.8)
         } else {
-            theme::RAISED.linear_multiply(0.55)
+            theme::raised().linear_multiply(0.55)
         };
-        let stroke = if self.selected { Stroke::new(1.5, self.color) } else { Stroke::new(1.0, theme::BORDER) };
+        let stroke = if self.selected { Stroke::new(1.5, self.color) } else { Stroke::new(1.0, theme::border()) };
         painter.rect(card, CornerRadius::same(theme::RADIUS + 2), fill, stroke, StrokeKind::Inside);
         // A band of the channel's color across the top.
         let band = Rect::from_min_size(card.min + vec2(14.0, 0.0), vec2(card.width() - 28.0, 3.0));
         painter.rect_filled(band, CornerRadius::same(2), self.color);
 
-        painter.text(pos2(card.center().x, card.top() + 24.0), Align2::CENTER_CENTER, self.name, FontId::proportional(15.0), theme::TEXT);
+        painter.text(pos2(card.center().x, card.top() + 24.0), Align2::CENTER_CENTER, self.name, FontId::proportional(15.0), theme::text());
         painter.text(
             pos2(card.center().x, card.top() + 43.0),
             Align2::CENTER_CENTER,
             &self.detail,
             FontId::proportional(11.5),
-            theme::TEXT_MUTED,
+            theme::text_muted(),
         );
 
         // Fader track, with the meter just right of it.
@@ -99,29 +99,29 @@ impl Strip<'_> {
         }
         let fader = fader.on_hover_text("Drag or scroll to change. Double-click for 100%.");
 
-        painter.rect_filled(track, CornerRadius::same(4), theme::BG);
-        let fill_color = if self.muted { theme::TEXT_MUTED.linear_multiply(0.5) } else { self.color };
+        painter.rect_filled(track, CornerRadius::same(4), theme::bg());
+        let fill_color = if self.muted { theme::text_muted().linear_multiply(0.5) } else { self.color };
         let filled = Rect::from_min_max(pos2(track.left(), y_at(p)), track.max);
         painter.rect_filled(filled, CornerRadius::same(4), fill_color.linear_multiply(0.85));
         // 100% mark.
         let unity = y_at(position(1.0));
         painter.line_segment(
             [pos2(track.left() - 7.0, unity), pos2(track.left() - 3.0, unity)],
-            Stroke::new(1.5, theme::TEXT_MUTED),
+            Stroke::new(1.5, theme::text_muted()),
         );
         let thumb = Rect::from_center_size(pos2(track.center().x, y_at(p)), vec2(30.0, 12.0));
-        let thumb_stroke = if fader.hovered() || fader.dragged() { self.color } else { theme::BORDER };
-        painter.rect(thumb, CornerRadius::same(4), theme::TEXT, Stroke::new(1.5, thumb_stroke), StrokeKind::Inside);
+        let thumb_stroke = if fader.hovered() || fader.dragged() { self.color } else { theme::border() };
+        painter.rect(thumb, CornerRadius::same(4), theme::text(), Stroke::new(1.5, thumb_stroke), StrokeKind::Inside);
 
         let (level, hold) = meter_levels(ui, ("strip", self.name), self.peak);
-        painter.rect_filled(meter, CornerRadius::same(3), theme::BG);
+        painter.rect_filled(meter, CornerRadius::same(3), theme::bg());
         if level > 0.0 {
             let top = meter.bottom() - level.sqrt() * meter.height();
             painter.rect_filled(Rect::from_min_max(pos2(meter.left(), top), meter.max), CornerRadius::same(3), self.color);
         }
         if let Some(hold) = hold {
             let y = meter.bottom() - hold.sqrt() * meter.height();
-            painter.line_segment([pos2(meter.left(), y), pos2(meter.right(), y)], Stroke::new(2.0, theme::TEXT));
+            painter.line_segment([pos2(meter.left(), y), pos2(meter.right(), y)], Stroke::new(2.0, theme::text()));
         }
 
         let percent = format!("{:.0}%", gain_at(p) * 100.0);
@@ -130,7 +130,7 @@ impl Strip<'_> {
             Align2::CENTER_CENTER,
             percent,
             FontId::proportional(13.0),
-            if self.muted { theme::TEXT_MUTED } else { theme::TEXT },
+            if self.muted { theme::text_muted() } else { theme::text() },
         );
 
         // Mute button.
@@ -140,13 +140,13 @@ impl Strip<'_> {
             out.toggle_mute = true;
         }
         let (mute_fill, mute_text) = if self.muted {
-            (theme::DANGER, Color32::from_rgb(0x1E, 0x0E, 0x0E))
+            (theme::danger(), theme::text_on(theme::danger()))
         } else if mute_response.hovered() {
-            (theme::RAISED_HOVER, theme::TEXT)
+            (theme::raised_hover(), theme::text())
         } else {
-            (theme::RAISED, theme::TEXT_MUTED)
+            (theme::raised(), theme::text_muted())
         };
-        painter.rect(mute, CornerRadius::same(6), mute_fill, Stroke::new(1.0, theme::BORDER), StrokeKind::Inside);
+        painter.rect(mute, CornerRadius::same(6), mute_fill, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
         painter.text(
             mute.center(),
             Align2::CENTER_CENTER,

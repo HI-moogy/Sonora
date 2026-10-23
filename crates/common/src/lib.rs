@@ -46,6 +46,121 @@ pub struct Presets {
     pub eq_presets: Vec<NamedEq>,
     #[serde(default)]
     pub mic: MicConfig,
+    /// Your colors; `None` until first saved (older settings then bring
+    /// their channel colors along, see [`SavedBus::color`]).
+    #[serde(default)]
+    pub colors: Option<ThemeColors>,
+    #[serde(default)]
+    pub guide: GuideState,
+}
+
+/// Whether you've been through the getting-started guide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuideState {
+    pub seen: bool,
+}
+
+/// A color, saved as `#RRGGBB` so it's easy to read, edit and share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Rgb(pub [u8; 3]);
+
+impl Rgb {
+    pub const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self([r, g, b])
+    }
+
+    /// Reads `#RRGGBB` or `RRGGBB`.
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        let hex = hex.trim();
+        let hex = hex.strip_prefix('#').unwrap_or(hex);
+        if hex.len() != 6 || !hex.is_ascii() {
+            return None;
+        }
+        let channel = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).ok();
+        Some(Self([channel(0)?, channel(2)?, channel(4)?]))
+    }
+
+    pub fn to_hex(self) -> String {
+        let [r, g, b] = self.0;
+        format!("#{r:02X}{g:02X}{b:02X}")
+    }
+}
+
+impl Serialize for Rgb {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for Rgb {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::from_hex(&text).ok_or_else(|| serde::de::Error::custom(format!("{text:?} isn't a #RRGGBB color")))
+    }
+}
+
+/// Every color Sonora draws with. Colors missing from a saved theme (one
+/// from before a color was added) are Sonora's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeColors {
+    /// Behind everything.
+    pub background: Rgb,
+    /// Side panels and windows.
+    pub panels: Rgb,
+    /// Cards, the boxes things are grouped in.
+    pub cards: Rgb,
+    /// Buttons, fields and slider rails.
+    pub controls: Rgb,
+    pub controls_hovered: Rgb,
+    pub borders: Rgb,
+    pub text: Rgb,
+    /// Hints, labels and details.
+    pub text_muted: Rgb,
+    /// Selected tabs, main buttons, sliders' filled part.
+    pub accent: Rgb,
+    /// Text and icons on the accent color.
+    pub text_on_accent: Rgb,
+    pub warning: Rgb,
+    /// Errors and muted channels.
+    pub error: Rgb,
+    /// Game, Chat, Aux, Media, Mic.
+    pub channels: [Rgb; 5],
+    /// The clip editor's desktop audio track.
+    pub desktop_track: Rgb,
+}
+
+impl ThemeColors {
+    /// Sonora's own look: dark, with a warm coral accent.
+    pub const SONORA: Self = Self {
+        background: Rgb::new(0x12, 0x14, 0x19),
+        panels: Rgb::new(0x19, 0x1C, 0x23),
+        cards: Rgb::new(0x15, 0x18, 0x1F),
+        controls: Rgb::new(0x22, 0x26, 0x2F),
+        controls_hovered: Rgb::new(0x2B, 0x30, 0x3B),
+        borders: Rgb::new(0x2C, 0x31, 0x3C),
+        text: Rgb::new(0xE7, 0xE9, 0xEE),
+        text_muted: Rgb::new(0x8C, 0x93, 0xA3),
+        accent: Rgb::new(0xFF, 0x7A, 0x59),
+        text_on_accent: Rgb::new(0x1A, 0x10, 0x0C),
+        warning: Rgb::new(0xF0, 0xB4, 0x4C),
+        error: Rgb::new(0xF2, 0x6D, 0x6D),
+        channels: [
+            Rgb::new(0x4F, 0xA3, 0xFF),
+            Rgb::new(0x45, 0xD0, 0x8A),
+            Rgb::new(0xA7, 0x8B, 0xFA),
+            Rgb::new(0xF4, 0x72, 0xB6),
+            Rgb::new(0xFB, 0xBF, 0x24),
+        ],
+        desktop_track: Rgb::new(0x96, 0x96, 0xA0),
+    };
+}
+
+impl Default for ThemeColors {
+    fn default() -> Self {
+        Self::SONORA
+    }
 }
 
 /// How the microphone is cleaned up before it reaches the mix.
@@ -109,7 +224,9 @@ pub struct SavedBus {
     /// Whether a copy also plays on the default device (hearing your own
     /// mic); `None` is off.
     pub monitor: Option<bool>,
-    /// `#RRGGBB` shown for the bus instead of its built-in color.
+    /// Older settings' `#RRGGBB` color for the bus. Read only: it moves
+    /// into [`ThemeColors::channels`] the first time colors are saved.
+    #[serde(skip_serializing)]
     pub color: Option<String>,
 }
 
@@ -363,14 +480,23 @@ fn parse_sections(text: &str) -> (Presets, Vec<String>) {
             T::default()
         })
     }
-    let (eq, moments, mixer, eq_presets, mic) =
-        (section("eq"), section("moments"), section("mixer"), section("eq_presets"), section("mic"));
+    let (eq, moments, mixer, eq_presets, mic, colors, guide) = (
+        section("eq"),
+        section("moments"),
+        section("mixer"),
+        section("eq_presets"),
+        section("mic"),
+        section("colors"),
+        section("guide"),
+    );
     let presets = Presets {
         eq: parse("EQ", eq, &mut broken),
         moments: parse("clip settings", moments, &mut broken),
         mixer: parse("mixer", mixer, &mut broken),
         eq_presets: parse("EQ presets", eq_presets, &mut broken),
         mic: parse("microphone noise removal", mic, &mut broken),
+        colors: parse("colors", colors, &mut broken),
+        guide: parse("guide", guide, &mut broken),
     };
     (presets, broken)
 }
@@ -416,6 +542,30 @@ mod tests {
     }
 
     #[test]
+    fn colors_are_saved_as_hex_and_missing_ones_are_sonoras() {
+        assert_eq!(Rgb::from_hex("#FF6000"), Some(Rgb::new(0xFF, 0x60, 0x00)));
+        assert_eq!(Rgb::from_hex("5865f2"), Some(Rgb::new(0x58, 0x65, 0xF2)));
+        assert_eq!(Rgb::from_hex("#FF60"), None);
+        assert_eq!(Rgb::from_hex("#GG6000"), None);
+        assert_eq!(Rgb::from_hex("#ÿÿÿ"), None);
+        let mut colors = ThemeColors::SONORA;
+        colors.accent = Rgb::new(1, 2, 3);
+        let json = serde_json::to_string(&colors).unwrap();
+        assert!(json.contains(r##""accent":"#010203""##));
+        assert_eq!(serde_json::from_str::<ThemeColors>(&json).unwrap(), colors);
+        let partial: ThemeColors = serde_json::from_str(r##"{ "accent": "#010203" }"##).unwrap();
+        assert_eq!(partial.background, ThemeColors::SONORA.background);
+        assert_eq!(partial.accent, Rgb::new(1, 2, 3));
+    }
+
+    #[test]
+    fn old_bus_colors_are_read_but_no_longer_written() {
+        let bus: SavedBus = serde_json::from_str(r##"{ "color": "#A855F7" }"##).unwrap();
+        assert_eq!(bus.color.as_deref(), Some("#A855F7"));
+        assert!(!serde_json::to_string(&bus).unwrap().contains("color"));
+    }
+
+    #[test]
     fn mixer_setup_round_trips() {
         let mut presets = Presets::default();
         presets.mixer.sources.push(SavedSource {
@@ -434,7 +584,7 @@ mod tests {
         });
         presets.mixer.buses.insert(
             "Aux".into(),
-            SavedBus { gain: 0.5, muted: false, device: Some("{0.0.0.00000000}.{tv}".into()), fallback_to_default: false, heard: Some(false), priority: Some(Priority::Low), monitor: Some(true), color: Some("#A855F7".into()) },
+            SavedBus { gain: 0.5, muted: false, device: Some("{0.0.0.00000000}.{tv}".into()), fallback_to_default: false, heard: Some(false), priority: Some(Priority::Low), monitor: Some(true), color: None },
         );
         let json = serde_json::to_string(&presets).unwrap();
         let loaded: Presets = serde_json::from_str(&json).unwrap();

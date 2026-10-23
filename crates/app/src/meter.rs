@@ -68,13 +68,13 @@ pub fn level_meter(ui: &mut egui::Ui, key: impl std::hash::Hash + std::fmt::Debu
     let (shown, hold) = meter_levels(ui, key, peak);
     let (rect, _) = ui.allocate_exact_size(SIZE, egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 3.0, crate::theme::BG);
+    painter.rect_filled(rect, 3.0, crate::theme::bg());
     let x_at = |level: f32| rect.left() + rect.width() * level;
     let fill = egui::Rect::from_min_max(rect.min, egui::pos2(x_at(shown), rect.bottom()));
     painter.rect_filled(fill, 3.0, color);
     if let Some(hold) = hold {
         let x = x_at(hold).min(rect.right() - 1.0);
-        painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], egui::Stroke::new(2.0, crate::theme::TEXT));
+        painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], egui::Stroke::new(2.0, crate::theme::text()));
     }
 }
 

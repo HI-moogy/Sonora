@@ -189,6 +189,7 @@ dependencies = [
  "capture-engine",
  "common",
  "eframe",
+ "serde_json",
  "windows",
  "winresource",
 ]

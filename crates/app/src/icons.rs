@@ -70,12 +70,12 @@ fn paint(painter: &egui::Painter, icon: Icon, center: Pos2, size: f32, color: Co
 
 /// Colors for a button: its fill, its outline and its icon.
 fn colors(accent: bool, enabled: bool, hovered: bool) -> (Color32, Stroke, Color32) {
-    let on_accent = Color32::from_rgb(0x1A, 0x10, 0x0C);
+    let on_accent = theme::on_accent();
     match (accent, enabled) {
-        (true, true) => (if hovered { theme::ACCENT.linear_multiply(1.1) } else { theme::ACCENT }, Stroke::NONE, on_accent),
-        (true, false) => (theme::ACCENT.linear_multiply(0.35), Stroke::NONE, on_accent),
-        (false, true) => (if hovered { theme::RAISED_HOVER } else { theme::RAISED }, Stroke::new(1.0, theme::BORDER), theme::TEXT),
-        (false, false) => (theme::RAISED.linear_multiply(0.5), Stroke::new(1.0, theme::BORDER), theme::TEXT_MUTED),
+        (true, true) => (if hovered { theme::accent().linear_multiply(1.1) } else { theme::accent() }, Stroke::NONE, on_accent),
+        (true, false) => (theme::accent().linear_multiply(0.35), Stroke::NONE, on_accent),
+        (false, true) => (if hovered { theme::raised_hover() } else { theme::raised() }, Stroke::new(1.0, theme::border()), theme::text()),
+        (false, false) => (theme::raised().linear_multiply(0.5), Stroke::new(1.0, theme::border()), theme::text_muted()),
     }
 }
 

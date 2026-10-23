@@ -13,10 +13,12 @@ use audio_engine::{
 use common::Priority;
 use eframe::egui;
 
+mod appearance;
 mod autostart;
 mod clips;
 mod eq_presets;
 mod games;
+mod guide;
 mod hotkey;
 mod icons;
 mod meter;
@@ -62,7 +64,7 @@ struct AvailableSession {
     name: String,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Mixer,
     Clips,
@@ -98,6 +100,8 @@ struct MixerApp {
     /// hidden, since eframe shows it once after its first frame whatever it
     /// was created with.
     start_hidden_frames: u32,
+    colors_window: appearance::ColorsWindow,
+    guide: guide::Guide,
 }
 
 impl MixerApp {
@@ -162,6 +166,15 @@ impl MixerApp {
             eq_presets: EqPresetState::load(),
             window: None,
             start_hidden_frames: if start_hidden { START_HIDDEN_FRAMES } else { 0 },
+            colors_window: appearance::ColorsWindow::default(),
+            guide: {
+                // The tour shows once, the first time Sonora opens.
+                let mut guide = guide::Guide::default();
+                if !common::load_presets().guide.seen {
+                    guide.start();
+                }
+                guide
+            },
         })
     }
 
@@ -190,7 +203,7 @@ impl MixerApp {
 
     fn channel_color(&self, bus: &str) -> egui::Color32 {
         let index = FIXED_BUSES.iter().position(|b| *b == bus).unwrap_or(0);
-        self.persistence.bus_color(bus).unwrap_or(theme::channel_color(index))
+        theme::channel_color(index)
     }
 
     /// Everything in a channel's settings panel, in sections.
@@ -308,7 +321,7 @@ impl MixerApp {
             .map(str::to_string)
             .collect();
         if mine.is_empty() && waiting.is_empty() {
-            ui.label(egui::RichText::new("None yet. Add one below.").color(theme::TEXT_MUTED));
+            ui.label(egui::RichText::new("None yet. Add one below.").color(theme::text_muted()));
         }
         for source in mine {
             theme::card().show(ui, |ui| {
@@ -343,7 +356,7 @@ impl MixerApp {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(capitalized(app_label(&app))).strong());
-                    ui.label(egui::RichText::new("joins when it starts").small().color(theme::TEXT_MUTED));
+                    ui.label(egui::RichText::new("joins when it starts").small().color(theme::text_muted()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(egui::Button::new("Remove").small()).clicked() {
                             self.persistence.forget_waiting_app(selected, &app);
@@ -357,7 +370,7 @@ impl MixerApp {
         let addable: Vec<&AvailableSession> =
             self.available_sessions.iter().filter(|s| !active_pids.contains(&s.pid)).collect();
         if addable.is_empty() {
-            ui.label(egui::RichText::new("No other apps are playing sound right now.").color(theme::TEXT_MUTED));
+            ui.label(egui::RichText::new("No other apps are playing sound right now.").color(theme::text_muted()));
         }
         let mut add = None;
         for session in addable {
@@ -402,7 +415,7 @@ impl MixerApp {
             if priority != bus.priority {
                 self.mixer.set_bus_priority(selected, priority);
             }
-            ui.label(egui::RichText::new(format!("~{:.0} ms", bus.delay_ms)).color(theme::TEXT_MUTED)).on_hover_text(
+            ui.label(egui::RichText::new(format!("~{:.0} ms", bus.delay_ms)).color(theme::text_muted())).on_hover_text(
                 "Sonora's own delay for this channel. For apps, Windows adds about 45 ms more \
                  before Sonora gets their sound (measured on this PC).",
             );
@@ -589,7 +602,7 @@ fn eq_preset_controls(
         }
     }
     if let Some(error) = &presets.error {
-        ui.colored_label(egui::Color32::from_rgb(230, 120, 90), error);
+        ui.colored_label(theme::danger(), error);
     }
 }
 
@@ -726,13 +739,31 @@ impl eframe::App for MixerApp {
             IDLE_REPAINT_INTERVAL
         });
 
+        // The guide moves the app to what each step is about.
+        match self.guide.view() {
+            Some(guide::View::Mixer(panel)) => {
+                self.tab = Tab::Mixer;
+                self.selected_bus = panel.map(str::to_string);
+            }
+            Some(guide::View::Clips) => self.tab = Tab::Clips,
+            None => {}
+        }
+        self.colors_window.show(ui.ctx());
+        if let Some(guide::Outcome::Done) = self.guide.show(ui.ctx(), &self.moments.hotkey_label()) {
+            self.tab = Tab::Mixer;
+            self.selected_bus = None;
+            if let Err(error) = common::update_presets(|presets| presets.guide.seen = true) {
+                self.config_notices.push(format!("Couldn't save that you've seen the guide: {error}"));
+            }
+        }
+
         egui::Panel::top("header")
-            .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(18, 10)))
+            .frame(egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin::symmetric(18, 10)))
             .show_separator_line(false)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Sonora").size(21.0).strong().color(theme::TEXT));
-                    ui.label(egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).small().color(theme::TEXT_MUTED));
+                    ui.label(egui::RichText::new("Sonora").size(21.0).strong().color(theme::text()));
+                    ui.label(egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).small().color(theme::text_muted()));
                     ui.add_space(18.0);
                     for (tab, label) in [(Tab::Mixer, "Mixer"), (Tab::Clips, "Clips")] {
                         let selected = self.tab == tab;
@@ -740,16 +771,32 @@ impl eframe::App for MixerApp {
                         let button = if selected {
                             theme::primary_button(label).min_size(egui::vec2(76.0, 30.0))
                         } else {
-                            egui::Button::new(text.color(theme::TEXT_MUTED)).frame(false).min_size(egui::vec2(76.0, 30.0))
+                            egui::Button::new(text.color(theme::text_muted())).frame(false).min_size(egui::vec2(76.0, 30.0))
                         };
-                        if ui.add(button).clicked() {
+                        let response = ui.add(button);
+                        if response.clicked() {
                             self.tab = tab;
                         }
+                        if tab == Tab::Clips {
+                            guide::target(ui.ctx(), "clips-tab", response.rect);
+                        }
                     }
+                    ui.add_space(6.0);
+                    let menu = ui.menu_button(egui::RichText::new("Menu").size(14.5).color(theme::text_muted()), |ui| {
+                        if ui.button("Colors…").clicked() {
+                            self.colors_window.open();
+                            ui.close();
+                        }
+                        if ui.button("Getting started guide").clicked() {
+                            self.guide.start();
+                            ui.close();
+                        }
+                    });
+                    guide::target(ui.ctx(), "menu", menu.response.rect);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        level_meter(ui, "master", master_level, theme::ACCENT);
+                        level_meter(ui, "master", master_level, theme::accent());
                         let mut gain = self.mixer.master_gain();
-                        ui.label(egui::RichText::new(format!("{:.0}%", gain * 100.0)).color(theme::TEXT_MUTED));
+                        ui.label(egui::RichText::new(format!("{:.0}%", gain * 100.0)).color(theme::text_muted()));
                         if ui
                             .add(egui::Slider::new(&mut gain, 0.0..=2.0).show_value(false))
                             .on_hover_text("Everything you hear. Doesn't change your voice sent to Discord and games.")
@@ -758,11 +805,12 @@ impl eframe::App for MixerApp {
                             self.mixer.set_master_gain(gain);
                         }
                         ui.label(egui::RichText::new("Master").strong());
+                        guide::target(ui.ctx(), "master", ui.min_rect());
                     });
                 });
                 if !self.config_notices.is_empty() {
                     ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(theme::WARNING, self.config_notices.join(" "));
+                        ui.colored_label(theme::warning(), self.config_notices.join(" "));
                         if ui.small_button("Dismiss").clicked() {
                             self.config_notices.clear();
                         }
@@ -780,14 +828,14 @@ impl eframe::App for MixerApp {
         // --- Settings for the selected channel (device, EQ, apps) ---
         if let Some(selected) = self.selected_bus.clone() {
             let color = self.channel_color(&selected);
-            egui::Panel::right("bus_detail")
+            let panel = egui::Panel::right("bus_detail")
                 .min_size(400.0)
                 .default_size(430.0)
                 .frame(
                     egui::Frame::new()
-                        .fill(theme::SURFACE)
+                        .fill(theme::surface())
                         .inner_margin(egui::Margin::same(16))
-                        .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+                        .stroke(egui::Stroke::new(1.0, theme::border())),
                 )
                 .show(ui, |ui| {
                     let Some(bus) = buses.iter().find(|b| b.name == selected) else {
@@ -804,12 +852,13 @@ impl eframe::App for MixerApp {
                         });
                     });
                     if let Some(status) = &self.status {
-                        ui.colored_label(theme::DANGER, status);
+                        ui.colored_label(theme::danger(), status);
                     }
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         self.channel_settings(ui, &selected, bus, &sources, mic_already_added, &active_pids, color);
                     });
                 });
+            guide::target(ui.ctx(), "channel-panel", panel.response.rect);
             if self.selected_bus.is_none() {
                 ui.ctx().request_repaint();
             }
@@ -817,10 +866,10 @@ impl eframe::App for MixerApp {
 
         // --- Channel strips ---
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(20)))
+            .frame(egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin::same(20)))
             .show(ui, |ui| {
                 egui::ScrollArea::horizontal().show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    let strips = ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
                         for &bus_name in FIXED_BUSES {
                             let bus = buses.iter().find(|b| b.name == bus_name);
@@ -856,11 +905,12 @@ impl eframe::App for MixerApp {
                             }
                         }
                     });
+                    guide::target(ui.ctx(), "strips", strips.response.rect);
                     if self.selected_bus.is_none() {
                         ui.add_space(16.0);
                         ui.label(
                             egui::RichText::new("Click a channel to choose where it plays, its EQ, and which apps go in it.")
-                                .color(theme::TEXT_MUTED),
+                                .color(theme::text_muted()),
                         );
                     }
                 });
@@ -869,6 +919,7 @@ impl eframe::App for MixerApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.persistence.save_now(&self.mixer);
+        self.colors_window.save_now();
     }
 }
 
@@ -893,7 +944,7 @@ fn main() -> eframe::Result<()> {
         single_instance::WINDOW_TITLE,
         options,
         Box::new(|cc| {
-            theme::apply(&cc.egui_ctx);
+            theme::load(&cc.egui_ctx);
             let mut app = MixerApp::new(&cc.egui_ctx, background).expect("failed to start audio mixer");
             app.config_notices.extend(rename_notes);
             Ok(Box::new(app))

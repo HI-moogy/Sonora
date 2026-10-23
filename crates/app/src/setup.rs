@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use audio_engine::{process_executable_name, BusInfo, Mixer, SourceInfo, EQ_BAND_COUNT};
 use common::{EqPreset, MicConfig, MixerSetup, SavedBus, SavedSource};
-use eframe::egui;
 
 use crate::AvailableSession;
 
@@ -30,8 +29,6 @@ pub struct MixerPersistence {
     /// microphone couldn't be opened). Restored when possible, and kept in
     /// saves meanwhile so they aren't forgotten.
     pending: Vec<SavedSource>,
-    /// Bus colors from the settings file, kept as written.
-    colors: HashMap<String, String>,
     /// Lowercase executable name per app source id.
     exe_names: HashMap<u64, String>,
     saved: Option<Snapshot>,
@@ -68,10 +65,8 @@ impl MixerPersistence {
         }
         mixer.mic_cleanup().set_mode(presets.mic.noise_suppression);
         mixer.mic_cleanup().set_quiet_far_voices(presets.mic.quiet_far_voices);
-        let colors = setup.buses.iter().filter_map(|(name, bus)| Some((name.clone(), bus.color.clone()?))).collect();
         let mut persistence = Self {
             pending: setup.sources,
-            colors,
             exe_names: HashMap::new(),
             saved: None,
             last_check: Instant::now() - CHECK_INTERVAL,
@@ -79,11 +74,6 @@ impl MixerPersistence {
         };
         persistence.restore_mic(mixer);
         persistence
-    }
-
-    /// The bus's saved custom color, if it has a valid one.
-    pub fn bus_color(&self, bus: &str) -> Option<egui::Color32> {
-        parse_hex_color(self.colors.get(bus)?)
     }
 
     /// Saved app routes for `bus` whose app isn't running.
@@ -206,7 +196,7 @@ impl MixerPersistence {
                     heard: Some(bus.heard),
                     priority: Some(bus.priority),
                     monitor: Some(bus.monitor),
-                    color: self.colors.get(&bus.name).cloned(),
+                    color: None,
                 };
                 (bus.name.clone(), saved)
             })
@@ -217,29 +207,5 @@ impl MixerPersistence {
             eq,
             mic,
         }
-    }
-}
-
-/// `#RRGGBB` (the `#` optional).
-fn parse_hex_color(hex: &str) -> Option<egui::Color32> {
-    let hex = hex.trim().trim_start_matches('#');
-    if hex.len() != 6 || !hex.is_ascii() {
-        return None;
-    }
-    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
-    Some(egui::Color32::from_rgb(channel(0)?, channel(2)?, channel(4)?))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hex_colors_parse_with_or_without_hash() {
-        assert_eq!(parse_hex_color("#FF6000"), Some(egui::Color32::from_rgb(0xFF, 0x60, 0x00)));
-        assert_eq!(parse_hex_color("5865f2"), Some(egui::Color32::from_rgb(0x58, 0x65, 0xF2)));
-        assert_eq!(parse_hex_color("#FF60"), None);
-        assert_eq!(parse_hex_color("#GG6000"), None);
-        assert_eq!(parse_hex_color("#ÿÿÿ"), None);
     }
 }

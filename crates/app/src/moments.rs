@@ -27,7 +27,6 @@ const CARD_THUMBNAIL: egui::Vec2 = egui::vec2(256.0, 144.0);
 fn clip_tracks() -> impl Iterator<Item = &'static str> {
     FIXED_BUSES.iter().copied().chain([DESKTOP_TRACK])
 }
-const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 100, 100);
 
 /// Feeds every mixer bus into the clip recorder's track of the same name.
 struct BusesToRecorder(AudioInput);
@@ -284,6 +283,11 @@ impl Moments {
 
     /// The Clips tab: clips fill the tab; the gear opens clip settings in a
     /// side panel.
+    /// The save-a-clip hotkey, as you'd press it ("Alt+F10").
+    pub fn hotkey_label(&self) -> String {
+        hotkey::label(self.config.hotkey).to_string()
+    }
+
     pub fn tab(&mut self, ui: &mut egui::Ui, mixer: &Mixer) {
         if self.show_settings {
             egui::Panel::right("clip-settings")
@@ -291,9 +295,9 @@ impl Moments {
                 .default_size(430.0)
                 .frame(
                     egui::Frame::new()
-                        .fill(theme::SURFACE)
+                        .fill(theme::surface())
                         .inner_margin(egui::Margin::same(16))
-                        .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+                        .stroke(egui::Stroke::new(1.0, theme::border())),
                 )
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -308,7 +312,7 @@ impl Moments {
                 });
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(20)))
+            .frame(egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin::same(20)))
             .show(ui, |ui| match &mut self.editor {
             Some(editor) => {
                 // The previous and next clips, as the clip list shows them.
@@ -350,7 +354,7 @@ impl Moments {
                 self.restart_recorder(mixer);
             }
             let (text, is_error) = self.status();
-            ui.label(egui::RichText::new(text).color(if is_error { ERROR_COLOR } else { theme::TEXT_MUTED }));
+            ui.label(egui::RichText::new(text).color(if is_error { theme::danger() } else { theme::text_muted() }));
         });
 
         theme::section(ui, "What to record");
@@ -424,7 +428,7 @@ impl Moments {
             ui.label(
                 egui::RichText::new(format!("Uses about {} of memory.", clips::format_size(self.estimated_buffer_bytes())))
                     .small()
-                    .color(theme::TEXT_MUTED),
+                    .color(theme::text_muted()),
             );
         });
 
@@ -463,7 +467,7 @@ impl Moments {
                 });
             }
             if let Some(error) = &self.hotkey_error {
-                ui.colored_label(ERROR_COLOR, error);
+                ui.colored_label(theme::danger(), error);
             }
         });
 
@@ -476,7 +480,7 @@ impl Moments {
                      everything you hear and plays by default; the channel tracks are for editing.",
                 )
                 .small()
-                .color(theme::TEXT_MUTED),
+                .color(theme::text_muted()),
             );
             egui::Grid::new("moments-tracks").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
                 for bus in clip_tracks() {
@@ -545,7 +549,7 @@ impl Moments {
                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                         ui.add(egui::Label::new(&app.title).truncate()).on_hover_text(&app.exe);
                         if !note.is_empty() {
-                            let color = if recording { theme::ACCENT } else { theme::TEXT_MUTED };
+                            let color = if recording { theme::accent() } else { theme::text_muted() };
                             ui.label(egui::RichText::new(note).small().color(color));
                         }
                     });
@@ -628,6 +632,7 @@ impl Moments {
                 if gear.clicked() {
                     self.show_settings = !self.show_settings;
                 }
+                crate::guide::target(ui.ctx(), "clip-settings", gear.rect);
                 if ui.add_enabled(self.recorder.is_some(), egui::Button::new("Save clip")).clicked() {
                     self.shared.save(ui.ctx());
                 }
@@ -638,7 +643,7 @@ impl Moments {
         }
         let (status, is_error) = self.status();
         if is_error {
-            ui.colored_label(ERROR_COLOR, status);
+            ui.colored_label(theme::danger(), status);
         } else if self.config.record == Some(RecordMode::Games) && self.recorder.is_some() {
             ui.weak(match self.recording_app() {
                 Some(app) => format!(
@@ -659,7 +664,7 @@ impl Moments {
             ui.weak("Recording is off. Turn it on in ⚙ settings.");
         }
         if let Some(Err(error)) = &last_result {
-            ui.colored_label(ERROR_COLOR, format!("Couldn't save the last clip: {error}"));
+            ui.colored_label(theme::danger(), format!("Couldn't save the last clip: {error}"));
         }
         ui.horizontal(|ui| {
             ui.label("Saved to");
@@ -695,7 +700,7 @@ impl Moments {
             } else {
                 "Looking for clips…".to_string()
             })
-            .color(theme::TEXT_MUTED));
+            .color(theme::text_muted()));
             return;
         }
 
@@ -777,7 +782,7 @@ impl Moments {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(title).size(16.0).strong());
-                        ui.label(egui::RichText::new(format!("{} clip{}", group.len(), if group.len() == 1 { "" } else { "s" })).color(theme::TEXT_MUTED));
+                        ui.label(egui::RichText::new(format!("{} clip{}", group.len(), if group.len() == 1 { "" } else { "s" })).color(theme::text_muted()));
                     });
                 }
                 // Top-aligned so cards line up even while thumbnails are still loading.
@@ -838,7 +843,7 @@ fn clip_card(ui: &mut egui::Ui, clip: &ClipEntry, thumbnails: &mut Thumbnails, g
         if let Some(game) = game {
             details.insert(0, game.to_string());
         }
-        ui.add(egui::Label::new(egui::RichText::new(details.join(" · ")).small().color(theme::TEXT_MUTED)).truncate());
+        ui.add(egui::Label::new(egui::RichText::new(details.join(" · ")).small().color(theme::text_muted())).truncate());
     });
     if card.small_button("Show in folder").clicked() {
         clips::show_in_folder(&clip.path);

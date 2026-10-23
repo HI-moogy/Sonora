@@ -38,8 +38,6 @@ const PLAYBACK_LEAD_FRAMES: u32 = SAMPLE_RATE as u32 * 60 / 1000;
 const UNSEEN_PAUSE: Duration = Duration::from_millis(400);
 const SKIP: Duration = Duration::from_secs(5);
 const MAX_VOLUME: f32 = 2.0;
-const DESKTOP_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 150, 160);
-const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 100, 100);
 
 const LABEL_WIDTH: f32 = 210.0;
 /// Narrower than this, the save buttons go on a row below the transport so
@@ -115,7 +113,7 @@ impl Row {
     fn color(&self) -> egui::Color32 {
         match self.role {
             Role::Bus(_) => theme::channel_color(self.track),
-            _ => DESKTOP_COLOR,
+            _ => theme::desktop_track(),
         }
     }
 }
@@ -410,7 +408,7 @@ impl ClipEditor {
             });
         });
         if let Some(error) = &self.error {
-            ui.colored_label(ERROR_COLOR, error);
+            ui.colored_label(theme::danger(), error);
         }
         ui.separator();
 
@@ -483,7 +481,7 @@ impl ClipEditor {
         left.label(
             egui::RichText::new(format!("{} / {}", format_duration_precise(position), format_duration_precise(self.duration())))
                 .monospace()
-                .color(theme::TEXT_MUTED),
+                .color(theme::text_muted()),
         );
         let transport = egui::Rect::from_center_size(row.center(), egui::vec2(TRANSPORT_WIDTH, row.height()));
         let mut middle = ui.new_child(egui::UiBuilder::new().max_rect(transport).layout(egui::Layout::left_to_right(egui::Align::Center)));
@@ -571,7 +569,7 @@ impl ClipEditor {
                 }
             }
             Saving::Done(Err(error)) => {
-                ui.colored_label(ERROR_COLOR, format!("Couldn't save: {error}"));
+                ui.colored_label(theme::danger(), format!("Couldn't save: {error}"));
             }
         }
     }
@@ -622,7 +620,7 @@ impl ClipEditor {
             let lane = egui::Rect::from_min_max(egui::pos2(lanes.left(), top), egui::pos2(lanes.right(), top + ROW_HEIGHT));
             let color = row.color();
 
-            painter.rect_filled(label_rect, 6.0, theme::CARD);
+            painter.rect_filled(label_rect, 6.0, theme::card_bg());
             painter.rect_filled(
                 egui::Rect::from_min_size(label_rect.min, egui::vec2(3.0, label_rect.height())),
                 egui::CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 },
@@ -634,7 +632,7 @@ impl ClipEditor {
             label_ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(row.label()).color(color).strong());
                 if row.peaks.is_empty() {
-                    ui.label(egui::RichText::new("silent").small().color(theme::TEXT_MUTED));
+                    ui.label(egui::RichText::new("silent").small().color(theme::text_muted()));
                 }
             });
             // The slider plus its value box fill the header's width.
