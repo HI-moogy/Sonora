@@ -562,7 +562,19 @@ impl Mixer {
         self.master_level.take()
     }
 
+    /// Every source, with its peak since the previous call (for meters:
+    /// read once per frame).
     pub fn sources(&self) -> Vec<SourceInfo> {
+        self.source_infos(true)
+    }
+
+    /// Every source's settings, leaving its peak for [`Self::sources`] (for
+    /// saving, and anything else that isn't a meter).
+    pub fn source_settings(&self) -> Vec<SourceInfo> {
+        self.source_infos(false)
+    }
+
+    fn source_infos(&self, take_levels: bool) -> Vec<SourceInfo> {
         self.sources
             .lock()
             .unwrap()
@@ -574,13 +586,24 @@ impl Mixer {
                 bus: s.bus.lock().unwrap().clone(),
                 gain: s.gain.load(),
                 muted: s.muted.load(Ordering::Relaxed),
-                level: s.level.take(),
+                level: if take_levels { s.level.take() } else { s.level.load() },
                 input_device: s.input_device.clone(),
             })
             .collect()
     }
 
+    /// Every bus, with its peak since the previous call (for meters: read
+    /// once per frame).
     pub fn buses(&self) -> Vec<BusInfo> {
+        self.bus_infos(true)
+    }
+
+    /// Every bus's settings, leaving its peak for [`Self::buses`].
+    pub fn bus_settings(&self) -> Vec<BusInfo> {
+        self.bus_infos(false)
+    }
+
+    fn bus_infos(&self, take_levels: bool) -> Vec<BusInfo> {
         self.buses
             .lock()
             .unwrap()
@@ -589,7 +612,7 @@ impl Mixer {
                 name: name.clone(),
                 gain: b.gain.load(),
                 muted: b.muted.load(Ordering::Relaxed),
-                level: b.level.take(),
+                level: if take_levels { b.level.take() } else { b.level.load() },
                 eq_gains_db: b.eq.lock().unwrap().gains(),
                 device_id: b.device_id.lock().unwrap().clone(),
                 fallback_to_default: b.fallback_to_default.load(Ordering::Relaxed),
@@ -695,6 +718,8 @@ fn run_render_loop(
     // render thread.
     let mut tap_buffers: Vec<Vec<f32>> = Vec::new();
     let mut rendered: Vec<f32> = Vec::new();
+    // Each source's audio for the block being rendered, gain applied.
+    let mut blocks: Vec<Vec<f32>> = Vec::new();
 
     while !stop.load(Ordering::Relaxed) {
         // Snapshot once per render tick (not per sample), grouped by bus so
@@ -821,6 +846,16 @@ fn run_render_loop(
         }
         let mut rendered_any = false;
         let mut broken_devices = Vec::new();
+        // Where each bus's sources start in `blocks`.
+        let block_starts: Vec<usize> = bus_snapshot
+            .iter()
+            .scan(0, |next, snapshot| {
+                let start = *next;
+                *next += snapshot.members.len();
+                Some(start)
+            })
+            .collect();
+        blocks.resize_with(bus_snapshot.iter().map(|s| s.members.len()).sum(), Vec::new);
 
         for (device_id, output) in device_outputs.iter_mut() {
             let Ok(padding) = output.queued_frames() else {
@@ -837,7 +872,36 @@ fn run_render_loop(
             rendered_any = true;
             rendered.clear();
 
-            for _ in 0..available as usize {
+            // Take each source's audio for the whole block at once: one lock
+            // per source per block rather than per sample, so the capture
+            // threads filling the queues are rarely made to wait. A source
+            // that runs short is silent for the rest of the block; a muted
+            // one's audio is dropped.
+            let wanted = available as usize * CHANNELS;
+            for (bus_idx, snapshot) in bus_snapshot.iter().enumerate() {
+                if &snapshot.device_id != device_id {
+                    continue;
+                }
+                for (src_idx, source) in snapshot.members.iter().enumerate() {
+                    let block = &mut blocks[block_starts[bus_idx] + src_idx];
+                    block.clear();
+                    let mut buffer = source.samples.lock().unwrap();
+                    let take = wanted.min(buffer.len() - buffer.len() % CHANNELS);
+                    if source.muted.load(Ordering::Relaxed) {
+                        buffer.drain(..take);
+                    } else {
+                        let gain = source.gain.load();
+                        block.extend(buffer.drain(..take).map(|sample| sample * gain));
+                    }
+                }
+            }
+            // Each bus's EQ, held for the block.
+            let mut eqs: Vec<_> = bus_snapshot
+                .iter()
+                .map(|snapshot| (&snapshot.device_id == device_id).then(|| snapshot.bus.eq.lock().unwrap()))
+                .collect();
+
+            for frame in 0..available as usize {
                 let mut device_mix = [0.0f32; CHANNELS];
                 // Send buses aren't changed by the master volume.
                 let mut send_mix = [0.0f32; CHANNELS];
@@ -861,29 +925,23 @@ fn run_render_loop(
                         continue;
                     }
                     let mut bus_mix = [0.0f32; CHANNELS];
-                    for (src_idx, source) in members.iter().enumerate() {
-                        let mut buffer = source.samples.lock().unwrap();
-                        if source.muted.load(Ordering::Relaxed) {
-                            for _ in 0..CHANNELS {
-                                buffer.pop_front();
-                            }
+                    for src_idx in 0..members.len() {
+                        let block = &blocks[block_starts[bus_idx] + src_idx];
+                        let Some(samples) = block.get(frame * CHANNELS..(frame + 1) * CHANNELS) else {
                             continue;
-                        }
-                        let gain = source.gain.load();
+                        };
                         let mut local_peak = 0.0f32;
-                        for channel_mix in bus_mix.iter_mut() {
-                            if let Some(sample) = buffer.pop_front() {
-                                let gained = sample * gain;
-                                *channel_mix += gained;
-                                local_peak = local_peak.max(gained.abs());
-                            }
+                        for (channel_mix, &sample) in bus_mix.iter_mut().zip(samples) {
+                            *channel_mix += sample;
+                            local_peak = local_peak.max(sample.abs());
                         }
-                        drop(buffer);
                         source_peaks[bus_idx][src_idx] =
                             source_peaks[bus_idx][src_idx].max(local_peak);
                     }
 
-                    bus.eq.lock().unwrap().process(&mut bus_mix);
+                    if let Some(eq) = eqs[bus_idx].as_mut() {
+                        eq.process(&mut bus_mix);
+                    }
                     if tap.is_some() {
                         tap_buffers[bus_idx].extend_from_slice(&bus_mix);
                     }
@@ -911,6 +969,7 @@ fn run_render_loop(
                 }
             }
 
+            drop(eqs);
             if output.write(&rendered).is_err() {
                 broken_devices.push(device_id.clone());
             }

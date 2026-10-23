@@ -708,6 +708,25 @@ fn device_choice(
 }
 
 impl eframe::App for MixerApp {
+    /// What keeps going whether or not the window is shown: eframe calls
+    /// this before every frame, and on its own while the window is hidden
+    /// (when it skips [`Self::ui`]).
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.refresh_sessions();
+        self.refresh_devices();
+        if self.last_route_recovery.elapsed() >= ROUTE_RECOVERY_INTERVAL {
+            self.last_route_recovery = Instant::now();
+            self.mixer.recover_routed_volumes();
+        }
+        self.persistence.tick(&self.mixer, &self.available_sessions);
+        #[cfg(windows)]
+        self.moments.tick();
+        self.colors_window.tick(ctx);
+        if tray::main_window_shown() == Some(false) {
+            ctx.request_repaint_after(HIDDEN_WAKE_INTERVAL);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Closing the window hides it to the tray: routing and clip
         // recording keep running. The tray's Quit exits.
@@ -724,20 +743,10 @@ impl eframe::App for MixerApp {
                 }
             }
         }
-        self.refresh_sessions();
-        self.refresh_devices();
-        if self.last_route_recovery.elapsed() >= ROUTE_RECOVERY_INTERVAL {
-            self.last_route_recovery = Instant::now();
-            self.mixer.recover_routed_volumes();
-        }
-
         // Levels are peaks since the previous read: read each once a frame.
         let buses = self.mixer.buses();
         let sources = self.mixer.sources();
         let master_level = self.mixer.master_level();
-        self.persistence.tick(&self.mixer, &buses, &sources, &self.available_sessions);
-        #[cfg(windows)]
-        self.moments.tick();
 
         if self.start_hidden_frames > 0 && self.tray.is_some() {
             tray::hide_main_window(ui.ctx());
@@ -953,6 +962,31 @@ impl eframe::App for MixerApp {
     }
 }
 
+/// Shown instead of the mixer when its audio engine can't start (no sound
+/// server to talk to, say), rather than closing without a word.
+struct StartupError(String);
+
+impl eframe::App for StartupError {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::bg()).inner_margin(egui::Margin::same(28)))
+            .show(ui, |ui| {
+                ui.heading("Sonora couldn't start its audio");
+                ui.label(egui::RichText::new(&self.0).color(theme::danger()));
+                ui.add_space(8.0);
+                ui.label(if cfg!(windows) {
+                    "Check that Windows Audio is running (and that an output device is enabled), then open Sonora again."
+                } else {
+                    "Sonora needs PipeWire (with pipewire-pulse) or PulseAudio running. Start it, or install your                      distro's pipewire-pulse package, then open Sonora again."
+                });
+                ui.add_space(12.0);
+                if ui.add(theme::primary_button("Quit")).clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+    }
+}
+
 /// Whether there's an X server to use and the keyboard library winit needs
 /// for it (desktops have it; minimal systems may only have Wayland's).
 #[cfg(target_os = "linux")]
@@ -1005,9 +1039,17 @@ fn main() -> eframe::Result<()> {
             theme::load(&cc.egui_ctx);
             #[cfg(target_os = "linux")]
             single_instance::listen(cc.egui_ctx.clone());
-            let mut app = MixerApp::new(&cc.egui_ctx, background).expect("failed to start audio mixer");
-            app.config_notices.extend(rename_notes);
-            Ok(Box::new(app))
+            match MixerApp::new(&cc.egui_ctx, background) {
+                Ok(mut app) => {
+                    app.config_notices.extend(rename_notes);
+                    Ok(Box::new(app) as Box<dyn eframe::App>)
+                }
+                Err(error) => {
+                    // Say so, even when started hidden at sign-in.
+                    cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    Ok(Box::new(StartupError(error.message())))
+                }
+            }
         }),
     )
 }

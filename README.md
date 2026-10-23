@@ -162,7 +162,7 @@ You need [Rust](https://rustup.rs) (stable).
 
 ```sh
 cargo build --release -p app        # target/release/sonora(.exe)
-cargo test -p common -p app -p audio-engine --lib
+cargo test -p common -p app -p audio-engine --lib --bins
 ```
 
 On Linux, Sonora links to `libpulse.so.0` (part of every PipeWire or

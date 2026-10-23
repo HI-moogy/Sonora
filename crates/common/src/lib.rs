@@ -450,22 +450,32 @@ fn load_from(path: &Path) -> (Presets, Vec<String>) {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let kept = path.with_extension(format!("corrupt-{stamp}.json"));
-    let kept_note = match std::fs::rename(path, &kept) {
+    let set_aside = std::fs::rename(path, &kept);
+    let kept_note = match &set_aside {
         Ok(()) => format!("The unreadable file was kept as {}.", kept.display()),
         Err(error) => format!("It couldn't be set aside ({error})."),
     };
 
-    if broken.iter().any(|section| section == WHOLE_FILE) {
-        if let Ok(text) = std::fs::read_to_string(backup_path(path)) {
-            let (backup, backup_broken) = parse_sections(&text);
-            if backup_broken.is_empty() {
-                return (backup, vec![format!("Settings were unreadable; restored the previous version. {kept_note}")]);
+    let (recovered, note) = if broken.iter().any(|section| section == WHOLE_FILE) {
+        let backup = std::fs::read_to_string(backup_path(path)).ok().map(|text| parse_sections(&text));
+        match backup {
+            Some((backup, backup_broken)) if backup_broken.is_empty() => {
+                (backup, format!("Settings were unreadable; restored the previous version. {kept_note}"))
             }
+            _ => (presets, format!("Settings were unreadable and reset to defaults. {kept_note}")),
         }
-        return (presets, vec![format!("Settings were unreadable and reset to defaults. {kept_note}")]);
+    } else {
+        let note = format!("Some settings were unreadable and reset to defaults ({}). {kept_note}", broken.join(", "));
+        (presets, note)
+    };
+    // Each part of the app loads the file on its own: write back what was
+    // recovered, or every later load would find no file and start from
+    // defaults (and the next save would keep them). Only once the
+    // unreadable file is safely set aside, never over it.
+    if set_aside.is_ok() {
+        let _ = save_to(path, &recovered);
     }
-    let note = format!("Some settings were unreadable and reset to defaults ({}). {kept_note}", broken.join(", "));
-    (presets, vec![note])
+    (recovered, vec![note])
 }
 
 const WHOLE_FILE: &str = "the whole file";
@@ -650,9 +660,13 @@ mod tests {
         assert_eq!(notices.len(), 1);
         assert!(notices[0].contains("restored the previous version"), "{notices:?}");
         let files = files_in(&dir);
-        assert!(!files.contains(&"config.json".to_string()), "the broken file is moved away: {files:?}");
         let kept = files.iter().find(|f| f.contains("corrupt")).expect("broken file kept");
         assert_eq!(std::fs::read_to_string(dir.join(kept)).unwrap(), "{ \"mixer\": { truncated");
+        // Loading again (each part of the app does) gets the restored
+        // settings, quietly, not defaults.
+        let (again, notices) = load_from(&path);
+        assert_eq!(again.mixer.master_gain, 0.5);
+        assert!(notices.is_empty(), "{notices:?}");
 
         // The next save must not back up the broken file over the good backup.
         save_to(&path, &loaded).unwrap();
@@ -673,6 +687,11 @@ mod tests {
         assert_eq!(presets.mixer, MixerSetup::default());
         assert!(notices[0].contains("(mixer)"), "{notices:?}");
         assert!(files_in(&dir).iter().any(|f| f.contains("corrupt")));
+        // The good sections survive every later load, not just the first.
+        let (again, notices) = load_from(&path);
+        assert_eq!(again.eq["Game"].gains_db[0], 1.0);
+        assert_eq!(again.moments.buffer_secs, 60);
+        assert!(notices.is_empty(), "{notices:?}");
     }
 
     #[test]

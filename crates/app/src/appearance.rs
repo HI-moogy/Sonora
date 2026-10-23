@@ -73,12 +73,17 @@ impl ColorsWindow {
         self.message = None;
     }
 
-    pub fn show(&mut self, ctx: &egui::Context) {
+    /// Saves colors once they've stopped changing; call often, whether or
+    /// not the window is shown.
+    pub fn tick(&mut self, ctx: &egui::Context) {
         if self.changed_at.is_some_and(|at| at.elapsed() >= SAVE_DELAY) {
             self.save_now();
         } else if self.changed_at.is_some() {
             ctx.request_repaint_after(SAVE_DELAY);
         }
+    }
+
+    pub fn show(&mut self, ctx: &egui::Context) {
         if !self.open {
             return;
         }

@@ -17,12 +17,18 @@ pub struct InstanceLock {
     _file: File,
 }
 
-/// Where the lock and socket live: the user's runtime folder (cleared at
-/// logout), or a per-user folder in /tmp.
+/// Where the lock and socket live: the user's runtime folder (private to
+/// them, cleared at logout), or else Sonora's folder in their own cache.
+/// Never a shared folder like /tmp, where another user could create it
+/// first and hold the lock or replace the socket.
 fn runtime_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|dir| dir.is_dir()).unwrap_or_else(|| {
-        let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
-        std::env::temp_dir().join(format!("sonora-{user}"))
+    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|dir| dir.is_absolute() && dir.is_dir()).unwrap_or_else(|| {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("sonora")
     })
 }
 
@@ -59,6 +65,9 @@ pub fn listen(ctx: egui::Context) {
     let Ok(listener) = UnixListener::bind(&path) else { return };
     let _ = std::thread::Builder::new().name("single-instance".into()).spawn(move || {
         for mut stream in listener.incoming().flatten() {
+            // A client that connects and says nothing mustn't hold up the
+            // next launch's request.
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
             let mut request = [0u8; 4];
             if stream.read_exact(&mut request).is_ok() && &request == b"show" {
                 crate::tray::show_main_window(&ctx);

@@ -257,6 +257,35 @@ impl Connection {
     }
 }
 
+thread_local! {
+    /// This thread's connection for queries and changes (lists, modules,
+    /// moving streams), kept between calls.
+    static CONTROL: std::cell::RefCell<Option<Connection>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `query` on this thread's long-lived connection, connecting on first
+/// use and again if the server went away (it restarted, say), rather than
+/// connecting for every query.
+pub(crate) fn with_control<T>(query: impl Fn(&mut Connection) -> Result<T>) -> Result<T> {
+    CONTROL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(connection) = slot.as_mut() {
+            if connection.iterate().is_ok() && matches!(connection.context.get_state(), ContextState::Ready) {
+                match query(connection) {
+                    Ok(result) => return Ok(result),
+                    Err(_) => *slot = None,
+                }
+            } else {
+                *slot = None;
+            }
+        }
+        let mut connection = Connection::open("Sonora")?;
+        let result = query(&mut connection);
+        *slot = Some(connection);
+        result
+    })
+}
+
 impl Drop for Connection {
     fn drop(&mut self) {
         self.context.disconnect();

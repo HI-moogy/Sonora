@@ -96,11 +96,23 @@ mod tests {
         }
     }
 
+    /// This test program under another name, so the tone player looks like
+    /// a separate app rather than a helper of the test (see
+    /// [`procs::app_root`]).
+    fn tone_program() -> std::path::PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        let other = exe.with_file_name(format!("sonora-test-tone-{}", std::process::id()));
+        let _ = std::fs::remove_file(&other);
+        std::fs::hard_link(&exe, &other).or_else(|_| std::fs::copy(&exe, &other).map(|_| ())).unwrap();
+        other
+    }
+
     #[test]
     #[ignore]
     fn route_an_app_through_the_mixer() {
+        let program = tone_program();
         let player = Player(
-            Command::new(std::env::current_exe().unwrap())
+            Command::new(&program)
                 .args(["--exact", "pulse::tests::tone_player", "--ignored", "--nocapture"])
                 .env(TONE_ENV, "1")
                 .spawn()
@@ -142,5 +154,27 @@ mod tests {
         // Stopping the mixer takes the virtual microphone down.
         drop(mixer);
         wait_for("the virtual mic to go", || !connection.sources().unwrap().iter().any(|source| source.name == VIRTUAL_MIC));
+        drop(player);
+        let _ = std::fs::remove_file(program);
+    }
+
+    #[test]
+    #[ignore]
+    fn a_helper_playing_for_an_app_is_listed_as_the_app() {
+        // The tone player is a child running the test's own program: a
+        // helper of the test process, which is Sonora's own here, so it
+        // isn't offered as an app at all.
+        let player = Player(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "pulse::tests::tone_player", "--ignored", "--nocapture"])
+                .env(TONE_ENV, "1")
+                .spawn()
+                .unwrap(),
+        );
+        let pid = player.0.id();
+        let mut connection = Connection::open("Sonora test").unwrap();
+        wait_for("the tone to play", || sink_of(&mut connection, pid).is_some());
+        assert_eq!(procs::app_root(pid), std::process::id());
+        assert!(!sessions::enumerate_sessions().unwrap().iter().any(|s| s.process_id == pid || s.process_id == std::process::id()));
     }
 }

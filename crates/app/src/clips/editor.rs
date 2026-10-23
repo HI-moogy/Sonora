@@ -287,7 +287,13 @@ impl ClipEditor {
     /// Picks up background results: decoded audio, decoded frames, saves.
     fn poll(&mut self, ctx: &egui::Context) -> EditorAction {
         if let Some(loading) = &self.loading {
-            if let Ok(loaded) = loading.try_recv() {
+            // A loader that stopped without answering hit a damaged file.
+            let loaded = match loading.try_recv() {
+                Ok(loaded) => Some(loaded),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err("the file looks damaged".to_string())),
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(loaded) = loaded {
                 self.loading = None;
                 match loaded {
                     Ok(loaded) => self.loaded(ctx, loaded),
@@ -298,7 +304,12 @@ impl ClipEditor {
 
         let mut action = EditorAction::None;
         if let Saving::Running { overwrite, result } = &self.saving {
-            if let Ok(saved) = result.try_recv() {
+            let saved = match result.try_recv() {
+                Ok(saved) => Some(saved),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err("the clip couldn't be read".to_string())),
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(saved) = saved {
                 let overwrite = *overwrite;
                 if saved.is_ok() {
                     action = EditorAction::Saved;

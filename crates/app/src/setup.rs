@@ -86,22 +86,23 @@ impl MixerPersistence {
         self.pending.retain(|s| !(s.bus == bus && s.app.as_deref() == Some(app)));
     }
 
-    /// Call every frame with the frame's mixer snapshots and the apps
-    /// currently playing audio: routes saved apps that have
-    /// started, and saves the setup once a second if it changed.
-    pub fn tick(&mut self, mixer: &Mixer, buses: &[BusInfo], sources: &[SourceInfo], sessions: &[AvailableSession]) {
+    /// Call often (every frame is fine) with the apps currently playing
+    /// audio: once a second, routes saved apps that have started, and saves
+    /// the setup if it changed.
+    pub fn tick(&mut self, mixer: &Mixer, sessions: &[AvailableSession]) {
         if self.last_check.elapsed() < CHECK_INTERVAL {
             return;
         }
         self.last_check = Instant::now();
+        let sources = mixer.source_settings();
         self.restore_mic(mixer);
-        self.restore_apps(mixer, sources, sessions);
-        self.save_if_changed(mixer, buses, sources);
+        self.restore_apps(mixer, &sources, sessions);
+        self.save_now(mixer);
     }
 
     /// Saves now if anything changed (e.g. on exit).
     pub fn save_now(&mut self, mixer: &Mixer) {
-        self.save_if_changed(mixer, &mixer.buses(), &mixer.sources());
+        self.save_if_changed(mixer, &mixer.bus_settings(), &mixer.source_settings());
     }
 
     fn restore_mic(&mut self, mixer: &Mixer) {

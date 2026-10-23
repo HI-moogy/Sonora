@@ -26,6 +26,30 @@ pub(crate) fn with_descendants(pid: u32) -> HashSet<u32> {
     found
 }
 
+/// The app `pid` is part of: its furthest ancestor running the same
+/// program. Browsers and Electron apps (Discord, Spotify) play audio from a
+/// helper process started from their own program; this finds the app.
+pub(crate) fn app_root(pid: u32) -> u32 {
+    root_with(pid, parent_pid, executable_name)
+}
+
+fn root_with(pid: u32, parent: impl Fn(u32) -> Option<u32>, program: impl Fn(u32) -> Option<String>) -> u32 {
+    let Some(name) = program(pid) else { return pid };
+    let mut root = pid;
+    // Bounded, in case of a pid cycle while processes come and go.
+    for _ in 0..64 {
+        match parent(root).filter(|&up| up > 1 && up != root) {
+            Some(up) if program(up).as_ref() == Some(&name) => root = up,
+            _ => break,
+        }
+    }
+    root
+}
+
+fn parent_pid(pid: u32) -> Option<u32> {
+    parent_of(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
 /// The parent pid in a `/proc/<pid>/stat` line. The name before it is in
 /// parentheses and may itself contain spaces and parentheses.
 fn parent_of(stat: &str) -> Option<u32> {
@@ -59,6 +83,18 @@ mod tests {
         assert_eq!(parent_of("1234 (firefox) S 1000 1234 1234 0"), Some(1000));
         assert_eq!(parent_of("1234 (Web Content (1)) S 999 1234"), Some(999));
         assert_eq!(parent_of("garbage"), None);
+    }
+
+    #[test]
+    fn a_helper_belongs_to_the_furthest_ancestor_running_its_program() {
+        // 1 init > 10 shell > 20 discord > 30 discord helper > 40 discord helper
+        let parent = |pid| [(40, 30), (30, 20), (20, 10), (10, 1)].into_iter().find(|&(c, _)| c == pid).map(|(_, p)| p);
+        let program = |pid| Some(if pid >= 20 { "Discord" } else { "bash" }.to_string());
+        assert_eq!(root_with(40, parent, program), 20);
+        assert_eq!(root_with(20, parent, program), 20);
+        assert_eq!(root_with(10, parent, program), 10);
+        // A process whose program can't be read is its own app.
+        assert_eq!(root_with(40, parent, |_| None), 40);
     }
 
     #[test]

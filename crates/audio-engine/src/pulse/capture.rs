@@ -72,6 +72,10 @@ struct AppRoute {
     sink_name: String,
     sink_index: u32,
     module: u32,
+    /// The app's processes, as of the last look through /proc.
+    family: HashSet<u32>,
+    /// Other processes with streams, as of that look: not the app's.
+    strangers: HashSet<u32>,
 }
 
 impl AppRoute {
@@ -91,6 +95,8 @@ impl AppRoute {
             sink_name,
             sink_index,
             module,
+            family: HashSet::new(),
+            strangers: HashSet::new(),
         };
         let monitor = format!("{}.monitor", route.sink_name);
         route.stream = Some(route.connection.record(Some(&monitor), 2, &format!("Sonora: {name}"))?);
@@ -99,25 +105,45 @@ impl AppRoute {
     }
 
     /// Moves every stream of the app that isn't on its sink yet there.
+    /// Cheap when nothing changed: /proc is only read again when a stream
+    /// comes from a process it hasn't placed yet (a new helper, say).
     fn move_app_streams(&mut self) {
         let Ok(inputs) = self.connection.sink_inputs() else { return };
-        let sinks = self.connection.sinks().unwrap_or_default();
+        let own_pid = std::process::id();
+        let elsewhere: Vec<&SinkInput> =
+            inputs.iter().filter(|input| input.sink != self.sink_index && input.pid != Some(own_pid)).collect();
+        if elsewhere.is_empty() {
+            return;
+        }
+        let unplaced = |pid: &u32| !self.family.contains(pid) && !self.strangers.contains(pid);
+        if elsewhere.iter().filter_map(|input| input.pid).any(|pid| unplaced(&pid)) {
+            self.family = procs::with_descendants(self.pid);
+            self.strangers = elsewhere.iter().filter_map(|input| input.pid).filter(|pid| !self.family.contains(pid)).collect();
+        }
+        if !elsewhere.iter().any(|input| self.owns(input)) {
+            return;
+        }
         // Streams on another Sonora sink are another app's (or this one's,
         // routed to another channel): leave them be.
-        let sonora_sinks: HashSet<u32> =
-            sinks.iter().filter(|sink| sink.name.starts_with(PREFIX)).map(|sink| sink.index).collect();
-        let family = procs::with_descendants(self.pid);
-        for input in inputs {
-            if input.sink != self.sink_index && !sonora_sinks.contains(&input.sink) && self.owns(&input, &family) {
+        let sonora_sinks: HashSet<u32> = self
+            .connection
+            .sinks()
+            .unwrap_or_default()
+            .iter()
+            .filter(|sink| sink.name.starts_with(PREFIX))
+            .map(|sink| sink.index)
+            .collect();
+        for input in elsewhere {
+            if !sonora_sinks.contains(&input.sink) && self.owns(input) {
                 let _ = self.connection.move_sink_input(input.index, &self.sink_name);
             }
         }
     }
 
-    fn owns(&self, input: &SinkInput, family: &HashSet<u32>) -> bool {
+    fn owns(&self, input: &SinkInput) -> bool {
         match input.pid {
             Some(pid) if pid == std::process::id() => false,
-            Some(pid) if family.contains(&pid) => true,
+            Some(pid) if self.family.contains(&pid) => true,
             // A pid we can't see is a sandboxed app's own numbering.
             Some(pid) if !procs::exists(pid) => self.binary.is_some() && input.binary == self.binary,
             _ => false,

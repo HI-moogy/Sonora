@@ -44,7 +44,7 @@ selected by `#[cfg_attr(target_os = "linux", path = ...)]`: `tray.rs` /
 
 ```sh
 cargo build --release -p app
-cargo test -p common -p app -p audio-engine --lib
+cargo test -p common -p app -p audio-engine --lib --bins
 cargo clippy -p app -p audio-engine
 ```
 

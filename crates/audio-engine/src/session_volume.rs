@@ -128,33 +128,37 @@ pub fn enforce(sessions: &[OwnedSession]) -> bool {
 }
 
 /// Puts the sessions of the processes in `pids` back to the volume each
-/// had before [`route`].
+/// had before [`route`]. An app's record is only dropped once one of its
+/// sessions is back up: one that couldn't be reached (the session list
+/// failed, or the app had closed) keeps it, so [`recover`] and the quit
+/// warning can still put it back later.
 pub fn unroute(pids: &HashSet<u32>) {
     let keys: HashMap<u32, String> = pids
         .iter()
         .filter_map(|&pid| Some((pid, app_key(pid)?)))
         .collect();
-    // Several processes can share an executable, and so a record.
     let originals: HashMap<String, f32> = with_routed_apps(|apps| {
+        // Several processes can share an executable, and so a record.
         let originals = keys
             .values()
             .filter_map(|key| Some((key.clone(), *apps.original_volumes.get(key)?)))
             .collect();
-        apps.original_volumes
-            .retain(|key, _| !keys.values().any(|k| k == key));
-        (originals, true)
+        (originals, false)
     });
-    if let Ok(sessions) = sessions(Some(pids)) {
-        for (pid, volume) in sessions {
-            unsafe {
-                let original = keys
-                    .get(&pid)
-                    .and_then(|key| originals.get(key))
-                    .copied()
-                    .unwrap_or(1.0);
-                let _ = volume.SetMasterVolume(original, std::ptr::null());
-            }
+    let Ok(sessions) = sessions(Some(pids)) else { return };
+    let mut restored = HashSet::new();
+    for (pid, volume) in sessions {
+        let key = keys.get(&pid);
+        let original = key.and_then(|key| originals.get(key)).copied().unwrap_or(1.0);
+        if unsafe { volume.SetMasterVolume(original, std::ptr::null()) }.is_ok() {
+            restored.extend(key.cloned());
         }
+    }
+    if !restored.is_empty() {
+        with_routed_apps(|apps| {
+            apps.original_volumes.retain(|key, _| !restored.contains(key));
+            ((), true)
+        });
     }
 }
 

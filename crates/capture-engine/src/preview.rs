@@ -72,8 +72,14 @@ impl VideoPreview {
         let worker = std::thread::Builder::new()
             .name("clip-preview".into())
             .spawn(move || {
-                if let Err(error) = decode(&path, max_width, &command_rx, &frame_tx, &on_frame) {
-                    let _ = frame_tx.send(Err(error.to_string()));
+                // A damaged file can make the MP4 reader panic: report it
+                // like any other failure rather than going quiet.
+                let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    decode(&path, max_width, &command_rx, &frame_tx, &on_frame).map_err(|error| error.to_string())
+                }))
+                .unwrap_or_else(|_| Err("the video looks damaged".to_string()));
+                if let Err(error) = decoded {
+                    let _ = frame_tx.send(Err(error));
                     on_frame();
                 }
             })

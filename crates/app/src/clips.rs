@@ -301,8 +301,13 @@ impl Thumbnails {
                 // Shell thumbnail providers expect a single-threaded apartment.
                 let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
                 for (path, modified) in request_rx {
-                    let image = thumbnail(&path);
-                    let duration = capture_engine::clip_duration(&path);
+                    // A damaged file (a recorder's interrupted save) can make
+                    // the MP4 reader panic: it gets no thumbnail, and the
+                    // clips after it still do.
+                    let (image, duration) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (thumbnail(&path), capture_engine::clip_duration(&path))
+                    }))
+                    .unwrap_or((None, None));
                     if result_tx.send((path, modified, image, duration)).is_err() {
                         break;
                     }
@@ -349,6 +354,9 @@ impl Thumbnails {
     }
 }
 
+/// The largest thumbnail side accepted from a shell thumbnail provider.
+const MAX_THUMBNAIL_SIDE: i32 = 2048;
+
 fn thumbnail(path: &Path) -> Option<egui::ColorImage> {
     unsafe {
         let factory: IShellItemImageFactory =
@@ -358,8 +366,11 @@ fn thumbnail(path: &Path) -> Option<egui::ColorImage> {
 
         let mut info = BITMAP::default();
         let read = GetObjectW(bitmap.into(), std::mem::size_of::<BITMAP>() as i32, Some(&mut info as *mut _ as *mut _));
-        let image = (read != 0).then(|| {
-            let (width, height) = (info.bmWidth, info.bmHeight);
+        // The provider says how big its bitmap is (rows may run either
+        // way); anything far past what was asked for isn't allocated.
+        let (width, height) = (info.bmWidth, info.bmHeight.abs());
+        let sane = (1..=MAX_THUMBNAIL_SIDE).contains(&width) && (1..=MAX_THUMBNAIL_SIDE).contains(&height);
+        let image = (read != 0 && sane).then(|| {
             let mut header = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
