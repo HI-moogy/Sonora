@@ -12,8 +12,10 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
+use common::Priority;
+
 use crate::atomic_f32::AtomicF32;
-use crate::com::ComGuard;
+use crate::com::{ComGuard, ProAudioThread};
 use crate::eq::{EqBands, EQ_BAND_COUNT};
 use crate::loopback::{activate_process_loopback_client, standard_format};
 use crate::denoise::MicCleanup;
@@ -25,6 +27,31 @@ use crate::session_volume::{self, OwnedSession, ROUTED_BOOST, ROUTED_VOLUME};
 const CAPTURE_BUFFER_DURATION_100NS: i64 = 2_000_000;
 const CHANNELS: usize = 2;
 const SAMPLE_RATE: f32 = 48_000.0;
+/// How full each output device is kept, by the most urgent bus playing on
+/// it: everything queued there is delay. The audio engine itself needs a
+/// little over 10 ms.
+fn device_target_ms(priority: Priority) -> f32 {
+    match priority {
+        Priority::High => 15.0,
+        Priority::Normal => 50.0,
+        Priority::Low => 120.0,
+    }
+}
+
+/// How much audio an app's queue may build up (say after a hiccup) before
+/// the oldest is dropped to catch up, rather than staying that late.
+fn queue_limit_ms(priority: Priority) -> f32 {
+    match priority {
+        Priority::High => 30.0,
+        Priority::Normal => 100.0,
+        Priority::Low => 250.0,
+    }
+}
+
+fn ms_to_frames(ms: f32) -> u32 {
+    (ms / 1000.0 * SAMPLE_RATE) as u32
+}
+
 /// Bounds how far a source's buffer can grow if the render thread falls
 /// behind, so a stalled render loop can't leak memory indefinitely.
 pub(crate) const MAX_BUFFERED_SAMPLES: usize = 48_000 * CHANNELS * 2;
@@ -95,6 +122,10 @@ struct BusInner {
     /// Whether you hear the bus. One you don't hear is still mixed, metered
     /// and passed to the bus tap (clips); it just isn't played.
     heard: AtomicBool,
+    priority: Mutex<Priority>,
+    /// Roughly how late the bus plays, in ms: what's queued on its device
+    /// plus its apps' queues.
+    delay_ms: AtomicF32,
 }
 
 /// Receives every bus's audio as the mixer renders it: after the bus's EQ,
@@ -136,6 +167,11 @@ pub struct BusInfo {
     pub fallback_to_default: bool,
     /// See [`Mixer::set_bus_heard`].
     pub heard: bool,
+    /// See [`Mixer::set_bus_priority`].
+    pub priority: Priority,
+    /// Roughly how late this bus plays, in ms (the mixer's own delay, not
+    /// the device's or the app's).
+    pub delay_ms: f32,
 }
 
 /// Captures audio from any number of processes (plus optionally the
@@ -393,6 +429,13 @@ impl Mixer {
         }
     }
 
+    /// How much delay `bus` may have (`Normal` by default).
+    pub fn set_bus_priority(&self, bus: &str, priority: Priority) {
+        if let Some(bus) = self.buses.lock().unwrap().get(bus) {
+            *bus.priority.lock().unwrap() = priority;
+        }
+    }
+
     /// Whether `bus` is played to you (on by default). Turning it off keeps
     /// the bus in clips and on its meter; it's for a microphone you don't
     /// want to hear yourself through.
@@ -476,6 +519,8 @@ impl Mixer {
                 device_id: b.device_id.lock().unwrap().clone(),
                 fallback_to_default: b.fallback_to_default.load(Ordering::Relaxed),
                 heard: b.heard.load(Ordering::Relaxed),
+                priority: *b.priority.lock().unwrap(),
+                delay_ms: b.delay_ms.load(),
             })
             .collect()
     }
@@ -500,6 +545,8 @@ impl Mixer {
                 device_id: Mutex::new(None),
                 fallback_to_default: AtomicBool::new(true),
                 heard: AtomicBool::new(true),
+                priority: Mutex::new(Priority::Normal),
+                delay_ms: AtomicF32::new(0.0),
             }),
         );
     }
@@ -617,6 +664,7 @@ fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: mpsc::Sender
             return;
         }
     };
+    let _pro_audio = ProAudioThread::join();
 
     let app = app_audio(pid);
     let mut capture = match LoopbackCapture::start(app.target) {
@@ -749,6 +797,7 @@ struct BusSnapshot {
     bus: Arc<BusInner>,
     members: Vec<Arc<SourceInner>>,
     device_id: Option<String>,
+    priority: Priority,
 }
 
 /// One opened output device's WASAPI client, kept alive only while at
@@ -813,6 +862,7 @@ fn run_render_loop(
     bus_tap: SharedTap,
 ) -> Result<()> {
     let _com = ComGuard::init()?;
+    let _pro_audio = ProAudioThread::join();
     let format = standard_format();
     let mut device_outputs: HashMap<Option<String>, DeviceOutput> = HashMap::new();
     // Devices that failed, with when to try each again.
@@ -830,6 +880,7 @@ fn run_render_loop(
                 .iter()
                 .map(|(name, bus)| {
                     let device_id = bus.device_id.lock().unwrap().clone();
+                    let priority = *bus.priority.lock().unwrap();
                     let members = sources
                         .values()
                         .filter(|s| *s.bus.lock().unwrap() == *name)
@@ -840,6 +891,7 @@ fn run_render_loop(
                         bus: bus.clone(),
                         members,
                         device_id,
+                        priority,
                     }
                 })
                 .collect()
@@ -883,14 +935,38 @@ fn run_render_loop(
         device_outputs
             .retain(|device_id, _| bus_snapshot.iter().any(|s| s.device_id == *device_id));
         // Buses with nowhere to play drop their audio rather than queue it
-        // up to play late once a device is back.
-        for snapshot in &bus_snapshot {
-            if !device_outputs.contains_key(&snapshot.device_id) {
-                for source in &snapshot.members {
-                    source.samples.lock().unwrap().clear();
+        // up to play late once a device is back; the rest drop any backlog
+        // beyond what their priority allows.
+        let mut queued_ms = vec![0.0f32; bus_snapshot.len()];
+        for (bus_idx, snapshot) in bus_snapshot.iter().enumerate() {
+            let playing = device_outputs.contains_key(&snapshot.device_id);
+            let limit = ms_to_frames(queue_limit_ms(snapshot.priority)) as usize * CHANNELS;
+            let keep = ms_to_frames(device_target_ms(snapshot.priority)) as usize * CHANNELS;
+            for source in &snapshot.members {
+                let mut samples = source.samples.lock().unwrap();
+                if !playing {
+                    samples.clear();
+                } else if samples.len() > limit {
+                    let excess = samples.len() - keep;
+                    samples.drain(..excess - excess % CHANNELS);
                 }
+                let ms = samples.len() as f32 / CHANNELS as f32 / SAMPLE_RATE * 1000.0;
+                queued_ms[bus_idx] = queued_ms[bus_idx].max(ms);
             }
         }
+        // Each device is kept only as full as its most urgent bus allows.
+        let device_targets: HashMap<&Option<String>, u32> = device_outputs
+            .keys()
+            .map(|device_id| {
+                let target = bus_snapshot
+                    .iter()
+                    .filter(|s| &s.device_id == device_id)
+                    .map(|s| device_target_ms(s.priority))
+                    .fold(f32::MAX, f32::min);
+                (device_id, ms_to_frames(target))
+            })
+            .collect();
+        let mut device_queued_ms: HashMap<Option<String>, f32> = HashMap::new();
 
         let master_gain_value = master_gain.load();
         let mut master_peak = 0.0f32;
@@ -912,7 +988,12 @@ fn run_render_loop(
                 broken_devices.push(device_id.clone());
                 continue;
             };
-            let available = output.buffer_frames.saturating_sub(padding);
+            let target = device_targets.get(device_id).copied().unwrap_or(output.buffer_frames);
+            device_queued_ms.insert(device_id.clone(), padding as f32 / SAMPLE_RATE * 1000.0);
+            let available = output
+                .buffer_frames
+                .saturating_sub(padding)
+                .min(target.saturating_sub(padding));
             if available == 0 {
                 continue;
             }
@@ -1008,8 +1089,14 @@ fn run_render_loop(
             }
         }
 
+        for (bus_idx, snapshot) in bus_snapshot.iter().enumerate() {
+            let device_ms = device_queued_ms.get(&snapshot.device_id).copied().unwrap_or(0.0);
+            snapshot.bus.delay_ms.store(device_ms + queued_ms[bus_idx]);
+        }
+
         if !rendered_any {
-            std::thread::sleep(Duration::from_millis(5));
+            // Short, since a High-priority device holds only ~20 ms.
+            std::thread::sleep(Duration::from_millis(2));
             continue;
         }
         // Levels accumulate until the UI takes them, so it sees every

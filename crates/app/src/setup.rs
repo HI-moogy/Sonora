@@ -55,6 +55,9 @@ impl MixerPersistence {
             if let Some(heard) = bus.heard {
                 mixer.set_bus_heard(name, heard);
             }
+            if let Some(priority) = bus.priority {
+                mixer.set_bus_priority(name, priority);
+            }
         }
         for (name, preset) in &presets.eq {
             mixer.ensure_bus(name);
@@ -200,6 +203,7 @@ impl MixerPersistence {
                     device: bus.device_id.clone(),
                     fallback_to_default: bus.fallback_to_default,
                     heard: Some(bus.heard),
+                    priority: Some(bus.priority),
                     color: self.colors.get(&bus.name).cloned(),
                 };
                 (bus.name.clone(), saved)

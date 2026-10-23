@@ -104,14 +104,27 @@ pub struct SavedBus {
     /// Whether you hear the bus; `None` (settings from before this) uses
     /// the app's default for that bus.
     pub heard: Option<bool>,
+    /// `None` (settings from before this) uses the app's default.
+    pub priority: Option<Priority>,
     /// `#RRGGBB` shown for the bus instead of its built-in color.
     pub color: Option<String>,
 }
 
 impl Default for SavedBus {
     fn default() -> Self {
-        Self { gain: 1.0, muted: false, device: None, fallback_to_default: true, heard: None, color: None }
+        Self { gain: 1.0, muted: false, device: None, fallback_to_default: true, heard: None, priority: None, color: None }
     }
+}
+
+/// How a channel trades delay against safety from dropouts (crackles) when
+/// your PC is busy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Priority {
+    /// Least delay: for games and voice, where late sound is noticeable.
+    High,
+    Normal,
+    /// Most headroom against dropouts: for music and video.
+    Low,
 }
 
 /// One app (or the microphone) routed into a bus.
@@ -405,7 +418,7 @@ mod tests {
         });
         presets.mixer.buses.insert(
             "Aux".into(),
-            SavedBus { gain: 0.5, muted: false, device: Some("{0.0.0.00000000}.{tv}".into()), fallback_to_default: false, heard: Some(false), color: Some("#A855F7".into()) },
+            SavedBus { gain: 0.5, muted: false, device: Some("{0.0.0.00000000}.{tv}".into()), fallback_to_default: false, heard: Some(false), priority: Some(Priority::Low), color: Some("#A855F7".into()) },
         );
         let json = serde_json::to_string(&presets).unwrap();
         let loaded: Presets = serde_json::from_str(&json).unwrap();

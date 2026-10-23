@@ -10,6 +10,7 @@ use audio_engine::{
     enumerate_sessions, list_input_devices, list_output_devices, AudioDevice, Mixer, EQ_BAND_COUNT,
     EQ_BAND_FREQUENCIES, EQ_GAIN_RANGE_DB,
 };
+use common::Priority;
 use eframe::egui;
 
 mod autostart;
@@ -117,6 +118,11 @@ impl MixerApp {
         // Hearing your own mic throws you off while talking; it's only for
         // checking how you sound (the saved setting, if any, wins).
         mixer.set_bus_heard("Mic", false);
+        // Late sound is noticeable in games and voice; music and video can
+        // take more delay for fewer dropouts.
+        for bus in ["Game", "Chat", "Mic"] {
+            mixer.set_bus_priority(bus, Priority::High);
+        }
         let persistence = MixerPersistence::restore(&mixer);
         let moments = Moments::new(ctx, &mixer);
         let quitting = Arc::new(AtomicBool::new(false));
@@ -502,6 +508,35 @@ impl eframe::App for MixerApp {
                         });
                     }
                 }
+                ui.horizontal(|ui| {
+                    ui.label("Priority");
+                    let mut priority = bus.priority;
+                    let label = |p: Priority| match p {
+                        Priority::High => "High (least delay)",
+                        Priority::Normal => "Normal",
+                        Priority::Low => "Low (smoothest)",
+                    };
+                    egui::ComboBox::from_id_salt("priority-choice")
+                        .selected_text(label(priority))
+                        .show_ui(ui, |ui| {
+                            for p in [Priority::High, Priority::Normal, Priority::Low] {
+                                ui.selectable_value(&mut priority, p, label(p));
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "How much delay this channel may have. High keeps it as small as it can (for games \
+                             and voice); Low leaves room so it never crackles when your PC is busy (for music \
+                             and video). If a High channel crackles, try Normal.",
+                        );
+                    if priority != bus.priority {
+                        self.mixer.set_bus_priority(&selected, priority);
+                    }
+                    ui.weak(format!("~{:.0} ms", bus.delay_ms)).on_hover_text(
+                        "sonar-rs's own delay for this channel. For apps, Windows adds about 45 ms more \
+                         before sonar-rs gets their sound (measured on this PC).",
+                    );
+                });
                 ui.separator();
 
                 egui::CollapsingHeader::new("EQ").default_open(true).show(ui, |ui| {
