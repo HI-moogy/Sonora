@@ -120,8 +120,10 @@ impl MixerApp {
                 match command {
                     TrayCommand::Open => tray::show_main_window(),
                     TrayCommand::Quit => {
-                        quitting.store(true, Ordering::Relaxed);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        if tray::confirm_quit() {
+                            quitting.store(true, Ordering::Relaxed);
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
                     }
                 }
                 ctx.request_repaint();

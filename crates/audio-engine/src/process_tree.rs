@@ -25,22 +25,45 @@ pub struct ProcessTree {
     started: RefCell<HashMap<u32, Option<u64>>>,
 }
 
+/// Calls `visit` with every running process.
+fn visit_processes(mut visit: impl FnMut(&PROCESSENTRY32W)) -> Result<()> {
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
+        while more {
+            visit(&entry);
+            more = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
+    }
+    Ok(())
+}
+
+/// The executable names (lowercase, e.g. "cider.exe") of every running
+/// process.
+pub fn running_executables() -> Result<HashSet<String>> {
+    let mut names = HashSet::new();
+    visit_processes(|entry| {
+        let len = entry
+            .szExeFile
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        names.insert(String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase());
+    })?;
+    Ok(names)
+}
+
 impl ProcessTree {
     pub fn snapshot() -> Result<Self> {
         let mut parents = HashMap::new();
-        unsafe {
-            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?;
-            let mut entry = PROCESSENTRY32W {
-                dwSize: size_of::<PROCESSENTRY32W>() as u32,
-                ..Default::default()
-            };
-            let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
-            while more {
-                parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
-                more = Process32NextW(snapshot, &mut entry).is_ok();
-            }
-            let _ = CloseHandle(snapshot);
-        }
+        visit_processes(|entry| {
+            parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+        })?;
         Ok(Self {
             parents,
             started: RefCell::default(),

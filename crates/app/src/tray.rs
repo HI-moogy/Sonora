@@ -16,7 +16,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
     DispatchMessageW, EnumWindows, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+    GetWindowThreadProcessId, IsIconic, MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_YESNO, IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
     SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TrackPopupMenu, TranslateMessage, CREATESTRUCTW,
     GWLP_USERDATA, HICON, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, SW_HIDE, SW_RESTORE,
     SW_SHOW, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY,
@@ -261,6 +261,32 @@ fn copy_into(field: &mut [u16], text: &str) {
     let units: Vec<u16> = text.encode_utf16().take(field.len() - 1).collect();
     field[..units.len()].copy_from_slice(&units);
     field[units.len()] = 0;
+}
+
+/// Asks before quitting if that would leave apps almost silent: ones
+/// sonar-rs turned down that closed before it could turn them back up.
+/// Windows only lets their volume be changed while they're open, so only a
+/// running sonar-rs can fix them. Returns whether to quit.
+pub fn confirm_quit() -> bool {
+    let apps = audio_engine::session_volume::turned_down_apps_not_running();
+    if apps.is_empty() {
+        return true;
+    }
+    let text = format!(
+        "These apps closed while sonar-rs had them turned down, and Windows will start them almost silent:\n\n{}\n\n\
+         sonar-rs turns them back up when it's running while they're open. Quit anyway?",
+        apps.join("\n")
+    );
+    let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let answer = unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            w!("Quit sonar-rs?"),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND,
+        )
+    };
+    answer == IDYES
 }
 
 /// This process's main window, found by title (it can't be reached

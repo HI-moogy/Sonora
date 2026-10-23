@@ -193,6 +193,27 @@ pub fn recover(routed_now: &[u32]) {
     }
 }
 
+/// Apps sonar-rs turned down that closed before it could turn them back
+/// up (executable names). Windows remembers an app's volume and only lets
+/// it be changed while the app is playing, so these start almost silent
+/// until sonar-rs runs while they're open and [`recover`] fixes them.
+pub fn turned_down_apps_not_running() -> Vec<String> {
+    let recorded: Vec<String> =
+        with_routed_apps(|apps| (apps.original_volumes.keys().cloned().collect(), false));
+    if recorded.is_empty() {
+        return recorded;
+    }
+    let Ok(running) = crate::process_tree::running_executables() else {
+        return Vec::new();
+    };
+    let mut left: Vec<String> = recorded
+        .into_iter()
+        .filter(|app| !running.contains(app))
+        .collect();
+    left.sort();
+    left
+}
+
 /// Whether any app's original volume is still recorded (cheap: no I/O).
 pub fn has_pending_routes() -> bool {
     with_routed_apps(|apps| (!apps.original_volumes.is_empty(), false))
