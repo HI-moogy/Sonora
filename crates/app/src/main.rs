@@ -115,8 +115,11 @@ impl MixerApp {
         for bus in FIXED_BUSES {
             mixer.ensure_bus(bus);
         }
-        // Hearing your own mic throws you off while talking; it's only for
-        // checking how you sound (the saved setting, if any, wins).
+        // The Mic channel sends your processed voice to other apps through
+        // a virtual cable; until you pick one it goes nowhere, since
+        // hearing your own mic throws you off while talking (the saved
+        // setting, if any, wins).
+        mixer.set_bus_send("Mic", true);
         mixer.set_bus_heard("Mic", false);
         // Late sound is noticeable in games and voice; music and video can
         // take more delay for fewer dropouts.
@@ -187,6 +190,70 @@ impl MixerApp {
         sessions.sort_by_key(|s| s.pid);
         sessions.dedup_by_key(|s| s.pid);
         self.available_sessions = sessions;
+    }
+
+    /// Where the Mic channel sends your processed voice: a virtual cable
+    /// that Discord and games then use as a microphone, or nowhere.
+    fn voice_send_ui(&mut self, ui: &mut egui::Ui, bus_name: &str, bus: &audio_engine::BusInfo) {
+        let cable = self.output_devices.iter().find(|d| is_virtual_cable(&d.name)).cloned();
+        let sending_to = bus.heard.then(|| bus.device_id.clone());
+        let label = match &sending_to {
+            None => "Nowhere".to_string(),
+            Some(None) => "Default output (you'll hear yourself)".to_string(),
+            Some(Some(id)) => self
+                .output_devices
+                .iter()
+                .find(|d| &d.id == id)
+                .map_or("(disconnected device)".to_string(), |d| d.name.clone()),
+        };
+        let mut picked: Option<Option<String>> = None;
+        ui.horizontal(|ui| {
+            ui.strong("Send my voice to");
+            egui::ComboBox::from_id_salt("voice-send").selected_text(label).width(260.0).show_ui(ui, |ui| {
+                if ui.selectable_label(sending_to.is_none(), "Nowhere").clicked() {
+                    picked = Some(None);
+                }
+                // The cable first: it's what this is for.
+                let mut devices: Vec<&AudioDevice> = self.output_devices.iter().collect();
+                devices.sort_by_key(|d| !is_virtual_cable(&d.name));
+                for device in devices {
+                    let selected = sending_to.as_ref().and_then(|s| s.as_deref()) == Some(device.id.as_str());
+                    if ui.selectable_label(selected, &device.name).clicked() {
+                        picked = Some(Some(device.id.clone()));
+                    }
+                }
+            });
+        });
+        if let Some(choice) = picked {
+            self.mixer.set_bus_heard(bus_name, choice.is_some());
+            self.mixer.set_bus_device(bus_name, choice);
+        }
+        let to_cable = matches!(&sending_to, Some(Some(id)) if cable.as_ref().is_some_and(|c| &c.id == id));
+        match (&cable, to_cable) {
+            (Some(_), true) => {
+                ui.weak("In Discord and games, pick \"CABLE Output\" as your microphone.");
+            }
+            (Some(cable), false) => {
+                ui.horizontal(|ui| {
+                    ui.weak("Virtual cable found.");
+                    if ui.button("Send my voice to it").clicked() {
+                        self.mixer.set_bus_heard(bus_name, true);
+                        self.mixer.set_bus_device(bus_name, Some(cable.id.clone()));
+                    }
+                });
+            }
+            (None, _) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak(
+                        "To use your cleaned-up voice in Discord and games, install the free VB-Audio Virtual \
+                         Cable, then pick it here.",
+                    );
+                    if ui.small_button("Get it").clicked() {
+                        clips::open_url("https://vb-audio.com/Cable/");
+                    }
+                });
+            }
+        }
     }
 
     fn refresh_devices(&mut self) {
@@ -335,6 +402,12 @@ fn eq_controls(ui: &mut egui::Ui, mixer: &Mixer, bus_name: &str, gains_db: [f32;
     });
 }
 
+/// Whether an output device is a virtual cable whose other end apps can
+/// record from (VB-Audio Virtual Cable's input side).
+fn is_virtual_cable(name: &str) -> bool {
+    name.contains("CABLE Input") || name.contains("VB-Audio Virtual Cable")
+}
+
 /// A device menu (playback devices for a bus, or microphones and line-ins
 /// for the Mic channel) showing `current` (`None`: `none_label`). Returns the
 /// device just picked, `Some(None)` being the system default.
@@ -469,16 +542,17 @@ impl eframe::App for MixerApp {
                             self.status = result.err().map(|e| format!("Couldn't open that microphone: {}", e.message()));
                         }
                     });
-                    let mut heard = bus.heard;
+                    self.voice_send_ui(ui, &selected, bus);
+                    let mut monitor = bus.monitor;
                     if ui
-                        .checkbox(&mut heard, "Listen to my mic")
+                        .checkbox(&mut monitor, "Listen to my mic")
                         .on_hover_text(
-                            "Plays your mic back to you, with its EQ and noise removal, to check how you sound. \
-                             Nobody else hears this. Turn it off when you're done.",
+                            "Plays your voice back to you, with its EQ and noise removal, to check how you sound. \
+                             Only you hear this copy. Turn it off when you're done.",
                         )
                         .changed()
                     {
-                        self.mixer.set_bus_heard(&selected, heard);
+                        self.mixer.set_bus_monitor(&selected, monitor);
                     }
                     noise::noise_controls(ui, self.mixer.mic_cleanup(), mic.is_some());
                 } else {

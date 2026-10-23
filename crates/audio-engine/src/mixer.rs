@@ -126,6 +126,12 @@ struct BusInner {
     /// Roughly how late the bus plays, in ms: what's queued on its device
     /// plus its apps' queues.
     delay_ms: AtomicF32,
+    /// A send bus carries a voice to other apps through its device (a
+    /// virtual cable): your master volume doesn't change it, and it never
+    /// falls back to the default device, which would play it to you.
+    send: AtomicBool,
+    /// Also play a copy on the default device, to hear a send bus.
+    monitor: AtomicBool,
 }
 
 /// Receives every bus's audio as the mixer renders it: after the bus's EQ,
@@ -172,6 +178,10 @@ pub struct BusInfo {
     /// Roughly how late this bus plays, in ms (the mixer's own delay, not
     /// the device's or the app's).
     pub delay_ms: f32,
+    /// See [`Mixer::set_bus_send`].
+    pub send: bool,
+    /// See [`Mixer::set_bus_monitor`].
+    pub monitor: bool,
 }
 
 /// Captures audio from any number of processes (plus optionally the
@@ -429,6 +439,23 @@ impl Mixer {
         }
     }
 
+    /// Makes `bus` a send bus: it carries a voice to other apps through its
+    /// device (a virtual cable), so the master volume doesn't apply and it
+    /// never falls back to the default device. Off by default.
+    pub fn set_bus_send(&self, bus: &str, send: bool) {
+        if let Some(bus) = self.buses.lock().unwrap().get(bus) {
+            bus.send.store(send, Ordering::Relaxed);
+        }
+    }
+
+    /// Also plays `bus` on the default device, to hear what a send bus
+    /// sends (your own mic, say). Off by default.
+    pub fn set_bus_monitor(&self, bus: &str, monitor: bool) {
+        if let Some(bus) = self.buses.lock().unwrap().get(bus) {
+            bus.monitor.store(monitor, Ordering::Relaxed);
+        }
+    }
+
     /// How much delay `bus` may have (`Normal` by default).
     pub fn set_bus_priority(&self, bus: &str, priority: Priority) {
         if let Some(bus) = self.buses.lock().unwrap().get(bus) {
@@ -521,6 +548,8 @@ impl Mixer {
                 heard: b.heard.load(Ordering::Relaxed),
                 priority: *b.priority.lock().unwrap(),
                 delay_ms: b.delay_ms.load(),
+                send: b.send.load(Ordering::Relaxed),
+                monitor: b.monitor.load(Ordering::Relaxed),
             })
             .collect()
     }
@@ -547,6 +576,8 @@ impl Mixer {
                 heard: AtomicBool::new(true),
                 priority: Mutex::new(Priority::Normal),
                 delay_ms: AtomicF32::new(0.0),
+                send: AtomicBool::new(false),
+                monitor: AtomicBool::new(false),
             }),
         );
     }
@@ -798,6 +829,8 @@ struct BusSnapshot {
     members: Vec<Arc<SourceInner>>,
     device_id: Option<String>,
     priority: Priority,
+    send: bool,
+    monitor: bool,
 }
 
 /// One opened output device's WASAPI client, kept alive only while at
@@ -867,6 +900,8 @@ fn run_render_loop(
     let mut device_outputs: HashMap<Option<String>, DeviceOutput> = HashMap::new();
     // Devices that failed, with when to try each again.
     let mut failed_devices: HashMap<Option<String>, Instant> = HashMap::new();
+    // Monitored buses' audio on its way to the default device.
+    let mut monitor_queue: VecDeque<f32> = VecDeque::new();
     // Reused across ticks so tapping doesn't allocate on the render thread.
     let mut tap_buffers: Vec<Vec<f32>> = Vec::new();
 
@@ -881,6 +916,8 @@ fn run_render_loop(
                 .map(|(name, bus)| {
                     let device_id = bus.device_id.lock().unwrap().clone();
                     let priority = *bus.priority.lock().unwrap();
+                    let send = bus.send.load(Ordering::Relaxed);
+                    let monitor = bus.monitor.load(Ordering::Relaxed);
                     let members = sources
                         .values()
                         .filter(|s| *s.bus.lock().unwrap() == *name)
@@ -892,6 +929,8 @@ fn run_render_loop(
                         members,
                         device_id,
                         priority,
+                        send,
+                        monitor,
                     }
                 })
                 .collect()
@@ -926,14 +965,22 @@ fn run_render_loop(
         };
         for snapshot in &mut bus_snapshot {
             if !ensure_open(&snapshot.device_id)
+                && !snapshot.send
                 && snapshot.bus.fallback_to_default.load(Ordering::Relaxed)
             {
                 snapshot.device_id = None;
                 ensure_open(&None);
             }
         }
-        device_outputs
-            .retain(|device_id, _| bus_snapshot.iter().any(|s| s.device_id == *device_id));
+        let monitoring = bus_snapshot.iter().any(|s| s.monitor && s.device_id.is_some());
+        if monitoring {
+            ensure_open(&None);
+        } else {
+            monitor_queue.clear();
+        }
+        device_outputs.retain(|device_id, _| {
+            bus_snapshot.iter().any(|s| s.device_id == *device_id) || (device_id.is_none() && monitoring)
+        });
         // Buses with nowhere to play drop their audio rather than queue it
         // up to play late once a device is back; the rest drop any backlog
         // beyond what their priority allows.
@@ -958,9 +1005,10 @@ fn run_render_loop(
         let device_targets: HashMap<&Option<String>, u32> = device_outputs
             .keys()
             .map(|device_id| {
+                // The default device also carries monitored buses.
                 let target = bus_snapshot
                     .iter()
-                    .filter(|s| &s.device_id == device_id)
+                    .filter(|s| &s.device_id == device_id || (device_id.is_none() && s.monitor))
                     .map(|s| device_target_ms(s.priority))
                     .fold(f32::MAX, f32::min);
                 (device_id, ms_to_frames(target))
@@ -1006,6 +1054,13 @@ fn run_render_loop(
 
             for frame in 0..available as usize {
                 let mut device_mix = [0.0f32; CHANNELS];
+                // Send buses aren't changed by the master volume.
+                let mut send_mix = [0.0f32; CHANNELS];
+                if device_id.is_none() {
+                    for m in device_mix.iter_mut() {
+                        *m += monitor_queue.pop_front().unwrap_or(0.0);
+                    }
+                }
 
                 for (
                     bus_idx,
@@ -1050,16 +1105,22 @@ fn run_render_loop(
                     let bus_frame_peak = bus_mix.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
                     bus_peaks[bus_idx] = bus_peaks[bus_idx].max(bus_frame_peak);
 
-                    if !bus.muted.load(Ordering::Relaxed) && bus.heard.load(Ordering::Relaxed) {
+                    if !bus.muted.load(Ordering::Relaxed) {
                         let bus_gain = bus.gain.load();
-                        for (m, b) in device_mix.iter_mut().zip(bus_mix.iter()) {
-                            *m += b * bus_gain;
+                        if bus.heard.load(Ordering::Relaxed) {
+                            let mix = if bus_snapshot[bus_idx].send { &mut send_mix } else { &mut device_mix };
+                            for (m, b) in mix.iter_mut().zip(bus_mix.iter()) {
+                                *m += b * bus_gain;
+                            }
+                        }
+                        if bus_snapshot[bus_idx].monitor && bus_device.is_some() {
+                            monitor_queue.extend(bus_mix.iter().map(|b| b * bus_gain));
                         }
                     }
                 }
 
                 for (channel, m) in device_mix.iter().enumerate() {
-                    let sample = (m * master_gain_value).clamp(-1.0, 1.0);
+                    let sample = (m * master_gain_value + send_mix[channel]).clamp(-1.0, 1.0);
                     master_peak = master_peak.max(sample.abs());
                     unsafe {
                         *render_ptr.add(frame * CHANNELS + channel) = sample;
@@ -1087,6 +1148,14 @@ fn run_render_loop(
                     tap.bus_audio(&snapshot.name, samples);
                 }
             }
+        }
+
+        // A monitor copy that piled up (the default device stalled) is
+        // dropped rather than heard late.
+        let monitor_limit = ms_to_frames(queue_limit_ms(Priority::High)) as usize * CHANNELS;
+        if monitor_queue.len() > monitor_limit {
+            let excess = monitor_queue.len() - monitor_limit / 2;
+            monitor_queue.drain(..excess - excess % CHANNELS);
         }
 
         for (bus_idx, snapshot) in bus_snapshot.iter().enumerate() {

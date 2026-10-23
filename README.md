@@ -40,6 +40,17 @@ Nothing is installed; settings live in `%APPDATA%\sonar-rs`.
 - Your setup is saved and comes back next time, including apps you open
   later.
 
+**Your mic in Discord and games**
+
+- sonar-rs cleans up your mic (noise removal and EQ on the Mic channel). For
+  Discord and games to get that cleaned-up voice, install the free
+  [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) (one install, then
+  restart sonar-rs).
+- On the Mic channel, set **Send my voice to** "CABLE Input".
+- In Discord (and games), pick **CABLE Output** as your microphone.
+- **Listen to my mic** plays your voice back to you to check how you sound;
+  leave it off while talking.
+
 **Clips tab**
 
 - The first time, it asks what to record: the **whole screen**, or **only

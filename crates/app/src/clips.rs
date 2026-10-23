@@ -193,6 +193,11 @@ pub fn show_in_folder(path: &Path) {
     let _ = Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).spawn();
 }
 
+/// Opens `url` in the default browser.
+pub fn open_url(url: &str) {
+    let _ = Command::new("explorer").arg(url).spawn();
+}
+
 pub fn open_folder(dir: &Path) {
     let _ = std::fs::create_dir_all(dir);
     let _ = Command::new("explorer").arg(dir).spawn();

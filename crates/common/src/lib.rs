@@ -106,13 +106,16 @@ pub struct SavedBus {
     pub heard: Option<bool>,
     /// `None` (settings from before this) uses the app's default.
     pub priority: Option<Priority>,
+    /// Whether a copy also plays on the default device (hearing your own
+    /// mic); `None` is off.
+    pub monitor: Option<bool>,
     /// `#RRGGBB` shown for the bus instead of its built-in color.
     pub color: Option<String>,
 }
 
 impl Default for SavedBus {
     fn default() -> Self {
-        Self { gain: 1.0, muted: false, device: None, fallback_to_default: true, heard: None, priority: None, color: None }
+        Self { gain: 1.0, muted: false, device: None, fallback_to_default: true, heard: None, priority: None, monitor: None, color: None }
     }
 }
 
@@ -418,7 +421,7 @@ mod tests {
         });
         presets.mixer.buses.insert(
             "Aux".into(),
-            SavedBus { gain: 0.5, muted: false, device: Some("{0.0.0.00000000}.{tv}".into()), fallback_to_default: false, heard: Some(false), priority: Some(Priority::Low), color: Some("#A855F7".into()) },
+            SavedBus { gain: 0.5, muted: false, device: Some("{0.0.0.00000000}.{tv}".into()), fallback_to_default: false, heard: Some(false), priority: Some(Priority::Low), monitor: Some(true), color: Some("#A855F7".into()) },
         );
         let json = serde_json::to_string(&presets).unwrap();
         let loaded: Presets = serde_json::from_str(&json).unwrap();
