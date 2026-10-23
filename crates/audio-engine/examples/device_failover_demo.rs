@@ -157,10 +157,12 @@ fn main() -> windows::core::Result<()> {
         .expect("no active output device with that name");
     println!("test device: {}", device.name);
 
-    let tone = Tone(std::process::Command::new(std::env::current_exe().unwrap()).arg("--tone").spawn().unwrap());
-        .arg("--tone")
-        .spawn()
-        .unwrap();
+    let tone = Tone(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--tone")
+            .spawn()
+            .unwrap(),
+    );
     std::thread::sleep(Duration::from_millis(500));
     let mixer = Mixer::start()?;
     mixer.ensure_bus(BUS);
