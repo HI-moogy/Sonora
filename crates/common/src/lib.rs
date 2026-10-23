@@ -167,6 +167,18 @@ pub struct MomentsConfig {
     pub always_record: Vec<String>,
     /// Detected games (lowercase executable names) never recorded.
     pub never_record: Vec<String>,
+    /// How the Clips tab orders clips.
+    pub clip_sort: ClipSort,
+}
+
+/// How the Clips tab orders clips.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipSort {
+    #[default]
+    NewestFirst,
+    OldestFirst,
+    /// Grouped by game (A to Z), newest first in each.
+    ByGame,
 }
 
 /// What clips record.
@@ -192,6 +204,7 @@ impl Default for MomentsConfig {
             record: None,
             always_record: Vec::new(),
             never_record: Vec::new(),
+            clip_sort: ClipSort::NewestFirst,
         }
     }
 }

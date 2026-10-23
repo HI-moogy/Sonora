@@ -6,16 +6,17 @@ use audio_engine::{BusTap, Mixer};
 use capture_engine::{
     default_clips_dir, AudioInput, CaptureTarget, ClipSaver, Recorder, Resolution, VideoSettings, DESKTOP_TRACK,
 };
-use common::{MomentsConfig, RecordMode};
+use common::{ClipSort, MomentsConfig, RecordMode};
 use eframe::egui;
 
 use crate::clips::editor::{ClipEditor, EditorAction};
-use crate::clips::{self, ClipList, Thumbnails};
+use crate::clips::{self, ClipEntry, ClipList, Thumbnails};
 use crate::games::{self, AppWindow, GameFinder};
 use crate::hotkey::{self, GlobalHotkey};
 use crate::{sounds, theme, FIXED_BUSES};
 
-const CLIP_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the clips folder (and its subfolders) is looked through again.
+const CLIP_SCAN_INTERVAL: Duration = Duration::from_secs(10);
 /// How often to look for games (and which one is in front) to record.
 const GAME_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// On-screen size of a clip's thumbnail in the Clips tab.
@@ -43,6 +44,9 @@ impl BusTap for BusesToRecorder {
 struct Shared {
     saver: Mutex<Option<ClipSaver>>,
     dir: Mutex<PathBuf>,
+    /// The game being recorded, if any: its clips go in a folder named
+    /// after it, like other recorders do.
+    game: Mutex<Option<String>>,
     last_result: Mutex<Option<Result<PathBuf, String>>>,
 }
 
@@ -52,7 +56,11 @@ impl Shared {
             self.finish(ctx, Err("Moments is off".into()));
             return;
         };
-        let reply = saver.save(self.dir.lock().unwrap().clone());
+        let mut dir = self.dir.lock().unwrap().clone();
+        if let Some(game) = self.game.lock().unwrap().as_deref() {
+            dir.push(game);
+        }
+        let reply = saver.save(dir);
         let (shared, ctx) = (self.clone(), ctx.clone());
         std::thread::spawn(move || {
             let result = match reply.recv() {
@@ -90,6 +98,8 @@ pub struct Moments {
     show_settings: bool,
     /// The clip open in the editor, shown instead of the clip list.
     editor: Option<ClipEditor>,
+    /// Show only this game's clips (a [`clips::game_key`]).
+    game_filter: Option<String>,
     ctx: egui::Context,
     games: GameFinder,
     /// Running apps' windows as of the last check.
@@ -109,11 +119,12 @@ impl Moments {
             hotkey: None,
             hotkey_error: None,
             capturing_hotkey: false,
-            clips: ClipList::default(),
+            clips: ClipList::new(ctx),
             thumbnails: Thumbnails::new(ctx),
             last_scan: None,
             show_settings: false,
             editor: None,
+            game_filter: None,
             ctx: ctx.clone(),
             games: GameFinder::new(),
             apps: Vec::new(),
@@ -195,6 +206,7 @@ impl Moments {
                 recorder.set_target(target);
             }
             self.target = target;
+            *self.shared.game.lock().unwrap() = self.recording_app().and_then(|app| folder_name(&app.title));
         }
     }
 
@@ -574,16 +586,17 @@ impl Moments {
         let dir = self.clips_dir();
         let last_result = self.shared.last_result.lock().unwrap().clone();
         // A clip saved from the hotkey shows up right away, not on the next scan.
+        self.clips.poll();
         if let Some(Ok(path)) = &last_result {
-            if self.clips.entries.first().is_none_or(|newest| &newest.path != path) {
+            if !self.clips.scanning && !self.clips.entries.iter().any(|clip| &clip.path == path) {
                 self.last_scan = None;
             }
         }
         if self.last_scan.is_none_or(|at| at.elapsed() >= CLIP_SCAN_INTERVAL) {
             self.clips.refresh(&dir);
-            self.thumbnails.retain(&self.clips.entries);
             self.last_scan = Some(Instant::now());
         }
+        self.thumbnails.begin_frame(ui.ctx());
 
         ui.horizontal(|ui| {
             ui.heading("Clips");
@@ -655,52 +668,181 @@ impl Moments {
 
         if self.clips.entries.is_empty() {
             ui.add_space(12.0);
-            ui.weak(format!(
-                "No clips yet. Press {} right after something happens to save the last {}.",
-                hotkey::label(self.config.hotkey),
-                clips::format_duration(Duration::from_secs(self.config.buffer_secs as u64)),
-            ));
+            ui.label(egui::RichText::new(if self.clips.scanned {
+                format!(
+                    "No clips yet. Press {} right after something happens to save the last {}.",
+                    hotkey::label(self.config.hotkey),
+                    clips::format_duration(Duration::from_secs(self.config.buffer_secs as u64)),
+                )
+            } else {
+                "Looking for clips…".to_string()
+            })
+            .color(theme::TEXT_MUTED));
             return;
+        }
+
+        // Each game with how many clips it has, for the filter.
+        let mut games: Vec<(String, String, usize)> = Vec::new();
+        for clip in &self.clips.entries {
+            let key = clips::game_key(&clip.game);
+            match games.iter_mut().find(|(k, ..)| *k == key) {
+                Some(game) => {
+                    game.2 += 1;
+                    // Your folder's spelling of a game wins.
+                    if clip.game_from_folder {
+                        game.1 = clip.game.clone();
+                    }
+                }
+                None => games.push((key, clip.game.clone(), 1)),
+            }
+        }
+        games.sort_by_key(|(_, name, _)| name.to_lowercase());
+        if self.game_filter.as_ref().is_some_and(|key| !games.iter().any(|(k, ..)| k == key)) {
+            self.game_filter = None;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Sort");
+            let sort_label = |sort: ClipSort| match sort {
+                ClipSort::NewestFirst => "Newest first",
+                ClipSort::OldestFirst => "Oldest first",
+                ClipSort::ByGame => "By game",
+            };
+            let mut sort = self.config.clip_sort;
+            egui::ComboBox::from_id_salt("clip-sort").width(120.0).selected_text(sort_label(sort)).show_ui(ui, |ui| {
+                for option in [ClipSort::NewestFirst, ClipSort::OldestFirst, ClipSort::ByGame] {
+                    ui.selectable_value(&mut sort, option, sort_label(option));
+                }
+            });
+            if sort != self.config.clip_sort {
+                self.config.clip_sort = sort;
+                self.persist();
+            }
+            ui.add_space(8.0);
+            ui.label("Game");
+            let selected = match &self.game_filter {
+                Some(key) => games.iter().find(|(k, ..)| k == key).map_or("All games".to_string(), |(_, name, _)| name.clone()),
+                None => "All games".to_string(),
+            };
+            egui::ComboBox::from_id_salt("clip-game").width(220.0).selected_text(selected).height(420.0).show_ui(ui, |ui| {
+                if ui.selectable_label(self.game_filter.is_none(), format!("All games ({})", self.clips.entries.len())).clicked() {
+                    self.game_filter = None;
+                }
+                for (key, name, count) in &games {
+                    if ui.selectable_label(self.game_filter.as_ref() == Some(key), format!("{name} ({count})")).clicked() {
+                        self.game_filter = Some(key.clone());
+                    }
+                }
+            });
+        });
+
+        let mut shown: Vec<&ClipEntry> = self
+            .clips
+            .entries
+            .iter()
+            .filter(|clip| self.game_filter.as_ref().is_none_or(|key| clips::game_key(&clip.game) == *key))
+            .collect();
+        match self.config.clip_sort {
+            ClipSort::NewestFirst => shown.sort_by_key(|clip| std::cmp::Reverse(clip.recorded)),
+            ClipSort::OldestFirst => shown.sort_by_key(|clip| clip.recorded),
+            ClipSort::ByGame => shown.sort_by_key(|clip| (clips::game_key(&clip.game), std::cmp::Reverse(clip.recorded))),
         }
 
         let ctx = ui.ctx().clone();
         let mut opened = None;
+        let by_game = self.config.clip_sort == ClipSort::ByGame;
+        let thumbnails = &mut self.thumbnails;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            // Top-aligned so cards line up even while thumbnails are still loading.
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP).with_main_wrap(true), |ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
-                for clip in &self.clips.entries {
-                    ui.allocate_ui(egui::vec2(CARD_THUMBNAIL.x, CARD_THUMBNAIL.y + 48.0), |ui| {
-                        ui.vertical(|ui| {
-                            let thumbnail = match self.thumbnails.get(&ctx, clip) {
-                                Some(texture) => ui.add(
-                                    egui::Image::new((texture.id(), CARD_THUMBNAIL))
-                                        .corner_radius(4.0)
-                                        .sense(egui::Sense::click()),
-                                ),
-                                None => ui.add_sized(CARD_THUMBNAIL, egui::Button::new("▶")),
-                            };
-                            if thumbnail.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open").clicked() {
-                                opened = Some(ClipEditor::open(&ctx, clip));
-                            }
-                            ui.label(clips::display_name(&clip.name));
-                            ui.horizontal(|ui| {
-                                ui.weak(format!(
-                                    "{} · {}",
-                                    clip.duration.map(clips::format_duration).unwrap_or_else(|| "?".into()),
-                                    clips::format_size(clip.size)
-                                ));
-                                if ui.small_button("Show in folder").clicked() {
-                                    clips::show_in_folder(&clip.path);
-                                }
-                            });
-                        });
+            // One run of cards per game when grouping, else one run of all.
+            let mut rest = &shown[..];
+            while let Some(first) = rest.first() {
+                let run = if by_game {
+                    let key = clips::game_key(&first.game);
+                    rest.iter().take_while(|clip| clips::game_key(&clip.game) == key).count()
+                } else {
+                    rest.len()
+                };
+                let (group, after) = rest.split_at(run);
+                rest = after;
+                if by_game {
+                    let key = clips::game_key(&first.game);
+                    let title = games.iter().find(|(k, ..)| *k == key).map_or(first.game.as_str(), |(_, name, _)| name.as_str());
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(title).size(16.0).strong());
+                        ui.label(egui::RichText::new(format!("{} clip{}", group.len(), if group.len() == 1 { "" } else { "s" })).color(theme::TEXT_MUTED));
                     });
                 }
-            });
+                // Top-aligned so cards line up even while thumbnails are still loading.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP).with_main_wrap(true), |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
+                    for clip in group {
+                        if clip_card(ui, clip, thumbnails, !by_game) {
+                            opened = Some(ClipEditor::open(&ctx, clip));
+                        }
+                    }
+                });
+            }
         });
         if opened.is_some() {
             self.editor = opened;
         }
+    }
+}
+
+/// One clip's card. Cards off screen only take their space: their
+/// thumbnail and length are loaded once they're scrolled into view.
+/// Returns whether the clip was clicked to open.
+fn clip_card(ui: &mut egui::Ui, clip: &ClipEntry, thumbnails: &mut Thumbnails, show_game: bool) -> bool {
+    let size = egui::vec2(CARD_THUMBNAIL.x, CARD_THUMBNAIL.y + 62.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return false;
+    }
+    let (texture, duration) = thumbnails.get(clip);
+    let mut card = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
+    card.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+    let thumbnail = match texture {
+        Some(texture) => card.add(
+            egui::Image::new((texture.id(), CARD_THUMBNAIL)).corner_radius(6.0).sense(egui::Sense::click()),
+        ),
+        None => card.add_sized(CARD_THUMBNAIL, egui::Button::new("▶").corner_radius(6.0)),
+    };
+    let opened = thumbnail.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open").clicked();
+    card.add(egui::Label::new(clips::display_name(&clip.name)).truncate());
+    card.horizontal(|ui| {
+        let mut details = vec![duration.map(clips::format_duration).unwrap_or_else(|| "…".into()), clips::format_size(clip.size)];
+        if show_game {
+            details.insert(0, clip.game.clone());
+        }
+        ui.add(egui::Label::new(egui::RichText::new(details.join(" · ")).small().color(theme::TEXT_MUTED)).truncate());
+    });
+    if card.small_button("Show in folder").clicked() {
+        clips::show_in_folder(&clip.path);
+    }
+    opened
+}
+
+/// A folder name for a game's clips from its window title: characters
+/// Windows doesn't allow in file names are dropped, and it's kept short.
+fn folder_name(title: &str) -> Option<String> {
+    let cleaned: String = title
+        .chars()
+        .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') && !c.is_control())
+        .take(60)
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches('.').trim().to_string();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn game_folder_names_are_safe_and_short() {
+        assert_eq!(folder_name("Deadlock").as_deref(), Some("Deadlock"));
+        assert_eq!(folder_name("Half-Life 2: Episode Two").as_deref(), Some("Half-Life 2 Episode Two"));
+        assert_eq!(folder_name("  ...  "), None);
+        assert_eq!(folder_name(&"x".repeat(200)).map(|n| n.len()), Some(60));
     }
 }
