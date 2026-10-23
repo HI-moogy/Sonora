@@ -49,7 +49,8 @@ pub fn noise_controls(ui: &mut egui::Ui, cleanup: &MicCleanup, has_mic: bool) {
         }
         match cleanup.test() {
             MicTest::Recording(progress) => {
-                ui.add(egui::ProgressBar::new(progress).desired_width(120.0).text("Recording… talk, type"));
+                ui.add(egui::ProgressBar::new(progress).desired_width(160.0).text("Recording… talk or type"))
+                    .on_hover_text("Talk, type, or let the noise you want gone happen.");
                 ui.ctx().request_repaint();
             }
             test => {
