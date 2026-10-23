@@ -307,65 +307,76 @@ impl Moments {
         });
     }
 
+    /// Clip settings, in stacked sections that fit the panel's width
+    /// (long text wraps instead of pushing the panel wider).
     fn settings_ui(&mut self, ui: &mut egui::Ui, mixer: &Mixer) {
-        ui.horizontal(|ui| {
+        theme::section(ui, "Recording");
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
             let mut enabled = self.config.enabled;
-            if ui.checkbox(&mut enabled, egui::RichText::new("Record Moments").strong()).changed() {
+            if ui.checkbox(&mut enabled, egui::RichText::new("Record clips").strong()).changed() {
                 self.config.enabled = enabled;
                 self.persist();
                 self.restart_recorder(mixer);
             }
-            ui.separator();
             let (text, is_error) = self.status();
-            if is_error {
-                ui.colored_label(ERROR_COLOR, text);
-            } else {
-                ui.label(text);
+            ui.label(egui::RichText::new(text).color(if is_error { ERROR_COLOR } else { theme::TEXT_MUTED }));
+        });
+
+        theme::section(ui, "What to record");
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let mode = self.config.record.unwrap_or(RecordMode::Screen);
+            if ui.radio(mode == RecordMode::Screen, "Whole screen").clicked() {
+                self.set_record_mode(RecordMode::Screen);
+            }
+            if ui.radio(mode == RecordMode::Games, "Only games and apps I choose").clicked() {
+                self.set_record_mode(RecordMode::Games);
             }
         });
-        ui.separator();
+        if self.config.record == Some(RecordMode::Games) {
+            theme::section(ui, "Games and apps");
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.games_ui(ui);
+            });
+        }
 
-        egui::Grid::new("moments-settings").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
-            ui.label("Record");
+        theme::section(ui, "Length and quality");
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                let mode = self.config.record.unwrap_or(RecordMode::Screen);
-                if ui.radio(mode == RecordMode::Screen, "Whole screen").clicked() {
-                    self.set_record_mode(RecordMode::Screen);
-                }
-                if ui.radio(mode == RecordMode::Games, "Only games and apps I choose").clicked() {
-                    self.set_record_mode(RecordMode::Games);
+                ui.label("Clip length");
+                let mut secs = self.config.buffer_secs;
+                let response = ui.add(
+                    egui::Slider::new(&mut secs, 10..=300)
+                        .step_by(5.0)
+                        .custom_formatter(|v, _| clips::format_duration(Duration::from_secs(v as u64))),
+                );
+                self.config.buffer_secs = secs;
+                // Restarting clears the buffer, so do it once the slider is let go.
+                if response.drag_stopped() || (response.changed() && !response.dragged()) {
+                    self.persist();
+                    self.restart_recorder(mixer);
                 }
             });
-            ui.end_row();
-
-            ui.label("Clip length");
-            let mut secs = self.config.buffer_secs;
-            let response = ui.add(
-                egui::Slider::new(&mut secs, 10..=300)
-                    .step_by(5.0)
-                    .custom_formatter(|v, _| clips::format_duration(Duration::from_secs(v as u64))),
-            );
-            self.config.buffer_secs = secs;
-            // Restarting clears the buffer, so do it once the slider is let go.
-            if response.drag_stopped() || (response.changed() && !response.dragged()) {
-                self.persist();
-                self.restart_recorder(mixer);
-            }
-            ui.end_row();
-
-            ui.label("Quality");
             ui.horizontal(|ui| {
+                ui.label("Quality");
                 let mut changed = false;
                 let current = self.video_settings().resolution;
-                egui::ComboBox::from_id_salt("moments-resolution").selected_text(current.label()).show_ui(ui, |ui| {
-                    for resolution in Resolution::ALL {
-                        if ui.selectable_label(resolution == current, resolution.label()).clicked() {
-                            self.config.height = resolution.size().1;
-                            changed = true;
+                egui::ComboBox::from_id_salt("moments-resolution")
+                    .width(90.0)
+                    .selected_text(current.label())
+                    .show_ui(ui, |ui| {
+                        for resolution in Resolution::ALL {
+                            if ui.selectable_label(resolution == current, resolution.label()).clicked() {
+                                self.config.height = resolution.size().1;
+                                changed = true;
+                            }
                         }
-                    }
-                });
+                    });
                 egui::ComboBox::from_id_salt("moments-fps")
+                    .width(80.0)
                     .selected_text(format!("{} fps", self.config.fps))
                     .show_ui(ui, |ui| {
                         for fps in [30, 60] {
@@ -375,88 +386,93 @@ impl Moments {
                             }
                         }
                     });
-                ui.weak(format!("~{} of memory", clips::format_size(self.estimated_buffer_bytes())));
                 if changed {
                     self.persist();
                     self.restart_recorder(mixer);
                 }
             });
-            ui.end_row();
+            ui.label(
+                egui::RichText::new(format!("Uses about {} of memory.", clips::format_size(self.estimated_buffer_bytes())))
+                    .small()
+                    .color(theme::TEXT_MUTED),
+            );
+        });
 
-            ui.label("Hotkey");
-            ui.horizontal(|ui| {
-                if self.capturing_hotkey {
-                    ui.label("Press the new key combination… (Esc to cancel)");
-                    let pressed = ui.input(|input| {
-                        input.events.iter().find_map(|event| match event {
-                            egui::Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
-                            _ => None,
-                        })
-                    });
-                    if let Some((key, modifiers)) = pressed {
-                        if key == egui::Key::Escape {
-                            self.capturing_hotkey = false;
-                            self.register_hotkey();
-                        } else if let Some(new_hotkey) = hotkey::from_key_press(key, modifiers) {
-                            self.config.hotkey = new_hotkey;
-                            self.capturing_hotkey = false;
-                            self.persist();
-                            self.register_hotkey();
-                        }
+        theme::section(ui, "Hotkey");
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if self.capturing_hotkey {
+                ui.label("Press the new key combination… (Esc to cancel)");
+                let pressed = ui.input(|input| {
+                    input.events.iter().find_map(|event| match event {
+                        egui::Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
+                        _ => None,
+                    })
+                });
+                if let Some((key, modifiers)) = pressed {
+                    if key == egui::Key::Escape {
+                        self.capturing_hotkey = false;
+                        self.register_hotkey();
+                    } else if let Some(new_hotkey) = hotkey::from_key_press(key, modifiers) {
+                        self.config.hotkey = new_hotkey;
+                        self.capturing_hotkey = false;
+                        self.persist();
+                        self.register_hotkey();
                     }
-                } else {
-                    ui.monospace(hotkey::label(self.config.hotkey));
+                }
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label("Save a clip with");
+                    ui.label(egui::RichText::new(hotkey::label(self.config.hotkey)).monospace().strong());
                     if ui.button("Change").clicked() {
                         // Release the old hotkey so pressing it again can be
                         // captured here instead of saving a clip.
                         self.hotkey = None;
                         self.capturing_hotkey = true;
                     }
+                });
+            }
+            if let Some(error) = &self.hotkey_error {
+                ui.colored_label(ERROR_COLOR, error);
+            }
+        });
+
+        theme::section(ui, "Clip audio");
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(
+                    "How loud each track is in saved clips; what you hear doesn't change. Desktop audio is \
+                     everything you hear and plays by default; the channel tracks are for editing.",
+                )
+                .small()
+                .color(theme::TEXT_MUTED),
+            );
+            egui::Grid::new("moments-tracks").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+                for bus in clip_tracks() {
+                    ui.label(if bus == DESKTOP_TRACK { "Desktop audio" } else { bus });
+                    let mut volume = self.track_volume(bus);
+                    let response = ui.add(
+                        egui::Slider::new(&mut volume, 0.0..=2.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                    );
+                    if response.changed() {
+                        self.config.track_volumes.insert(bus.to_string(), volume);
+                        if let Some(recorder) = &self.recorder {
+                            recorder.set_track_volume(bus, volume);
+                        }
+                    }
+                    if response.drag_stopped() || (response.changed() && !response.dragged()) {
+                        self.persist();
+                    }
+                    ui.end_row();
                 }
             });
-            ui.end_row();
-            if let Some(error) = &self.hotkey_error {
-                ui.label("");
-                ui.colored_label(ERROR_COLOR, error);
-                ui.end_row();
-            }
         });
-
-        if self.config.record == Some(RecordMode::Games) {
-            ui.separator();
-            self.games_ui(ui);
-        }
-
-        ui.separator();
-        ui.strong("Clip audio");
-        ui.weak("How loud each track is in saved clips. This doesn't change what you hear.");
-        ui.weak("Desktop audio is everything you hear and plays by default; the bus tracks are for editing.");
-        egui::Grid::new("moments-tracks").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-            for bus in clip_tracks() {
-                ui.label(if bus == DESKTOP_TRACK { "Desktop audio" } else { bus });
-                let mut volume = self.track_volume(bus);
-                let response = ui.add(
-                    egui::Slider::new(&mut volume, 0.0..=2.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                );
-                if response.changed() {
-                    self.config.track_volumes.insert(bus.to_string(), volume);
-                    if let Some(recorder) = &self.recorder {
-                        recorder.set_track_volume(bus, volume);
-                    }
-                }
-                if response.drag_stopped() || (response.changed() && !response.dragged()) {
-                    self.persist();
-                }
-                ui.end_row();
-            }
-        });
-
     }
 
     /// Which games and apps get recorded: what's open now, and the apps
     /// you added or left out.
     fn games_ui(&mut self, ui: &mut egui::Ui) {
-        ui.strong("Games and apps");
         ui.weak(
             "Games are found automatically. Only the game's own window is recorded (not the rest of the screen), \
              and nothing while no game is open. The one in front is recorded.",
@@ -465,43 +481,48 @@ impl Moments {
         ui.label("Open now");
         let mut seen = std::collections::HashSet::new();
         let apps: Vec<AppWindow> = self.apps.iter().filter(|app| seen.insert(app.exe.clone())).cloned().collect();
-        egui::Grid::new("moments-apps").num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
-            for app in &apps {
-                let recording = self.recording_app().is_some_and(|r| r.exe == app.exe);
-                let label = if recording { format!("● {}", app.title) } else { app.title.clone() };
-                // Window titles can be very long (a browser tab's, say).
-                ui.scope(|ui| {
-                    ui.set_max_width(220.0);
-                    ui.add(egui::Label::new(label).truncate()).on_hover_text(&app.exe);
+        for app in &apps {
+            let recording = self.recording_app().is_some_and(|r| r.exe == app.exe);
+            let always = self.config.always_record.contains(&app.exe);
+            let never = self.config.never_record.contains(&app.exe);
+            let note = match (app.is_game, never, always, recording) {
+                (_, _, _, true) => "recording now",
+                (true, true, _, _) => "game, left out",
+                (true, false, _, _) => "game",
+                (false, _, true, _) => "added",
+                (false, _, false, _) => "",
+            };
+            ui.horizontal(|ui| {
+                let (text, action) = match (app.is_game, never, always) {
+                    (true, true, _) => ("Record it", 0),
+                    (true, false, _) => ("Don't record", 1),
+                    (false, _, true) => ("Stop recording", 2),
+                    (false, _, false) => ("Record it", 3),
+                };
+                // The button keeps its place on the right; the name (a
+                // window title, possibly a browser tab's long one) gets the
+                // rest and is cut short if needed.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button(text).clicked() {
+                        match action {
+                            0 => self.config.never_record.retain(|exe| exe != &app.exe),
+                            1 => self.config.never_record.push(app.exe.clone()),
+                            2 => self.config.always_record.retain(|exe| exe != &app.exe),
+                            _ => self.config.always_record.push(app.exe.clone()),
+                        }
+                        changed = true;
+                    }
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.add(egui::Label::new(&app.title).truncate()).on_hover_text(&app.exe);
+                        if !note.is_empty() {
+                            let color = if recording { theme::ACCENT } else { theme::TEXT_MUTED };
+                            ui.label(egui::RichText::new(note).small().color(color));
+                        }
+                    });
                 });
-                let always = self.config.always_record.contains(&app.exe);
-                let never = self.config.never_record.contains(&app.exe);
-                if app.is_game {
-                    ui.weak(if never { "game, left out" } else { "game" });
-                    if never {
-                        if ui.small_button("Record it").clicked() {
-                            self.config.never_record.retain(|exe| exe != &app.exe);
-                            changed = true;
-                        }
-                    } else if ui.small_button("Don't record").clicked() {
-                        self.config.never_record.push(app.exe.clone());
-                        changed = true;
-                    }
-                } else {
-                    ui.weak(if always { "added" } else { "" });
-                    if always {
-                        if ui.small_button("Stop recording").clicked() {
-                            self.config.always_record.retain(|exe| exe != &app.exe);
-                            changed = true;
-                        }
-                    } else if ui.small_button("Record it").clicked() {
-                        self.config.always_record.push(app.exe.clone());
-                        changed = true;
-                    }
-                }
-                ui.end_row();
-            }
-        });
+            });
+            ui.separator();
+        }
         // Choices for apps that aren't open right now.
         let open: Vec<&str> = apps.iter().map(|app| app.exe.as_str()).collect();
         for (list, verb) in [(&mut self.config.always_record, "Recorded"), (&mut self.config.never_record, "Left out")] {
