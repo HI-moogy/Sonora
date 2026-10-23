@@ -74,13 +74,16 @@ pub struct SavedBus {
     /// When `device` disconnects: play on the default device until it's
     /// back (true), or go silent (false).
     pub fallback_to_default: bool,
+    /// Whether you hear the bus; `None` (settings from before this) uses
+    /// the app's default for that bus.
+    pub heard: Option<bool>,
     /// `#RRGGBB` shown for the bus instead of its built-in color.
     pub color: Option<String>,
 }
 
 impl Default for SavedBus {
     fn default() -> Self {
-        Self { gain: 1.0, muted: false, device: None, fallback_to_default: true, color: None }
+        Self { gain: 1.0, muted: false, device: None, fallback_to_default: true, heard: None, color: None }
     }
 }
 
@@ -373,7 +376,7 @@ mod tests {
         });
         presets.mixer.buses.insert(
             "Aux".into(),
-            SavedBus { gain: 0.5, muted: false, device: Some("{0.0.0.00000000}.{tv}".into()), fallback_to_default: false, color: Some("#A855F7".into()) },
+            SavedBus { gain: 0.5, muted: false, device: Some("{0.0.0.00000000}.{tv}".into()), fallback_to_default: false, heard: Some(false), color: Some("#A855F7".into()) },
         );
         let json = serde_json::to_string(&presets).unwrap();
         let loaded: Presets = serde_json::from_str(&json).unwrap();

@@ -113,6 +113,9 @@ impl MixerApp {
         for bus in FIXED_BUSES {
             mixer.ensure_bus(bus);
         }
+        // Hearing your own mic throws you off while talking; it's only for
+        // checking how you sound (the saved setting, if any, wins).
+        mixer.set_bus_heard("Mic", false);
         let persistence = MixerPersistence::restore(&mixer);
         let moments = Moments::new(ctx, &mixer);
         let quitting = Arc::new(AtomicBool::new(false));
@@ -462,6 +465,17 @@ impl eframe::App for MixerApp {
                             self.status = result.err().map(|e| format!("Couldn't open that microphone: {}", e.message()));
                         }
                     });
+                    let mut heard = bus.heard;
+                    if ui
+                        .checkbox(&mut heard, "Listen to my mic")
+                        .on_hover_text(
+                            "Plays your mic back to you, with its EQ, to check how you sound. \
+                             Nobody else hears this. Turn it off when you're done.",
+                        )
+                        .changed()
+                    {
+                        self.mixer.set_bus_heard(&selected, heard);
+                    }
                 } else {
                     ui.horizontal(|ui| {
                         ui.strong("Output device");

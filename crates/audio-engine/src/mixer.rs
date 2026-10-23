@@ -91,6 +91,9 @@ struct BusInner {
     /// Whether the bus plays on the default device while its own device is
     /// unavailable, rather than going silent.
     fallback_to_default: AtomicBool,
+    /// Whether you hear the bus. One you don't hear is still mixed, metered
+    /// and passed to the bus tap (clips); it just isn't played.
+    heard: AtomicBool,
 }
 
 /// Receives every bus's audio as the mixer renders it: after the bus's EQ,
@@ -130,6 +133,8 @@ pub struct BusInfo {
     pub device_id: Option<String>,
     /// See [`Mixer::set_bus_fallback`].
     pub fallback_to_default: bool,
+    /// See [`Mixer::set_bus_heard`].
+    pub heard: bool,
 }
 
 /// Captures audio from any number of processes (plus optionally the
@@ -379,6 +384,15 @@ impl Mixer {
         }
     }
 
+    /// Whether `bus` is played to you (on by default). Turning it off keeps
+    /// the bus in clips and on its meter; it's for a microphone you don't
+    /// want to hear yourself through.
+    pub fn set_bus_heard(&self, bus: &str, heard: bool) {
+        if let Some(bus) = self.buses.lock().unwrap().get(bus) {
+            bus.heard.store(heard, Ordering::Relaxed);
+        }
+    }
+
     /// Sets one band (0..[`EQ_BAND_COUNT`]) of `bus`'s EQ, in dB.
     pub fn set_bus_eq_band(&self, bus: &str, band: usize, gain_db: f32) {
         if let Some(bus) = self.buses.lock().unwrap().get(bus) {
@@ -452,6 +466,7 @@ impl Mixer {
                 eq_gains_db: b.eq.lock().unwrap().gains(),
                 device_id: b.device_id.lock().unwrap().clone(),
                 fallback_to_default: b.fallback_to_default.load(Ordering::Relaxed),
+                heard: b.heard.load(Ordering::Relaxed),
             })
             .collect()
     }
@@ -475,6 +490,7 @@ impl Mixer {
                 eq: Mutex::new(EqBands::from_gains(SAMPLE_RATE, gains_db)),
                 device_id: Mutex::new(None),
                 fallback_to_default: AtomicBool::new(true),
+                heard: AtomicBool::new(true),
             }),
         );
     }
@@ -944,7 +960,7 @@ fn run_render_loop(
                     let bus_frame_peak = bus_mix.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
                     bus_peaks[bus_idx] = bus_peaks[bus_idx].max(bus_frame_peak);
 
-                    if !bus.muted.load(Ordering::Relaxed) {
+                    if !bus.muted.load(Ordering::Relaxed) && bus.heard.load(Ordering::Relaxed) {
                         let bus_gain = bus.gain.load();
                         for (m, b) in device_mix.iter_mut().zip(bus_mix.iter()) {
                             *m += b * bus_gain;
