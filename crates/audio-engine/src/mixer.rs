@@ -8,7 +8,7 @@ use windows::Win32::Foundation::{CloseHandle, E_INVALIDARG, E_UNEXPECTED, HANDLE
 use windows::Win32::Media::Audio::{
     IAudioCaptureClient, IAudioClient, IAudioRenderClient, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-    AUDCLNT_STREAMFLAGS_LOOPBACK,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX,
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
@@ -298,7 +298,13 @@ impl Mixer {
     /// its bus, gain and mute. Returns the source's new id. On failure the
     /// old capture keeps running.
     pub fn set_mic_device(&self, id: u64, device_id: Option<String>) -> Result<u64> {
-        let old = self.sources.lock().unwrap().get(&id).filter(|s| s.pid.is_none()).cloned();
+        let old = self
+            .sources
+            .lock()
+            .unwrap()
+            .get(&id)
+            .filter(|s| s.pid.is_none())
+            .cloned();
         let Some(old) = old else {
             return Err(Error::from(E_INVALIDARG));
         };
@@ -710,6 +716,46 @@ struct DeviceOutput {
     buffer_frames: u32,
 }
 
+impl DeviceOutput {
+    /// Opens and starts `device_id` (`None` = the system default).
+    fn open(device_id: Option<&str>, format: &WAVEFORMATEX) -> Result<Self> {
+        let (client, render_service) = open_render_client_for_device(device_id, format)?;
+        unsafe {
+            let buffer_frames = client.GetBufferSize()?;
+            client.Start()?;
+            Ok(Self {
+                client,
+                render_service,
+                buffer_frames,
+            })
+        }
+    }
+}
+
+impl Drop for DeviceOutput {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.client.Stop();
+        }
+    }
+}
+
+/// How long to wait before trying an output device again after it failed
+/// (unplugged, turned off, taken over by an exclusive-mode app). Its buses
+/// play on the default device meanwhile.
+const DEVICE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+/// The same for the default device, retried sooner because a failure
+/// there usually means Windows just switched the default to another device.
+const DEFAULT_DEVICE_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
+fn device_retry_interval(device_id: &Option<String>) -> Duration {
+    if device_id.is_some() {
+        DEVICE_RETRY_INTERVAL
+    } else {
+        DEFAULT_DEVICE_RETRY_INTERVAL
+    }
+}
+
 /// Runs entirely on its own OS thread. Unlike capture threads (one per
 /// source), there is one render thread total: it lazily opens/closes a
 /// WASAPI render client per *distinct device a bus currently targets*,
@@ -726,13 +772,15 @@ fn run_render_loop(
     let _com = ComGuard::init()?;
     let format = standard_format();
     let mut device_outputs: HashMap<Option<String>, DeviceOutput> = HashMap::new();
+    // Devices that failed, with when to try each again.
+    let mut failed_devices: HashMap<Option<String>, Instant> = HashMap::new();
     // Reused across ticks so tapping doesn't allocate on the render thread.
     let mut tap_buffers: Vec<Vec<f32>> = Vec::new();
 
     while !stop.load(Ordering::Relaxed) {
         // Snapshot once per render tick (not per sample), grouped by bus so
         // each bus's EQ runs once on that bus's own summed signal.
-        let bus_snapshot: Vec<BusSnapshot> = {
+        let mut bus_snapshot: Vec<BusSnapshot> = {
             let sources = sources.lock().unwrap();
             let buses = buses.lock().unwrap();
             buses
@@ -754,46 +802,50 @@ fn run_render_loop(
                 .collect()
         };
 
-        // Open any newly-needed device clients; close ones no bus targets
-        // anymore.
-        let needed_devices: std::collections::HashSet<Option<String>> = bus_snapshot
-            .iter()
-            .map(|snapshot| snapshot.device_id.clone())
-            .collect();
-        for device_id in &needed_devices {
+        // Open the devices buses ask for; a bus whose device can't be opened
+        // plays on the default device until it can. Then close devices no
+        // bus plays on anymore.
+        let now = Instant::now();
+        let mut ensure_open = |device_id: &Option<String>| {
             if device_outputs.contains_key(device_id) {
-                continue;
+                return true;
             }
-            match open_render_client_for_device(device_id.as_deref(), &format) {
-                Ok((client, render_service)) => {
-                    let buffer_frames = unsafe { client.GetBufferSize()? };
-                    unsafe {
-                        client.Start()?;
-                    }
-                    device_outputs.insert(
-                        device_id.clone(),
-                        DeviceOutput {
-                            client,
-                            render_service,
-                            buffer_frames,
-                        },
-                    );
+            if failed_devices
+                .get(device_id)
+                .is_some_and(|&retry_at| now < retry_at)
+            {
+                return false;
+            }
+            match DeviceOutput::open(device_id.as_deref(), &format) {
+                Ok(output) => {
+                    failed_devices.remove(device_id);
+                    device_outputs.insert(device_id.clone(), output);
+                    true
                 }
-                Err(error) => {
-                    eprintln!("mixer: failed to open render device {device_id:?}: {error:?}");
+                Err(_) => {
+                    failed_devices
+                        .insert(device_id.clone(), now + device_retry_interval(device_id));
+                    false
+                }
+            }
+        };
+        for snapshot in &mut bus_snapshot {
+            if !ensure_open(&snapshot.device_id) {
+                snapshot.device_id = None;
+                ensure_open(&None);
+            }
+        }
+        device_outputs
+            .retain(|device_id, _| bus_snapshot.iter().any(|s| s.device_id == *device_id));
+        // Buses with nowhere to play drop their audio rather than queue it
+        // up to play late once a device is back.
+        for snapshot in &bus_snapshot {
+            if !device_outputs.contains_key(&snapshot.device_id) {
+                for source in &snapshot.members {
+                    source.samples.lock().unwrap().clear();
                 }
             }
         }
-        device_outputs.retain(|device_id, output| {
-            if needed_devices.contains(device_id) {
-                true
-            } else {
-                unsafe {
-                    let _ = output.client.Stop();
-                }
-                false
-            }
-        });
 
         let master_gain_value = master_gain.load();
         let mut master_peak = 0.0f32;
@@ -808,16 +860,23 @@ fn run_render_loop(
             tap_buffers.iter_mut().for_each(Vec::clear);
         }
         let mut rendered_any = false;
+        let mut broken_devices = Vec::new();
 
         for (device_id, output) in device_outputs.iter() {
-            let padding = unsafe { output.client.GetCurrentPadding()? };
+            let Ok(padding) = (unsafe { output.client.GetCurrentPadding() }) else {
+                broken_devices.push(device_id.clone());
+                continue;
+            };
             let available = output.buffer_frames.saturating_sub(padding);
             if available == 0 {
                 continue;
             }
+            let Ok(buffer) = (unsafe { output.render_service.GetBuffer(available) }) else {
+                broken_devices.push(device_id.clone());
+                continue;
+            };
             rendered_any = true;
-
-            let render_ptr = unsafe { output.render_service.GetBuffer(available)? } as *mut f32;
+            let render_ptr = buffer as *mut f32;
 
             for frame in 0..available as usize {
                 let mut device_mix = [0.0f32; CHANNELS];
@@ -882,9 +941,18 @@ fn run_render_loop(
                 }
             }
 
-            unsafe {
-                output.render_service.ReleaseBuffer(available, 0)?;
+            if unsafe { output.render_service.ReleaseBuffer(available, 0) }.is_err() {
+                broken_devices.push(device_id.clone());
             }
+        }
+        // A device that fails mid-stream is gone (or taken over): close it,
+        // and its buses fall back to the default device from the next tick.
+        for device_id in broken_devices {
+            device_outputs.remove(&device_id);
+            failed_devices.insert(
+                device_id.clone(),
+                Instant::now() + device_retry_interval(&device_id),
+            );
         }
 
         if let Some(tap) = &tap {
@@ -910,10 +978,5 @@ fn run_render_loop(
         master_level.raise_to(master_peak);
     }
 
-    for output in device_outputs.values() {
-        unsafe {
-            let _ = output.client.Stop();
-        }
-    }
     Ok(())
 }
