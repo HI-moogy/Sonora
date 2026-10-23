@@ -11,6 +11,10 @@ use crate::theme;
 
 /// The GitHub repository, from Cargo.toml's `repository` (empty until set).
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+/// Whether testers can open the repository's issues. It's private for now
+/// (testers get Sonora as a file), so the About window doesn't send them
+/// there; set this when it goes public.
+const REPOSITORY_IS_PUBLIC: bool = false;
 
 /// Sonora's own license, and those of the libraries built into it.
 const LICENSE: &str = include_str!("../../../LICENSE");
@@ -151,13 +155,17 @@ impl AboutWindow {
                         .color(theme::text_muted()),
                 );
                 theme::section(ui, "Report a bug");
-                ui.label("Say what you did, what happened and what you expected. Paste the details below into it, and attach the newest crash report if Sonora crashed.");
+                ui.label(if REPOSITORY_IS_PUBLIC {
+                    "Say what you did, what happened and what you expected. Paste the details below into it, and attach the newest crash report if Sonora crashed."
+                } else {
+                    "Tell whoever gave you Sonora what you did, what happened and what you expected. Paste the details below into your message, and attach the newest crash report if Sonora crashed."
+                });
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Copy details").on_hover_text("Sonora's version and your system").clicked() {
                         ui.ctx().copy_text(system_summary());
                         self.copied = true;
                     }
-                    if !REPOSITORY.is_empty() && ui.button("Report on GitHub").clicked() {
+                    if REPOSITORY_IS_PUBLIC && !REPOSITORY.is_empty() && ui.button("Report on GitHub").clicked() {
                         ui.ctx().copy_text(system_summary());
                         self.copied = true;
                         open_url(&format!("{REPOSITORY}/issues/new/choose"));

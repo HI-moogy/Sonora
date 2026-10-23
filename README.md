@@ -153,8 +153,9 @@ recording) keeps going. Click the icon to open it again; right-click it for
 
 ## Reporting a bug
 
-Open **Menu > About and bug reports** and use **Report on GitHub** (or
-[open an issue](../../issues/new/choose)). Please include:
+Send it to whoever gave you Sonora (or, if you can see this repository,
+[open an issue](../../issues/new/choose)). **Menu > About and bug reports**
+has what you need. Please include:
 
 1. The details **Copy details** puts on your clipboard (Sonora's version
    and your system).

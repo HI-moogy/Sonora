@@ -1,11 +1,5 @@
 # Changelog
 
-## Unreleased
-
-### New
-
-- **Trim clips**: split a clip at the playhead (scissors, or S), right-click a part to cut it out (or press Delete), and save. Playback skips cut parts. The video is copied, not re-encoded, so no quality is lost; a kept part starts at the keyframe just before your split, which the timeline shows in amber.
-
 ## 0.1.0-alpha.2 (2026-10-23)
 
 ### New
@@ -18,7 +12,8 @@
 - **Colors**: seven presets, any color changeable, and colors to share as text (Menu > Colors).
 - **A getting-started tour** the first time Sonora opens (Menu > Getting started guide).
 - **Clips**: clips in subfolders show too; sort by date or game and filter by game; the game is read from Radeon and SteelSeries file names. The editor has previous/next clip buttons, skip to start/end, and drawn controls.
-- **Bug reports**: Menu > About and bug reports copies your version and system, and Sonora writes a crash report if it crashes.
+- **Trim clips**: split a clip at the playhead (scissors, or S), right-click a part to cut it out (or press Delete), and save. Playback skips cut parts. The video is copied, not re-encoded, so no quality is lost; a kept part starts at the keyframe just before your split, which the timeline shows in amber.
+- **Bug reports**: Menu > About and bug reports copies your version and system to send with a bug, and Sonora writes a crash report if it crashes.
 - **Windows download is one file**: `Sonora.exe`, nothing to unzip or install. Replace it to update.
 
 ### Changed
