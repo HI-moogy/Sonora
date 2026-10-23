@@ -1,0 +1,67 @@
+name: Bug report
+description: Something doesn't work, sounds wrong, or crashed.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing Sonora! In Sonora, **Menu > About and bug reports > Copy details** copies your version and system for the first box.
+  - type: textarea
+    id: details
+    attributes:
+      label: Sonora version and system
+      description: Paste what Copy details gave you.
+      placeholder: Sonora 0.1.0-alpha.2 on Windows 11 24H2 (build 26100)
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: What part of Sonora?
+      options:
+        - Mixer (channels, apps, volume, outputs)
+        - EQ
+        - Mic (noise removal, sending my voice)
+        - Clips (recording, saving, editor)
+        - Colors or the tour
+        - Tray, starting, quitting
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: What you did
+      description: Step by step, so it can be tried again.
+      placeholder: |
+        1. Added Discord to Chat
+        2. Unplugged my headset
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: dropdown
+    id: often
+    attributes:
+      label: How often?
+      options:
+        - Every time
+        - Sometimes
+        - Once
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Your audio setup (if it's about sound)
+      description: Headset, speakers, mic, other audio apps running (Discord, other mixers, VB-Cable...), and on Linux whether it's PipeWire or PulseAudio.
+  - type: textarea
+    id: files
+    attributes:
+      label: Crash report, screenshots, video
+      description: If Sonora crashed, attach the newest file from Menu > About and bug reports > Crash reports. Screenshots and short videos help too.

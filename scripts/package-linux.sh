@@ -3,8 +3,8 @@
 #
 # The binary runs on systems with at least the glibc it's built against, so
 # release builds come from the oldest supported base (Ubuntu 22.04, as the
-# release workflow uses). Needs Rust and libpulse (the dev package, or just
-# libpulse.so.0).
+# release workflow uses). Needs Rust, Python 3 (for the third-party
+# notices) and libpulse (the dev package, or just libpulse.so.0).
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -24,7 +24,8 @@ mkdir -p "$stage" "$root/dist"
 cp "$target_dir/release/sonora" "$stage/"
 cp crates/app/assets/icon.png "$stage/sonora.png"
 cp packaging/linux/sonora.desktop packaging/linux/install.sh packaging/linux/uninstall.sh "$stage/"
-cp README.md CHANGELOG.md "$stage/" 2>/dev/null || cp README.md "$stage/"
+cp README.md CHANGELOG.md LICENSE "$stage/"
+python3 scripts/third_party_notices.py --target x86_64-unknown-linux-gnu > "$stage/THIRD-PARTY-NOTICES.txt"
 chmod 644 "$stage"/*
 chmod 755 "$stage/sonora" "$stage/install.sh" "$stage/uninstall.sh"
 tar -C "$work" -czf "$root/dist/$name.tar.gz" "$name"
