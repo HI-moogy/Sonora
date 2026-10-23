@@ -9,7 +9,7 @@
 //! [`ROUTED_BOOST`].
 //!
 //! Windows remembers per-app volumes across restarts, so each routed app's
-//! original volume is also kept on disk ([`common::RoutedApps`]); if sonar-rs
+//! original volume is also kept on disk ([`common::RoutedApps`]); if Sonora
 //! exits without restoring it (crash, killed), [`recover`] puts it back.
 
 use std::collections::{HashMap, HashSet};
@@ -193,10 +193,10 @@ pub fn recover(routed_now: &[u32]) {
     }
 }
 
-/// Apps sonar-rs turned down that closed before it could turn them back
+/// Apps Sonora turned down that closed before it could turn them back
 /// up (executable names). Windows remembers an app's volume and only lets
 /// it be changed while the app is playing, so these start almost silent
-/// until sonar-rs runs while they're open and [`recover`] fixes them.
+/// until Sonora runs while they're open and [`recover`] fixes them.
 pub fn turned_down_apps_not_running() -> Vec<String> {
     let recorded: Vec<String> =
         with_routed_apps(|apps| (apps.original_volumes.keys().cloned().collect(), false));

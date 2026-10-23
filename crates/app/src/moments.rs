@@ -13,7 +13,7 @@ use crate::clips::editor::{ClipEditor, EditorAction};
 use crate::clips::{self, ClipList, Thumbnails};
 use crate::games::{self, AppWindow, GameFinder};
 use crate::hotkey::{self, GlobalHotkey};
-use crate::{sounds, FIXED_BUSES};
+use crate::{sounds, theme, FIXED_BUSES};
 
 const CLIP_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 /// How often to look for games (and which one is in front) to record.
@@ -64,7 +64,7 @@ impl Shared {
     }
 
     /// Records the outcome and confirms it audibly, since you're usually in
-    /// a game rather than looking at sonar-rs when you save.
+    /// a game rather than looking at Sonora when you save.
     fn finish(&self, ctx: &egui::Context, result: Result<PathBuf, String>) {
         if result.is_ok() {
             sounds::clip_saved();
@@ -274,20 +274,30 @@ impl Moments {
     /// side panel.
     pub fn tab(&mut self, ui: &mut egui::Ui, mixer: &Mixer) {
         if self.show_settings {
-            egui::Panel::right("clip-settings").min_size(430.0).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Clip settings");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("✕").on_hover_text("Close settings").clicked() {
-                            self.show_settings = false;
-                        }
+            egui::Panel::right("clip-settings")
+                .size_range(380.0..=480.0)
+                .default_size(430.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::SURFACE)
+                        .inner_margin(egui::Margin::same(16))
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+                )
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("Clip settings");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(egui::Button::new("✕").frame(false)).on_hover_text("Close settings").clicked() {
+                                self.show_settings = false;
+                            }
+                        });
                     });
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.settings_ui(ui, mixer));
                 });
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| self.settings_ui(ui, mixer));
-            });
         }
-        egui::CentralPanel::default().show(ui, |ui| match &mut self.editor {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(20)))
+            .show(ui, |ui| match &mut self.editor {
             Some(editor) => match editor.ui(ui) {
                 EditorAction::None => {}
                 EditorAction::Close => self.editor = None,
@@ -459,7 +469,11 @@ impl Moments {
             for app in &apps {
                 let recording = self.recording_app().is_some_and(|r| r.exe == app.exe);
                 let label = if recording { format!("● {}", app.title) } else { app.title.clone() };
-                ui.label(label).on_hover_text(&app.exe);
+                // Window titles can be very long (a browser tab's, say).
+                ui.scope(|ui| {
+                    ui.set_max_width(220.0);
+                    ui.add(egui::Label::new(label).truncate()).on_hover_text(&app.exe);
+                });
                 let always = self.config.always_record.contains(&app.exe);
                 let never = self.config.never_record.contains(&app.exe);
                 if app.is_game {
@@ -648,7 +662,7 @@ impl Moments {
                             if thumbnail.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open").clicked() {
                                 opened = Some(ClipEditor::open(&ctx, clip));
                             }
-                            ui.label(clip.name.strip_prefix("sonar-rs ").unwrap_or(&clip.name));
+                            ui.label(clips::display_name(&clip.name));
                             ui.horizontal(|ui| {
                                 ui.weak(format!(
                                     "{} · {}",

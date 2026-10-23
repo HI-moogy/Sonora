@@ -467,7 +467,7 @@ impl Scaler {
 
     /// `luma` and `chroma` hold the NV12 planes (chroma interleaved), rows
     /// `pitch` bytes apart, at least the source size. Colors are BT.709
-    /// limited range, as sonar-rs records them.
+    /// limited range, as Sonora records them.
     fn nv12_to_rgba(&self, luma: &[u8], chroma: &[u8], pitch: usize) -> Vec<u8> {
         // Per output row: sum the source rows it covers column by column,
         // then turn those into running totals along the row, so any output

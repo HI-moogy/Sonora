@@ -1,5 +1,5 @@
 //! Decodes a clip with Windows' own MP4 demuxer and H.264/AAC decoders
-//! (independent of sonar-rs's writer) and reports what it finds: video frame
+//! (independent of Sonora's writer) and reports what it finds: video frame
 //! count and rate, and for each audio track its length, loudness (RMS) and
 //! dominant pitch (from zero crossings). Writes the frame nearest the middle
 //! to `<clip>.mid.bmp`.

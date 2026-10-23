@@ -20,7 +20,7 @@ use capture_engine::{decode_clip_audio, save_edited_clip, ClipAudio, ClipEdit, P
 use eframe::egui;
 
 use super::{format_duration, format_size, play, show_in_folder, ClipEntry};
-use crate::{BUS_COLORS, FIXED_BUSES};
+use crate::{theme, FIXED_BUSES};
 
 const SAMPLE_RATE: u64 = 48_000;
 const HNS_PER_SECOND: i64 = 10_000_000;
@@ -96,7 +96,7 @@ impl Row {
 
     fn color(&self) -> egui::Color32 {
         match self.role {
-            Role::Bus(_) => BUS_COLORS[self.track % BUS_COLORS.len()],
+            Role::Bus(_) => theme::channel_color(self.track),
             _ => DESKTOP_COLOR,
         }
     }
@@ -375,7 +375,7 @@ impl ClipEditor {
             if ui.button("← Clips").clicked() {
                 action = EditorAction::Close;
             }
-            ui.heading(self.name.strip_prefix("sonar-rs ").unwrap_or(&self.name));
+            ui.heading(crate::clips::display_name(&self.name));
             ui.weak(format!("{} · {}", format_duration(hns_to_duration(self.duration())), format_size(self.size)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Show in folder").clicked() {

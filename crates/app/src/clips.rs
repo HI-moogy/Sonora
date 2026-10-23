@@ -193,6 +193,12 @@ pub fn show_in_folder(path: &Path) {
     let _ = Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).spawn();
 }
 
+/// A clip's file name without the app name in front, for showing; clips
+/// saved before the rename start with "sonar-rs ".
+pub fn display_name(name: &str) -> &str {
+    name.strip_prefix("Sonora ").or_else(|| name.strip_prefix("sonar-rs ")).unwrap_or(name)
+}
+
 /// Opens `url` in the default browser.
 pub fn open_url(url: &str) {
     let _ = Command::new("explorer").arg(url).spawn();

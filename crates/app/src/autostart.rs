@@ -1,4 +1,4 @@
-//! Starting sonar-rs when you sign in to Windows: a value under the current
+//! Starting Sonora when you sign in to Windows: a value under the current
 //! user's `Run` key that launches it hidden in the tray.
 
 use windows::core::{w, Error, PCWSTR, Result};
@@ -8,12 +8,12 @@ use windows::Win32::System::Registry::{
 };
 
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const VALUE_NAME: PCWSTR = w!("sonar-rs");
+const VALUE_NAME: PCWSTR = w!("Sonora");
 
 /// Command-line flag for starting hidden in the tray, as at sign-in.
 pub const BACKGROUND_ARG: &str = "--background";
 
-/// The command that starts this sonar-rs.exe in the background.
+/// The command that starts this sonora.exe in the background.
 fn command() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     Some(format!("\"{}\" {BACKGROUND_ARG}", exe.display()))
@@ -23,7 +23,7 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Whether sonar-rs starts with Windows, from this location. A value left
+/// Whether Sonora starts with Windows, from this location. A value left
 /// by a copy elsewhere doesn't count, so turning it on points it here.
 pub fn is_enabled() -> bool {
     let mut buffer = [0u16; 1024];
@@ -66,4 +66,11 @@ pub fn set_enabled(enabled: bool) -> Result<()> {
             result => result.ok(),
         }
     }
+}
+
+/// Removes the Start with Windows entry left by sonar-rs (Sonora's old
+/// name), returning whether there was one, so it can be turned on again
+/// under the new name.
+pub fn take_legacy_entry() -> bool {
+    unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, w!("sonar-rs")) }.is_ok()
 }

@@ -11,7 +11,7 @@ const FALL_DB_PER_SECOND: f32 = 30.0;
 const PEAK_HOLD: Duration = Duration::from_millis(1000);
 /// Below this a meter counts as empty and stops asking for repaints.
 const SILENT: f32 = 0.001;
-const SIZE: egui::Vec2 = egui::vec2(90.0, 10.0);
+const SIZE: egui::Vec2 = egui::vec2(90.0, 6.0);
 /// Repaint rate while a meter is still moving.
 const MOVING_REPAINT: Duration = Duration::from_millis(33);
 
@@ -48,9 +48,10 @@ impl Ballistics {
     }
 }
 
-/// Draws a meter for `peak` (the peak since the previous frame). `key`
-/// identifies the meter across frames.
-pub fn level_meter(ui: &mut egui::Ui, key: impl std::hash::Hash + std::fmt::Debug, peak: f32) {
+/// What a meter shows this frame for `peak` (the peak since the previous
+/// frame): (level, held peak), both 0..1. `key` identifies the meter
+/// across frames.
+pub fn meter_levels(ui: &egui::Ui, key: impl std::hash::Hash + std::fmt::Debug, peak: f32) -> (f32, Option<f32>) {
     let id = egui::Id::unique(("level-meter", key));
     let now = Instant::now();
     let mut meter = ui.data_mut(|data| *data.get_temp_mut_or_insert_with(id, || Ballistics::new(now)));
@@ -59,17 +60,21 @@ pub fn level_meter(ui: &mut egui::Ui, key: impl std::hash::Hash + std::fmt::Debu
     if meter.is_moving() {
         ui.ctx().request_repaint_after(MOVING_REPAINT);
     }
+    (meter.shown, (meter.hold > SILENT).then_some(meter.hold))
+}
 
+/// Draws a horizontal meter for `peak` in `color`; see [`meter_levels`].
+pub fn level_meter(ui: &mut egui::Ui, key: impl std::hash::Hash + std::fmt::Debug, peak: f32, color: egui::Color32) {
+    let (shown, hold) = meter_levels(ui, key, peak);
     let (rect, _) = ui.allocate_exact_size(SIZE, egui::Sense::hover());
-    let visuals = ui.visuals();
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, visuals.extreme_bg_color);
+    painter.rect_filled(rect, 3.0, crate::theme::BG);
     let x_at = |level: f32| rect.left() + rect.width() * level;
-    let fill = egui::Rect::from_min_max(rect.min, egui::pos2(x_at(meter.shown), rect.bottom()));
-    painter.rect_filled(fill, 2.0, visuals.selection.bg_fill);
-    if meter.hold > SILENT {
-        let x = x_at(meter.hold).min(rect.right() - 1.0);
-        painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], egui::Stroke::new(2.0, visuals.strong_text_color()));
+    let fill = egui::Rect::from_min_max(rect.min, egui::pos2(x_at(shown), rect.bottom()));
+    painter.rect_filled(fill, 3.0, color);
+    if let Some(hold) = hold {
+        let x = x_at(hold).min(rect.right() - 1.0);
+        painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], egui::Stroke::new(2.0, crate::theme::TEXT));
     }
 }
 

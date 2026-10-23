@@ -1,4 +1,4 @@
-//! The notification-area (tray) icon. sonar-rs keeps routing audio and
+//! The notification-area (tray) icon. Sonora keeps routing audio and
 //! recording clips while its window is closed, so closing the window only
 //! hides it; the tray icon brings it back (left-click) or offers Open,
 //! Start with Windows and Quit (right-click).
@@ -99,7 +99,7 @@ fn run(on_command: Box<dyn Fn(TrayCommand) + Send>, ready_tx: mpsc::Sender<Resul
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance.unwrap_or_default().into(),
-            lpszClassName: w!("sonar-rs-tray"),
+            lpszClassName: w!("sonora-tray"),
             ..Default::default()
         };
         RegisterClassW(&class);
@@ -108,8 +108,8 @@ fn run(on_command: Box<dyn Fn(TrayCommand) + Send>, ready_tx: mpsc::Sender<Resul
         // receives Explorer's TaskbarCreated broadcast.
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
-            w!("sonar-rs-tray"),
-            w!("sonar-rs tray"),
+            w!("sonora-tray"),
+            w!("Sonora tray"),
             WS_OVERLAPPED,
             0,
             0,
@@ -187,7 +187,7 @@ unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM
 unsafe fn show_menu(window: HWND, state: &State) {
     let Ok(menu) = CreatePopupMenu() else { return };
     let autostart_flag = if autostart::is_enabled() { MF_CHECKED } else { MF_UNCHECKED };
-    let _ = AppendMenuW(menu, MF_STRING, MENU_OPEN, w!("Open sonar-rs"));
+    let _ = AppendMenuW(menu, MF_STRING, MENU_OPEN, w!("Open Sonora"));
     let _ = AppendMenuW(menu, MF_STRING | autostart_flag, MENU_AUTOSTART, w!("Start with Windows"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("Quit"));
@@ -213,7 +213,7 @@ fn add_icon(window: HWND) -> bool {
     data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     data.uCallbackMessage = CALLBACK_MESSAGE;
     data.hIcon = app_icon();
-    copy_into(&mut data.szTip, concat!("sonar-rs ", env!("CARGO_PKG_VERSION")));
+    copy_into(&mut data.szTip, concat!("Sonora ", env!("CARGO_PKG_VERSION")));
     let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool();
     if !data.hIcon.is_invalid() {
         // The shell keeps its own copy.
@@ -233,7 +233,7 @@ fn icon_data(window: HWND) -> NOTIFYICONDATAW {
     }
 }
 
-/// The small icon embedded in sonar-rs.exe.
+/// The small icon embedded in sonora.exe.
 fn app_icon() -> HICON {
     let mut small = HICON::default();
     if let Ok(exe) = std::env::current_exe() {
@@ -264,17 +264,17 @@ fn copy_into(field: &mut [u16], text: &str) {
 }
 
 /// Asks before quitting if that would leave apps almost silent: ones
-/// sonar-rs turned down that closed before it could turn them back up.
+/// Sonora turned down that closed before it could turn them back up.
 /// Windows only lets their volume be changed while they're open, so only a
-/// running sonar-rs can fix them. Returns whether to quit.
+/// running Sonora can fix them. Returns whether to quit.
 pub fn confirm_quit() -> bool {
     let apps = audio_engine::session_volume::turned_down_apps_not_running();
     if apps.is_empty() {
         return true;
     }
     let text = format!(
-        "These apps closed while sonar-rs had them turned down, and Windows will start them almost silent:\n\n{}\n\n\
-         sonar-rs turns them back up when it's running while they're open. Quit anyway?",
+        "These apps closed while Sonora had them turned down, and Windows will start them almost silent:\n\n{}\n\n\
+         Sonora turns them back up when it's running while they're open. Quit anyway?",
         apps.join("\n")
     );
     let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -282,7 +282,7 @@ pub fn confirm_quit() -> bool {
         MessageBoxW(
             None,
             PCWSTR(text.as_ptr()),
-            w!("Quit sonar-rs?"),
+            w!("Quit Sonora?"),
             MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND,
         )
     };

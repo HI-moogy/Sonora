@@ -23,7 +23,7 @@ const SILENCE: i16 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EditError {
-    #[error("not a clip sonar-rs can edit: {0}")]
+    #[error("not a clip Sonora can edit: {0}")]
     Unsupported(&'static str),
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -87,7 +87,7 @@ pub struct ClipEdit {
 }
 
 /// Where a clip's tracks are, from its MP4 header. Only the layout
-/// sonar-rs writes is accepted: one H.264 track without frame reordering,
+/// Sonora writes is accepted: one H.264 track without frame reordering,
 /// and 48 kHz stereo AAC tracks.
 pub(crate) struct Layout {
     pub video: u32,

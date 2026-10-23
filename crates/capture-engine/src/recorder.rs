@@ -99,7 +99,7 @@ pub struct Recorder {
 
 impl Recorder {
     /// `tracks` names the audio tracks fed through [`Recorder::audio_input`]
-    /// (for sonar-rs: the buses). Clips get those tracks in order, then
+    /// (for Sonora: the buses). Clips get those tracks in order, then
     /// [`DESKTOP_TRACK`], which the recorder captures itself.
     pub fn start(settings: VideoSettings, tracks: &[&str]) -> Result<Self, StartError> {
         let epoch = Instant::now();
@@ -471,7 +471,7 @@ fn save_to(dir: &Path, clip: &Clip) -> Result<PathBuf, SaveError> {
 fn unique_clip_path(dir: &Path) -> PathBuf {
     let t = unsafe { GetLocalTime() };
     let stem = format!(
-        "sonar-rs {:04}-{:02}-{:02} {:02}-{:02}-{:02}",
+        "Sonora {:04}-{:02}-{:02} {:02}-{:02}-{:02}",
         t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
     );
     let mut path = dir.join(format!("{stem}.mp4"));

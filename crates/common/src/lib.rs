@@ -29,7 +29,7 @@ impl Default for EqPreset {
     }
 }
 
-/// Everything sonar-rs remembers between runs (`config.json`). Each
+/// Everything Sonora remembers between runs (`config.json`). Each
 /// section loads on its own, so one unreadable section doesn't cost the
 /// others.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -155,7 +155,7 @@ pub struct MomentsConfig {
     pub fps: u32,
     /// Encoded height: 720, 1080, 1440 or 2160.
     pub height: u32,
-    /// `None` saves to the default folder (`Videos\sonar-rs`).
+    /// `None` saves to the default folder (`Videos\sonora`).
     pub clips_dir: Option<PathBuf>,
     /// Clip volume per track (bus name); a missing track is at 100%.
     pub track_volumes: HashMap<String, f32>,
@@ -213,10 +213,10 @@ impl Default for Hotkey {
     }
 }
 
-/// `%APPDATA%\sonar-rs`, where every sonar-rs settings file lives.
+/// `%APPDATA%\sonora`, where every Sonora settings file lives.
 pub fn config_dir() -> PathBuf {
     let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(base).join("sonar-rs")
+    PathBuf::from(base).join("sonora")
 }
 
 fn config_path() -> PathBuf {
@@ -228,7 +228,7 @@ fn legacy_config_path() -> PathBuf {
     config_dir().join("presets.json")
 }
 
-/// Apps whose own volume sonar-rs turned down to route them through the
+/// Apps whose own volume Sonora turned down to route them through the
 /// mixer, with the volume each had before (keyed by lowercase executable
 /// name). Kept on disk so a crash can't leave an app near-silent: Windows
 /// remembers per-app volumes, so the next run restores leftovers.
@@ -430,7 +430,7 @@ mod tests {
 
     /// A fresh, empty folder for one test's settings files.
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("sonar-rs-config-test-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sonora-config-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

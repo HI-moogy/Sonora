@@ -4,7 +4,7 @@ version = "0.1.0-alpha.1"
 edition.workspace = true
 
 [[bin]]
-name = "sonar-rs"
+name = "sonora"
 path = "src/main.rs"
 
 [dependencies]

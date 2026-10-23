@@ -9,7 +9,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, GetWindowThreadProcessId};
 
 /// The main window's title; also how a second launch finds the first window.
-pub const WINDOW_TITLE: &str = "sonar-rs";
+pub const WINDOW_TITLE: &str = "Sonora";
 
 /// Held for the process lifetime. Two mixers would capture and mute the same
 /// app sessions and fight over them, so only one instance may run.
@@ -26,7 +26,7 @@ impl Drop for InstanceLock {
 /// Returns the lock if this is the only running instance; otherwise brings
 /// the existing instance's window to the front and returns `None`.
 pub fn acquire() -> Option<InstanceLock> {
-    let handle = unsafe { CreateMutexW(None, false, w!("Local\\sonar-rs-single-instance")) }.ok()?;
+    let handle = unsafe { CreateMutexW(None, false, w!("Local\\sonora-single-instance")) }.ok()?;
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         unsafe {
             let _ = CloseHandle(handle);

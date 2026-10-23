@@ -21,12 +21,16 @@ mod hotkey;
 mod meter;
 mod moments;
 mod noise;
+mod rename;
 mod setup;
 mod single_instance;
 mod sounds;
+mod strip;
+mod theme;
 mod tray;
 
 use meter::level_meter;
+use strip::Strip;
 use moments::Moments;
 use setup::MixerPersistence;
 use tray::{Tray, TrayCommand};
@@ -34,15 +38,6 @@ use tray::{Tray, TrayCommand};
 /// The five channels always shown as faders, matching SteelSeries Sonar's
 /// own channel naming plus a dedicated Mic channel.
 const FIXED_BUSES: &[&str] = &["Game", "Chat", "Aux", "Media", "Mic"];
-// Placeholder palette — not final, just enough to tell faders apart.
-const BUS_COLORS: [egui::Color32; 5] = [
-    egui::Color32::from_rgb(90, 170, 230),
-    egui::Color32::from_rgb(220, 90, 90),
-    egui::Color32::from_rgb(90, 110, 200),
-    egui::Color32::from_rgb(230, 200, 140),
-    egui::Color32::from_rgb(230, 150, 80),
-];
-
 const SESSION_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
 const DEVICE_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 /// How often to retry restoring apps a crashed run left turned down, for
@@ -190,6 +185,227 @@ impl MixerApp {
         sessions.sort_by_key(|s| s.pid);
         sessions.dedup_by_key(|s| s.pid);
         self.available_sessions = sessions;
+    }
+
+    fn channel_color(&self, bus: &str) -> egui::Color32 {
+        let index = FIXED_BUSES.iter().position(|b| *b == bus).unwrap_or(0);
+        self.persistence.bus_color(bus).unwrap_or(theme::channel_color(index))
+    }
+
+    /// Everything in a channel's settings panel, in sections.
+    #[allow(clippy::too_many_arguments)]
+    fn channel_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        selected: &str,
+        bus: &audio_engine::BusInfo,
+        sources: &[audio_engine::SourceInfo],
+        mic_already_added: bool,
+        active_pids: &HashSet<u32>,
+        color: egui::Color32,
+    ) {
+        if selected == "Mic" {
+            theme::section(ui, "Microphone");
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                // The Mic channel's device is the microphone it records.
+                let mic = sources.iter().find(|s| s.pid.is_none());
+                ui.horizontal(|ui| {
+                    ui.label("Microphone");
+                    let current = mic.and_then(|m| m.input_device.as_deref());
+                    let none_label = if mic.is_some() { "System default" } else { "Not added" };
+                    if let Some(picked) = device_choice(ui, "input-device", &self.input_devices, current, none_label) {
+                        let result = match mic {
+                            Some(mic) => self.mixer.set_mic_device(mic.id, picked),
+                            None => self.mixer.add_mic_source("Microphone", "Mic", picked),
+                        };
+                        self.status = result.err().map(|e| format!("Couldn't open that microphone: {}", e.message()));
+                    }
+                });
+                if !mic_already_added && ui.add(theme::primary_button("Add my microphone")).clicked() {
+                    let result = self.mixer.add_mic_source("Microphone", "Mic", None);
+                    self.status = result.err().map(|e| format!("Couldn't open the microphone: {}", e.message()));
+                }
+                self.voice_send_ui(ui, selected, bus);
+                let mut monitor = bus.monitor;
+                if ui
+                    .checkbox(&mut monitor, "Listen to my mic")
+                    .on_hover_text(
+                        "Plays your voice back to you, with its EQ and noise removal, to check how you sound. \
+                         Only you hear this copy. Turn it off when you're done.",
+                    )
+                    .changed()
+                {
+                    self.mixer.set_bus_monitor(selected, monitor);
+                }
+            });
+            theme::section(ui, "Noise removal");
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                noise::noise_controls(ui, self.mixer.mic_cleanup(), mic_already_added);
+            });
+        } else {
+            theme::section(ui, "Output");
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label("Plays on");
+                    let current = bus.device_id.as_deref();
+                    if let Some(picked) = device_choice(ui, "output-device", &self.output_devices, current, "System default") {
+                        self.mixer.set_bus_device(selected, picked);
+                    }
+                });
+                if bus.device_id.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.label("If it disconnects");
+                        let mut fallback = bus.fallback_to_default;
+                        egui::ComboBox::from_id_salt("disconnect-choice")
+                            .selected_text(if fallback { "Play on default output" } else { "Go silent" })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut fallback, true, "Play on default output");
+                                ui.selectable_value(&mut fallback, false, "Go silent");
+                            });
+                        if fallback != bus.fallback_to_default {
+                            self.mixer.set_bus_fallback(selected, fallback);
+                        }
+                    });
+                }
+                self.priority_row(ui, selected, bus);
+            });
+        }
+        if selected == "Mic" {
+            theme::section(ui, "Delay");
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.priority_row(ui, selected, bus);
+            });
+        }
+
+        theme::section(ui, "EQ");
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            eq_preset_controls(ui, &self.mixer, selected, bus.eq_gains_db, &mut self.eq_presets);
+            eq_controls(ui, &self.mixer, selected, bus.eq_gains_db);
+        });
+
+        if selected == "Mic" {
+            return;
+        }
+        theme::section(ui, "Apps in this channel");
+        let mine: Vec<&audio_engine::SourceInfo> = sources.iter().filter(|s| s.bus == selected && s.pid.is_some()).collect();
+        // A saved app with one copy already here (a second Discord, say)
+        // isn't listed again as waiting.
+        let here: Vec<String> = mine
+            .iter()
+            .filter_map(|s| audio_engine::process_executable_name(s.pid?))
+            .map(|exe| exe.to_lowercase())
+            .collect();
+        let waiting: Vec<String> = self
+            .persistence
+            .waiting_apps(selected)
+            .filter(|app| !here.iter().any(|exe| exe == app))
+            .map(str::to_string)
+            .collect();
+        if mine.is_empty() && waiting.is_empty() {
+            ui.label(egui::RichText::new("None yet. Add one below.").color(theme::TEXT_MUTED));
+        }
+        for source in mine {
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(app_label(&source.name)).strong())
+                        .on_hover_text(format!("{} (process {})", source.name, source.pid.unwrap_or_default()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Button::new("Remove").small()).clicked() {
+                            self.mixer.remove_source(source.id);
+                        }
+                        level_meter(ui, ("source", source.id), source.level, color);
+                    });
+                });
+                ui.horizontal(|ui| {
+                    let mut muted = source.muted;
+                    if ui.checkbox(&mut muted, "Mute").changed() {
+                        self.mixer.set_source_muted(source.id, muted);
+                    }
+                    let mut gain = source.gain;
+                    if ui
+                        .add(egui::Slider::new(&mut gain, 0.0..=2.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)))
+                        .changed()
+                    {
+                        self.mixer.set_source_gain(source.id, gain);
+                    }
+                });
+            });
+        }
+        for app in waiting {
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(capitalized(app_label(&app))).strong());
+                    ui.label(egui::RichText::new("joins when it starts").small().color(theme::TEXT_MUTED));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Button::new("Remove").small()).clicked() {
+                            self.persistence.forget_waiting_app(selected, &app);
+                        }
+                    });
+                });
+            });
+        }
+
+        theme::section(ui, "Add an app");
+        let addable: Vec<&AvailableSession> =
+            self.available_sessions.iter().filter(|s| !active_pids.contains(&s.pid)).collect();
+        if addable.is_empty() {
+            ui.label(egui::RichText::new("No other apps are playing sound right now.").color(theme::TEXT_MUTED));
+        }
+        let mut add = None;
+        for session in addable {
+            ui.horizontal(|ui| {
+                ui.label(app_label(&session.name)).on_hover_text(format!("{} (process {})", session.name, session.pid));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new("Add").small()).clicked() {
+                        add = Some((session.pid, session.name.clone()));
+                    }
+                });
+            });
+        }
+        if let Some((pid, name)) = add {
+            if let Err(error) = self.mixer.add_source(pid, name, selected.to_string()) {
+                self.status = Some(format!("Couldn't add that app: {}", error.message()));
+            }
+        }
+    }
+
+    fn priority_row(&mut self, ui: &mut egui::Ui, selected: &str, bus: &audio_engine::BusInfo) {
+        ui.horizontal(|ui| {
+            ui.label("Priority");
+            let mut priority = bus.priority;
+            let label = |p: Priority| match p {
+                Priority::High => "High (least delay)",
+                Priority::Normal => "Normal",
+                Priority::Low => "Low (smoothest)",
+            };
+            egui::ComboBox::from_id_salt("priority-choice")
+                .selected_text(label(priority))
+                .show_ui(ui, |ui| {
+                    for p in [Priority::High, Priority::Normal, Priority::Low] {
+                        ui.selectable_value(&mut priority, p, label(p));
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "How much delay this channel may have. High keeps it as small as it can (for games \
+                     and voice); Low leaves room so it never crackles when your PC is busy (for music \
+                     and video). If a High channel crackles, try Normal.",
+                );
+            if priority != bus.priority {
+                self.mixer.set_bus_priority(selected, priority);
+            }
+            ui.label(egui::RichText::new(format!("~{:.0} ms", bus.delay_ms)).color(theme::TEXT_MUTED)).on_hover_text(
+                "Sonora's own delay for this channel. For apps, Windows adds about 45 ms more \
+                 before Sonora gets their sound (measured on this PC).",
+            );
+        });
     }
 
     /// Where the Mic channel sends your processed voice: a virtual cable
@@ -402,6 +618,23 @@ fn eq_controls(ui: &mut egui::Ui, mixer: &Mixer, bus_name: &str, gains_db: [f32;
     });
 }
 
+/// `name` with its first letter in capitals ("discord" -> "Discord"), for
+/// names that come from lowercase executable names.
+fn capitalized(name: &str) -> String {
+    let mut chars = name.chars();
+    chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
+}
+
+/// An app's name for showing: its executable name without ".exe".
+fn app_label(name: &str) -> &str {
+    let len = name.len();
+    if len > 4 && name[len - 4..].eq_ignore_ascii_case(".exe") {
+        &name[..len - 4]
+    } else {
+        name
+    }
+}
+
 /// Whether an output device is a virtual cable whose other end apps can
 /// record from (VB-Audio Virtual Cable's input side).
 fn is_virtual_cable(name: &str) -> bool {
@@ -446,7 +679,7 @@ impl eframe::App for MixerApp {
                 tray::hide_main_window();
                 if !self.tray_hint_shown {
                     tray.notify(
-                        "sonar-rs is still running",
+                        "Sonora is still running",
                         "It keeps routing audio and recording clips. Right-click its tray icon to quit.",
                     );
                     self.tray_hint_shown = true;
@@ -492,20 +725,49 @@ impl eframe::App for MixerApp {
             IDLE_REPAINT_INTERVAL
         });
 
-        egui::Panel::top("tabs").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Mixer, "Mixer");
-                ui.selectable_value(&mut self.tab, Tab::Clips, "Clips");
-            });
-            if !self.config_notices.is_empty() {
+        egui::Panel::top("header")
+            .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(18, 10)))
+            .show_separator_line(false)
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(egui::Color32::from_rgb(230, 170, 60), self.config_notices.join(" "));
-                    if ui.small_button("Dismiss").clicked() {
-                        self.config_notices.clear();
+                    ui.label(egui::RichText::new("Sonora").size(21.0).strong().color(theme::TEXT));
+                    ui.label(egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).small().color(theme::TEXT_MUTED));
+                    ui.add_space(18.0);
+                    for (tab, label) in [(Tab::Mixer, "Mixer"), (Tab::Clips, "Clips")] {
+                        let selected = self.tab == tab;
+                        let text = egui::RichText::new(label).size(14.5);
+                        let button = if selected {
+                            theme::primary_button(label).min_size(egui::vec2(76.0, 30.0))
+                        } else {
+                            egui::Button::new(text.color(theme::TEXT_MUTED)).frame(false).min_size(egui::vec2(76.0, 30.0))
+                        };
+                        if ui.add(button).clicked() {
+                            self.tab = tab;
+                        }
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        level_meter(ui, "master", master_level, theme::ACCENT);
+                        let mut gain = self.mixer.master_gain();
+                        ui.label(egui::RichText::new(format!("{:.0}%", gain * 100.0)).color(theme::TEXT_MUTED));
+                        if ui
+                            .add(egui::Slider::new(&mut gain, 0.0..=2.0).show_value(false))
+                            .on_hover_text("Everything you hear. Doesn't change your voice sent to Discord and games.")
+                            .changed()
+                        {
+                            self.mixer.set_master_gain(gain);
+                        }
+                        ui.label(egui::RichText::new("Master").strong());
+                    });
                 });
-            }
-        });
+                if !self.config_notices.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(theme::WARNING, self.config_notices.join(" "));
+                        if ui.small_button("Dismiss").clicked() {
+                            self.config_notices.clear();
+                        }
+                    });
+                }
+            });
         if self.tab == Tab::Clips {
             self.moments.tab(ui, &self.mixer);
             return;
@@ -514,207 +776,94 @@ impl eframe::App for MixerApp {
         let mic_already_added = sources.iter().any(|s| s.pid.is_none());
         let active_pids: HashSet<u32> = sources.iter().filter_map(|s| s.pid).collect();
 
-        // --- Detail panel for the selected channel (device, EQ, app routing) ---
+        // --- Settings for the selected channel (device, EQ, apps) ---
         if let Some(selected) = self.selected_bus.clone() {
-            egui::Panel::right("bus_detail").min_size(380.0).show(ui, |ui| {
-                ui.heading(&selected);
-                if let Some(status) = &self.status {
-                    ui.colored_label(egui::Color32::from_rgb(230, 100, 100), status);
-                }
-                ui.separator();
-
-                let Some(bus) = buses.iter().find(|b| b.name == selected) else {
-                    return;
-                };
-
-                if selected == "Mic" {
-                    // The Mic channel's device is the microphone it records.
-                    let mic = sources.iter().find(|s| s.pid.is_none());
+            let color = self.channel_color(&selected);
+            egui::Panel::right("bus_detail")
+                .min_size(400.0)
+                .default_size(430.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::SURFACE)
+                        .inner_margin(egui::Margin::same(16))
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+                )
+                .show(ui, |ui| {
+                    let Some(bus) = buses.iter().find(|b| b.name == selected) else {
+                        return;
+                    };
                     ui.horizontal(|ui| {
-                        ui.strong("Input device");
-                        let current = mic.and_then(|m| m.input_device.as_deref());
-                        let none_label = if mic.is_some() { "System Default" } else { "Not added" };
-                        if let Some(picked) = device_choice(ui, "input-device", &self.input_devices, current, none_label) {
-                            let result = match mic {
-                                Some(mic) => self.mixer.set_mic_device(mic.id, picked),
-                                None => self.mixer.add_mic_source("Microphone", "Mic", picked),
-                            };
-                            self.status = result.err().map(|e| format!("Couldn't open that microphone: {}", e.message()));
-                        }
-                    });
-                    self.voice_send_ui(ui, &selected, bus);
-                    let mut monitor = bus.monitor;
-                    if ui
-                        .checkbox(&mut monitor, "Listen to my mic")
-                        .on_hover_text(
-                            "Plays your voice back to you, with its EQ and noise removal, to check how you sound. \
-                             Only you hear this copy. Turn it off when you're done.",
-                        )
-                        .changed()
-                    {
-                        self.mixer.set_bus_monitor(&selected, monitor);
-                    }
-                    noise::noise_controls(ui, self.mixer.mic_cleanup(), mic.is_some());
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.strong("Output device");
-                        let current = bus.device_id.as_deref();
-                        if let Some(picked) = device_choice(ui, "output-device", &self.output_devices, current, "System Default") {
-                            self.mixer.set_bus_device(&selected, picked);
-                        }
-                    });
-                    if bus.device_id.is_some() {
-                        ui.horizontal(|ui| {
-                            ui.label("If it disconnects");
-                            let mut fallback = bus.fallback_to_default;
-                            egui::ComboBox::from_id_salt("disconnect-choice")
-                                .selected_text(if fallback { "Play on default output" } else { "Go silent" })
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut fallback, true, "Play on default output");
-                                    ui.selectable_value(&mut fallback, false, "Go silent");
-                                });
-                            if fallback != bus.fallback_to_default {
-                                self.mixer.set_bus_fallback(&selected, fallback);
+                        let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 6.0, color);
+                        ui.heading(&selected);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(egui::Button::new("✕").frame(false)).on_hover_text("Close").clicked() {
+                                self.selected_bus = None;
                             }
                         });
+                    });
+                    if let Some(status) = &self.status {
+                        ui.colored_label(theme::DANGER, status);
                     }
-                }
-                ui.horizontal(|ui| {
-                    ui.label("Priority");
-                    let mut priority = bus.priority;
-                    let label = |p: Priority| match p {
-                        Priority::High => "High (least delay)",
-                        Priority::Normal => "Normal",
-                        Priority::Low => "Low (smoothest)",
-                    };
-                    egui::ComboBox::from_id_salt("priority-choice")
-                        .selected_text(label(priority))
-                        .show_ui(ui, |ui| {
-                            for p in [Priority::High, Priority::Normal, Priority::Low] {
-                                ui.selectable_value(&mut priority, p, label(p));
-                            }
-                        })
-                        .response
-                        .on_hover_text(
-                            "How much delay this channel may have. High keeps it as small as it can (for games \
-                             and voice); Low leaves room so it never crackles when your PC is busy (for music \
-                             and video). If a High channel crackles, try Normal.",
-                        );
-                    if priority != bus.priority {
-                        self.mixer.set_bus_priority(&selected, priority);
-                    }
-                    ui.weak(format!("~{:.0} ms", bus.delay_ms)).on_hover_text(
-                        "sonar-rs's own delay for this channel. For apps, Windows adds about 45 ms more \
-                         before sonar-rs gets their sound (measured on this PC).",
-                    );
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        self.channel_settings(ui, &selected, bus, &sources, mic_already_added, &active_pids, color);
+                    });
                 });
-                ui.separator();
-
-                egui::CollapsingHeader::new("EQ").default_open(true).show(ui, |ui| {
-                    eq_preset_controls(ui, &self.mixer, &selected, bus.eq_gains_db, &mut self.eq_presets);
-                    eq_controls(ui, &self.mixer, &selected, bus.eq_gains_db);
-                });
-                ui.separator();
-
-                if selected == "Mic" && !mic_already_added {
-                    if ui.button("Add Microphone").clicked() {
-                        let result = self.mixer.add_mic_source("Microphone", "Mic", None);
-                        self.status = result.err().map(|e| format!("Couldn't open the microphone: {}", e.message()));
-                    }
-                    ui.separator();
-                }
-
-                ui.strong("Apps using this");
-                for source in sources.iter().filter(|s| s.bus == selected) {
-                    ui.horizontal(|ui| {
-                        let pid_label = source.pid.map(|p| p.to_string()).unwrap_or_else(|| "mic".into());
-                        ui.label(format!("{} ({pid_label})", source.name));
-                        let mut muted = source.muted;
-                        if ui.checkbox(&mut muted, "mute").changed() {
-                            self.mixer.set_source_muted(source.id, muted);
-                        }
-                        let mut gain = source.gain;
-                        if ui.add(egui::Slider::new(&mut gain, 0.0..=2.0)).changed() {
-                            self.mixer.set_source_gain(source.id, gain);
-                        }
-                        level_meter(ui, ("source", source.id), source.level);
-                        if ui.button("Remove").clicked() {
-                            self.mixer.remove_source(source.id);
-                        }
-                    });
-                }
-                let waiting: Vec<String> = self.persistence.waiting_apps(&selected).map(str::to_string).collect();
-                for app in waiting {
-                    ui.horizontal(|ui| {
-                        ui.label(&app);
-                        ui.weak("not running · routed when it starts");
-                        if ui.button("Remove").clicked() {
-                            self.persistence.forget_waiting_app(&selected, &app);
-                        }
-                    });
-                }
-
-                ui.separator();
-                ui.strong("Apps not using this");
-                for session in &self.available_sessions {
-                    if active_pids.contains(&session.pid) {
-                        continue;
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{} ({})", session.name, session.pid));
-                        if ui.button("Add").clicked() {
-                            let _ = self.mixer.add_source(session.pid, session.name.clone(), selected.clone());
-                        }
-                    });
-                }
-            });
+            if self.selected_bus.is_none() {
+                ui.ctx().request_repaint();
+            }
         }
 
-        // --- Main fader bank ---
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading(concat!("sonar-rs ", env!("CARGO_PKG_VERSION")));
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                ui.strong("Master");
-                let mut gain = self.mixer.master_gain();
-                if ui.add(egui::Slider::new(&mut gain, 0.0..=2.0).text("gain")).changed() {
-                    self.mixer.set_master_gain(gain);
-                }
-                level_meter(ui, "master", master_level);
-            });
-            ui.add_space(24.0);
-
-            ui.horizontal(|ui| {
-                for (i, &bus_name) in FIXED_BUSES.iter().enumerate() {
-                    let bus = buses.iter().find(|b| b.name == bus_name);
-                    let mut gain = bus.map(|b| b.gain).unwrap_or(1.0);
-                    let level = bus.map(|b| b.level).unwrap_or(0.0);
-                    let color = self.persistence.bus_color(bus_name).unwrap_or(BUS_COLORS[i % BUS_COLORS.len()]);
-
-                    ui.vertical(|ui| {
-                        ui.set_width(70.0);
-                        egui::Frame::new().fill(color.gamma_multiply(0.35)).inner_margin(6.0).show(ui, |ui| {
-                            ui.vertical_centered(|ui| {
-                                // Vertical sliders already put the start of the
-                                // range at the bottom: louder is up.
-                                let slider = egui::Slider::new(&mut gain, 0.0..=2.0)
-                                    .vertical()
-                                    .show_value(false);
-                                if ui.add_sized([36.0, 180.0], slider).changed() {
-                                    self.mixer.set_bus_gain(bus_name, gain);
-                                }
-                                level_meter(ui, ("bus", bus_name), level);
-                                let selected = self.selected_bus.as_deref() == Some(bus_name);
-                                if ui.selectable_label(selected, bus_name).clicked() {
-                                    self.selected_bus = Some(bus_name.to_string());
-                                }
-                            });
-                        });
+        // --- Channel strips ---
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(20)))
+            .show(ui, |ui| {
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        for &bus_name in FIXED_BUSES {
+                            let bus = buses.iter().find(|b| b.name == bus_name);
+                            let app_count = sources.iter().filter(|s| s.bus == bus_name && s.pid.is_some()).count();
+                            let detail = match bus_name {
+                                "Mic" if !mic_already_added => "No mic added".to_string(),
+                                "Mic" if bus.is_some_and(|b| b.heard) => "Voice sent".to_string(),
+                                "Mic" => "Voice not sent".to_string(),
+                                _ => match app_count {
+                                    0 => "No apps".to_string(),
+                                    1 => "1 app".to_string(),
+                                    n => format!("{n} apps"),
+                                },
+                            };
+                            let response = Strip {
+                                name: bus_name,
+                                color: self.channel_color(bus_name),
+                                gain: bus.map_or(1.0, |b| b.gain),
+                                muted: bus.is_some_and(|b| b.muted),
+                                peak: bus.map_or(0.0, |b| b.level),
+                                detail,
+                                selected: self.selected_bus.as_deref() == Some(bus_name),
+                            }
+                            .show(ui);
+                            if response.selected {
+                                self.selected_bus = Some(bus_name.to_string());
+                            }
+                            if let Some(gain) = response.gain {
+                                self.mixer.set_bus_gain(bus_name, gain);
+                            }
+                            if response.toggle_mute {
+                                self.mixer.set_bus_muted(bus_name, !bus.is_some_and(|b| b.muted));
+                            }
+                        }
                     });
-                }
+                    if self.selected_bus.is_none() {
+                        ui.add_space(16.0);
+                        ui.label(
+                            egui::RichText::new("Click a channel to choose where it plays, its EQ, and which apps go in it.")
+                                .color(theme::TEXT_MUTED),
+                        );
+                    }
+                });
             });
-        });
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -726,13 +875,15 @@ fn main() -> eframe::Result<()> {
     let Some(_instance) = single_instance::acquire() else {
         return Ok(());
     };
+    let rename_notes = rename::move_from_sonar_rs();
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
         .expect("bundled icon.png is a valid PNG");
     // Started at sign-in: stay in the tray until opened.
     let background = std::env::args().any(|arg| arg == autostart::BACKGROUND_ARG);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 700.0])
+            .with_inner_size([1180.0, 760.0])
+            .with_min_inner_size([760.0, 560.0])
             .with_visible(!background)
             .with_icon(icon),
         ..Default::default()
@@ -741,7 +892,9 @@ fn main() -> eframe::Result<()> {
         single_instance::WINDOW_TITLE,
         options,
         Box::new(|cc| {
-            let app = MixerApp::new(&cc.egui_ctx, background).expect("failed to start audio mixer");
+            theme::apply(&cc.egui_ctx);
+            let mut app = MixerApp::new(&cc.egui_ctx, background).expect("failed to start audio mixer");
+            app.config_notices.extend(rename_notes);
             Ok(Box::new(app))
         }),
     )

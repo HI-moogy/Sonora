@@ -120,7 +120,7 @@ pub fn clip_duration(path: &std::path::Path) -> Option<std::time::Duration> {
     Some(reader.duration())
 }
 
-/// `Videos\sonar-rs`, the default place clips are saved.
+/// `Videos\sonora`, the default place clips are saved.
 pub fn default_clips_dir() -> PathBuf {
     let videos = unsafe { SHGetKnownFolderPath(&FOLDERID_Videos, KF_FLAG_DEFAULT, None) }
         .ok()
@@ -131,5 +131,5 @@ pub fn default_clips_dir() -> PathBuf {
         })
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default()).join("Videos"));
-    videos.join("sonar-rs")
+    videos.join("sonora")
 }

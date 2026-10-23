@@ -22,7 +22,7 @@ const MODES: [(NoiseSuppression, &str, &str); 4] = [
 pub fn noise_controls(ui: &mut egui::Ui, cleanup: &MicCleanup, has_mic: bool) {
     let mode = cleanup.mode();
     ui.horizontal(|ui| {
-        ui.strong("Noise removal");
+        ui.label("Strength");
         for (choice, label, help) in MODES {
             if ui.selectable_label(mode == choice, label).on_hover_text(help).clicked() {
                 cleanup.set_mode(choice);
