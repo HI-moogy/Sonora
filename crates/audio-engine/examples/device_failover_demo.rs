@@ -22,6 +22,16 @@ use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 
 const BUS: &str = "Aux";
 
+/// The tone's child process, stopped however the demo ends.
+struct Tone(std::process::Child);
+
+impl Drop for Tone {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Plays the quiet tone until killed (run as the child process).
 fn play_tone() -> windows::core::Result<()> {
     let (client, render) = open_render_client_for_device(None, &standard_format())?;
@@ -147,7 +157,7 @@ fn main() -> windows::core::Result<()> {
         .expect("no active output device with that name");
     println!("test device: {}", device.name);
 
-    let mut tone = std::process::Command::new(std::env::current_exe().unwrap())
+    let tone = Tone(std::process::Command::new(std::env::current_exe().unwrap()).arg("--tone").spawn().unwrap());
         .arg("--tone")
         .spawn()
         .unwrap();
@@ -155,7 +165,7 @@ fn main() -> windows::core::Result<()> {
     let mixer = Mixer::start()?;
     mixer.ensure_bus(BUS);
     mixer.set_bus_device(BUS, Some(device.id.clone()));
-    mixer.add_source(tone.id(), "tone", BUS)?;
+    mixer.add_source(tone.0.id(), "tone", BUS)?;
 
     report(&mixer, "on test device", 3);
     match take_exclusive(&device.id) {
@@ -166,8 +176,8 @@ fn main() -> windows::core::Result<()> {
         }
         Err(error) => println!("couldn't take the device over in exclusive mode: {error}"),
     }
+    // Restore the tone's volume before stopping it.
     drop(mixer);
-    let _ = tone.kill();
-    let _ = tone.wait();
+    drop(tone);
     Ok(())
 }
