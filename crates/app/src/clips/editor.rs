@@ -20,6 +20,7 @@ use capture_engine::{decode_clip_audio, save_edited_clip, ClipAudio, ClipEdit, P
 use eframe::egui;
 
 use super::{format_duration, format_size, play, show_in_folder, ClipEntry};
+use crate::icons::{icon_button, Icon};
 use crate::{theme, FIXED_BUSES};
 
 const SAMPLE_RATE: u64 = 48_000;
@@ -40,12 +41,15 @@ const MAX_VOLUME: f32 = 2.0;
 const DESKTOP_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 150, 160);
 const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 100, 100);
 
-const LABEL_WIDTH: f32 = 200.0;
+const LABEL_WIDTH: f32 = 210.0;
 /// Narrower than this, the save buttons go on a row below the transport so
 /// the two don't overlap.
 const ONE_ROW_CONTROLS_WIDTH: f32 = 900.0;
+/// Width of the four play buttons and the gaps between them.
+const TRANSPORT_WIDTH: f32 = 38.0 * 3.0 + 46.0 + 8.0 * 3.0;
 const RULER_HEIGHT: f32 = 22.0;
-const ROW_HEIGHT: f32 = 46.0;
+/// Tall enough for a track's name above its volume slider.
+const ROW_HEIGHT: f32 = 60.0;
 const ROW_GAP: f32 = 6.0;
 
 /// What a clip's audio track holds, from its position (see the module docs).
@@ -392,7 +396,7 @@ impl ClipEditor {
         ui.separator();
 
         let timeline_height = RULER_HEIGHT + self.rows.len().max(1) as f32 * (ROW_HEIGHT + ROW_GAP) + 8.0;
-        let controls_height = if ui.available_width() >= ONE_ROW_CONTROLS_WIDTH { 40.0 } else { 76.0 };
+        let controls_height = if ui.available_width() >= ONE_ROW_CONTROLS_WIDTH { 44.0 } else { 80.0 };
         let video_height = (ui.available_height() - timeline_height - controls_height - 16.0).max(120.0);
         self.video_ui(ui, video_height);
         ui.add_space(4.0);
@@ -427,18 +431,25 @@ impl ClipEditor {
         }
     }
 
+    /// The time on the left, play controls in the middle, saving on the
+    /// right; on a narrow window, saving goes on a second line.
     fn controls_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if ui.available_width() >= ONE_ROW_CONTROLS_WIDTH {
-            ui.horizontal(|ui| {
-                ui.set_min_height(32.0);
-                self.transport_ui(ui);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.save_ui(ui, ctx));
-            });
+        let one_row = ui.available_width() >= ONE_ROW_CONTROLS_WIDTH;
+        let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::hover());
+        let position = self.position().min(self.duration());
+        let mut left = ui.new_child(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        left.label(
+            egui::RichText::new(format!("{} / {}", format_duration_precise(position), format_duration_precise(self.duration())))
+                .monospace()
+                .color(theme::TEXT_MUTED),
+        );
+        let transport = egui::Rect::from_center_size(row.center(), egui::vec2(TRANSPORT_WIDTH, row.height()));
+        let mut middle = ui.new_child(egui::UiBuilder::new().max_rect(transport).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        self.transport_ui(&mut middle);
+        if one_row {
+            let mut right = ui.new_child(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::right_to_left(egui::Align::Center)));
+            self.save_ui(&mut right, ctx);
         } else {
-            ui.horizontal(|ui| {
-                ui.set_min_height(32.0);
-                self.transport_ui(ui);
-            });
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), 28.0),
                 egui::Layout::right_to_left(egui::Align::Center),
@@ -447,29 +458,22 @@ impl ClipEditor {
         }
     }
 
-    /// Position, then seek and play buttons.
+    /// Back to the start, back 5 s, play/pause, forward 5 s.
     fn transport_ui(&mut self, ui: &mut egui::Ui) {
         let ready = self.player.is_some();
         let position = self.position().min(self.duration());
-        ui.monospace(format!(
-            "{} / {}",
-            format_duration_precise(position),
-            format_duration_precise(self.duration())
-        ));
-        ui.add_space(12.0);
-        let big = |text: &str| egui::Button::new(egui::RichText::new(text).size(18.0)).min_size(egui::vec2(36.0, 30.0));
-        if ui.add_enabled(ready, big("⏮")).on_hover_text("Back to the start").clicked() {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        if icon_button(ui, Icon::ToStart, false, ready).on_hover_text("Back to the start").clicked() {
             self.seek(0);
         }
-        if ui.add_enabled(ready, big("⏪")).on_hover_text("Back 5 seconds").clicked() {
+        if icon_button(ui, Icon::Back, false, ready).on_hover_text("Back 5 seconds").clicked() {
             self.seek(position - SKIP.as_nanos() as i64 / 100);
         }
-        let playing = self.is_playing();
-        let play_pause = big(if playing { "⏸" } else { "▶" });
-        if ui.add_enabled(ready, play_pause).on_hover_text("Play / pause (Space)").clicked() {
+        let icon = if self.is_playing() { Icon::Pause } else { Icon::Play };
+        if icon_button(ui, icon, true, ready).on_hover_text("Play / pause (Space)").clicked() {
             self.toggle_play();
         }
-        if ui.add_enabled(ready, big("⏩")).on_hover_text("Forward 5 seconds").clicked() {
+        if icon_button(ui, Icon::Forward, false, ready).on_hover_text("Forward 5 seconds").clicked() {
             self.seek(position + SKIP.as_nanos() as i64 / 100);
         }
     }
@@ -570,15 +574,23 @@ impl ClipEditor {
             let lane = egui::Rect::from_min_max(egui::pos2(lanes.left(), top), egui::pos2(lanes.right(), top + ROW_HEIGHT));
             let color = row.color();
 
-            painter.rect_filled(label_rect, 4.0, visuals.faint_bg_color);
-            let mut label_ui = ui.new_child(egui::UiBuilder::new().max_rect(label_rect.shrink2(egui::vec2(8.0, 3.0))));
+            painter.rect_filled(label_rect, 6.0, theme::CARD);
+            painter.rect_filled(
+                egui::Rect::from_min_size(label_rect.min, egui::vec2(3.0, label_rect.height())),
+                egui::CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 },
+                color,
+            );
+            let mut label_ui = ui.new_child(egui::UiBuilder::new().max_rect(label_rect.shrink2(egui::vec2(10.0, 5.0))));
+            label_ui.spacing_mut().item_spacing.y = 2.0;
+            label_ui.spacing_mut().interact_size.y = 22.0;
             label_ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(row.label()).color(color).strong());
                 if row.peaks.is_empty() {
-                    ui.weak("silent");
+                    ui.label(egui::RichText::new("silent").small().color(theme::TEXT_MUTED));
                 }
             });
-            label_ui.spacing_mut().slider_width = LABEL_WIDTH - 70.0;
+            // The slider plus its value box fill the header's width.
+            label_ui.spacing_mut().slider_width = LABEL_WIDTH - 20.0 - 62.0;
             let slider = label_ui.add(
                 egui::Slider::new(&mut row.volume, 0.0..=MAX_VOLUME).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
             );

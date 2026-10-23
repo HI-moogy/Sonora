@@ -18,6 +18,7 @@ mod clips;
 mod eq_presets;
 mod games;
 mod hotkey;
+mod icons;
 mod meter;
 mod moments;
 mod noise;
