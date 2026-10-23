@@ -20,7 +20,7 @@ use capture_engine::{decode_clip_audio, save_edited_clip, ClipAudio, ClipEdit, P
 use eframe::egui;
 
 use super::{format_duration, format_size, play, show_in_folder, ClipEntry};
-use crate::icons::{icon_button, Icon};
+use crate::icons::{big_icon_button, icon_button, Icon};
 use crate::{theme, FIXED_BUSES};
 
 const SAMPLE_RATE: u64 = 48_000;
@@ -45,8 +45,12 @@ const LABEL_WIDTH: f32 = 210.0;
 /// Narrower than this, the save buttons go on a row below the transport so
 /// the two don't overlap.
 const ONE_ROW_CONTROLS_WIDTH: f32 = 900.0;
-/// Width of the four play buttons and the gaps between them.
-const TRANSPORT_WIDTH: f32 = 38.0 * 3.0 + 46.0 + 8.0 * 3.0;
+/// Width of the five play buttons and the gaps between them.
+const TRANSPORT_WIDTH: f32 = 38.0 * 4.0 + 46.0 + 8.0 * 4.0;
+/// The previous/next clip buttons either side of the video, and their gap
+/// to it.
+const SIDE_BUTTON: f32 = 56.0;
+const SIDE_GAP: f32 = 16.0;
 const RULER_HEIGHT: f32 = 22.0;
 /// Tall enough for a track's name above its volume slider.
 const ROW_HEIGHT: f32 = 60.0;
@@ -74,6 +78,16 @@ pub enum EditorAction {
     Close,
     /// A clip was written; the clip list should pick it up.
     Saved,
+    /// Open the clip before or after this one in the clip list.
+    Previous,
+    Next,
+}
+
+/// Whether the clip list has a clip before and after the open one.
+#[derive(Clone, Copy, Default)]
+pub struct Neighbours {
+    pub previous: bool,
+    pub next: bool,
 }
 
 struct Row {
@@ -137,6 +151,11 @@ pub struct ClipEditor {
 }
 
 impl ClipEditor {
+    /// The open clip's file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn open(ctx: &egui::Context, clip: &ClipEntry) -> Self {
         Self::open_path(ctx, &clip.path, clip.size)
     }
@@ -364,7 +383,7 @@ impl ClipEditor {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> EditorAction {
+    pub fn ui(&mut self, ui: &mut egui::Ui, neighbours: Neighbours) -> EditorAction {
         let ctx = ui.ctx().clone();
         let mut action = self.poll(&ctx);
         if self.is_playing() {
@@ -398,7 +417,9 @@ impl ClipEditor {
         let timeline_height = RULER_HEIGHT + self.rows.len().max(1) as f32 * (ROW_HEIGHT + ROW_GAP) + 8.0;
         let controls_height = if ui.available_width() >= ONE_ROW_CONTROLS_WIDTH { 44.0 } else { 80.0 };
         let video_height = (ui.available_height() - timeline_height - controls_height - 16.0).max(120.0);
-        self.video_ui(ui, video_height);
+        if let Some(go) = self.video_ui(ui, video_height, neighbours) {
+            action = go;
+        }
         ui.add_space(4.0);
         self.controls_ui(ui, &ctx);
         ui.add_space(4.0);
@@ -406,9 +427,12 @@ impl ClipEditor {
         action
     }
 
-    fn video_ui(&mut self, ui: &mut egui::Ui, height: f32) {
+    /// The video, with the previous and next clip buttons either side;
+    /// returns which of those was clicked.
+    fn video_ui(&mut self, ui: &mut egui::Ui, height: f32, neighbours: Neighbours) -> Option<EditorAction> {
         let width = ui.available_width();
-        let (area, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+        let (full, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+        let area = full.shrink2(egui::vec2(SIDE_BUTTON + SIDE_GAP, 0.0));
         let size = match &self.frame {
             Some((_, texture)) => {
                 let [w, h] = texture.size().map(|v| v as f32);
@@ -429,6 +453,24 @@ impl ClipEditor {
                 painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(16.0), egui::Color32::GRAY);
             }
         }
+
+        // Beside the video, centered on it.
+        let mut go = None;
+        let sides = [
+            (rect.left() - SIDE_GAP - SIDE_BUTTON / 2.0, Icon::Previous, neighbours.previous, "Previous clip", EditorAction::Previous),
+            (rect.right() + SIDE_GAP + SIDE_BUTTON / 2.0, Icon::Next, neighbours.next, "Next clip", EditorAction::Next),
+        ];
+        for (x, icon, enabled, hint, action) in sides {
+            let button = egui::Rect::from_center_size(egui::pos2(x, rect.center().y), egui::vec2(SIDE_BUTTON, SIDE_BUTTON));
+            // In a child so the button doesn't move the layout's cursor; each
+            // with its own id, or a click on one would count for both.
+            let mut side = ui.new_child(egui::UiBuilder::new().id_salt(hint).max_rect(button));
+            let response = big_icon_button(&mut side, icon, SIDE_BUTTON, enabled);
+            if response.on_hover_text(if enabled { hint } else { "No more clips this way" }).clicked() {
+                go = Some(action);
+            }
+        }
+        go
     }
 
     /// The time on the left, play controls in the middle, saving on the
@@ -458,7 +500,7 @@ impl ClipEditor {
         }
     }
 
-    /// Back to the start, back 5 s, play/pause, forward 5 s.
+    /// Back to the start, back 5 s, play/pause, forward 5 s, to the end.
     fn transport_ui(&mut self, ui: &mut egui::Ui) {
         let ready = self.player.is_some();
         let position = self.position().min(self.duration());
@@ -475,6 +517,12 @@ impl ClipEditor {
         }
         if icon_button(ui, Icon::Forward, false, ready).on_hover_text("Forward 5 seconds").clicked() {
             self.seek(position + SKIP.as_nanos() as i64 / 100);
+        }
+        if icon_button(ui, Icon::ToEnd, false, ready).on_hover_text("To the end").clicked() {
+            if let Some(player) = &self.player {
+                player.set_playing(false);
+            }
+            self.seek(self.duration());
         }
     }
 

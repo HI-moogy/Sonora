@@ -9,7 +9,7 @@ use capture_engine::{
 use common::{ClipSort, MomentsConfig, RecordMode};
 use eframe::egui;
 
-use crate::clips::editor::{ClipEditor, EditorAction};
+use crate::clips::editor::{ClipEditor, EditorAction, Neighbours};
 use crate::clips::{self, ClipEntry, ClipList, Thumbnails};
 use crate::games::{self, AppWindow, GameFinder};
 use crate::hotkey::{self, GlobalHotkey};
@@ -310,11 +310,29 @@ impl Moments {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(20)))
             .show(ui, |ui| match &mut self.editor {
-            Some(editor) => match editor.ui(ui) {
-                EditorAction::None => {}
-                EditorAction::Close => self.editor = None,
-                EditorAction::Saved => self.last_scan = None,
-            },
+            Some(editor) => {
+                // The previous and next clips, as the clip list shows them.
+                let shown = shown_clips(&self.clips.entries, self.game_filter.as_deref(), self.config.clip_sort);
+                let at = shown.iter().position(|clip| clip.path == editor.path());
+                let neighbour = |step: isize| at.and_then(|at| at.checked_add_signed(step)).and_then(|i| shown.get(i).copied());
+                let neighbours = Neighbours { previous: neighbour(-1).is_some(), next: neighbour(1).is_some() };
+                let go = match editor.ui(ui, neighbours) {
+                    EditorAction::None => None,
+                    EditorAction::Close => {
+                        self.editor = None;
+                        None
+                    }
+                    EditorAction::Saved => {
+                        self.last_scan = None;
+                        None
+                    }
+                    EditorAction::Previous => neighbour(-1),
+                    EditorAction::Next => neighbour(1),
+                };
+                if let Some(clip) = go {
+                    self.editor = Some(ClipEditor::open(ui.ctx(), clip));
+                }
+            }
             None => self.clips_ui(ui),
         });
     }
@@ -735,17 +753,7 @@ impl Moments {
             });
         });
 
-        let mut shown: Vec<&ClipEntry> = self
-            .clips
-            .entries
-            .iter()
-            .filter(|clip| self.game_filter.as_ref().is_none_or(|key| clips::game_key(&clip.game) == *key))
-            .collect();
-        match self.config.clip_sort {
-            ClipSort::NewestFirst => shown.sort_by_key(|clip| std::cmp::Reverse(clip.recorded)),
-            ClipSort::OldestFirst => shown.sort_by_key(|clip| clip.recorded),
-            ClipSort::ByGame => shown.sort_by_key(|clip| (clips::game_key(&clip.game), std::cmp::Reverse(clip.recorded))),
-        }
+        let shown = shown_clips(&self.clips.entries, self.game_filter.as_deref(), self.config.clip_sort);
 
         let ctx = ui.ctx().clone();
         let mut opened = None;
@@ -790,6 +798,19 @@ impl Moments {
             self.editor = opened;
         }
     }
+}
+
+/// The clips the clip list shows, in its order: only `game`'s (a
+/// [`clips::game_key`]) if set, sorted by `sort`. The editor's previous and
+/// next clip follow this too.
+fn shown_clips<'a>(entries: &'a [ClipEntry], game: Option<&str>, sort: ClipSort) -> Vec<&'a ClipEntry> {
+    let mut shown: Vec<&ClipEntry> = entries.iter().filter(|clip| game.is_none_or(|key| clips::game_key(&clip.game) == key)).collect();
+    match sort {
+        ClipSort::NewestFirst => shown.sort_by_key(|clip| std::cmp::Reverse(clip.recorded)),
+        ClipSort::OldestFirst => shown.sort_by_key(|clip| clip.recorded),
+        ClipSort::ByGame => shown.sort_by_key(|clip| (clips::game_key(&clip.game), std::cmp::Reverse(clip.recorded))),
+    }
+    shown
 }
 
 /// One clip's card. Cards off screen only take their space: their
