@@ -62,6 +62,20 @@ pub(crate) fn to_access_unit(annex_b: &[u8]) -> AccessUnit {
     unit
 }
 
+/// Appends one MP4 access unit (NAL units each prefixed with a 4-byte
+/// big-endian length, as [`to_access_unit`] writes them) to `annex_b` with
+/// start codes instead. `None` if a length runs past the end.
+pub(crate) fn append_annex_b(avcc: &[u8], annex_b: &mut Vec<u8>) -> Option<()> {
+    let mut rest = avcc;
+    while let Some((length, after)) = rest.split_first_chunk::<4>() {
+        let (nal, next) = after.split_at_checked(u32::from_be_bytes(*length) as usize)?;
+        annex_b.extend_from_slice(&[0, 0, 0, 1]);
+        annex_b.extend_from_slice(nal);
+        rest = next;
+    }
+    rest.is_empty().then_some(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +102,14 @@ mod tests {
         let unit = to_access_unit(&[0, 0, 1, 0x41, 0x9a]);
         assert!(!unit.keyframe);
         assert_eq!(unit.avcc, vec![0, 0, 0, 2, 0x41, 0x9a]);
+    }
+
+    #[test]
+    fn length_prefixes_become_start_codes() {
+        let mut annex_b = vec![9];
+        assert!(append_annex_b(&[0, 0, 0, 2, 0x65, 0xaa, 0, 0, 0, 1, 0x41], &mut annex_b).is_some());
+        assert_eq!(annex_b, vec![9, 0, 0, 0, 1, 0x65, 0xaa, 0, 0, 0, 1, 0x41]);
+        assert!(append_annex_b(&[0, 0, 0, 3, 0x65], &mut annex_b).is_none());
+        assert!(append_annex_b(&[0, 0], &mut annex_b).is_none());
     }
 }

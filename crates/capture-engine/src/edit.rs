@@ -89,12 +89,12 @@ pub struct ClipEdit {
 /// Where a clip's tracks are, from its MP4 header. Only the layout
 /// sonar-rs writes is accepted: one H.264 track without frame reordering,
 /// and 48 kHz stereo AAC tracks.
-struct Layout {
-    video: u32,
-    audio: Vec<u32>,
+pub(crate) struct Layout {
+    pub video: u32,
+    pub audio: Vec<u32>,
 }
 
-fn read_layout<R: Read + Seek>(mp4: &Mp4Reader<R>) -> Result<Layout, EditError> {
+pub(crate) fn read_layout<R: Read + Seek>(mp4: &Mp4Reader<R>) -> Result<Layout, EditError> {
     let mut ids: Vec<u32> = mp4.tracks().keys().copied().collect();
     ids.sort_unstable();
     let (mut video, mut audio) = (None, Vec::new());
@@ -120,7 +120,7 @@ fn read_layout<R: Read + Seek>(mp4: &Mp4Reader<R>) -> Result<Layout, EditError> 
     Ok(Layout { video, audio })
 }
 
-fn open_mp4(path: &Path) -> Result<Mp4Reader<BufReader<File>>, EditError> {
+pub(crate) fn open_mp4(path: &Path) -> Result<Mp4Reader<BufReader<File>>, EditError> {
     let file = File::open(path)?;
     let size = file.metadata()?.len();
     Ok(Mp4Reader::read_header(BufReader::new(file), size)?)
@@ -265,7 +265,7 @@ fn block_pts(index: usize) -> i64 {
 
 /// Rounds up, so converting back to `timescale` ticks (rounding down, as
 /// the MP4 writer does) gives exactly `ticks` again.
-fn ticks_to_hns(ticks: i64, timescale: i64) -> i64 {
+pub(crate) fn ticks_to_hns(ticks: i64, timescale: i64) -> i64 {
     (ticks * HNS_PER_SECOND + timescale - 1) / timescale
 }
 

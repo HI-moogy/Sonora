@@ -1,11 +1,15 @@
 //! Decodes a clip's whole video the way the in-app preview does, as fast
-//! as it can, then seeks to the middle; reports frame size and timing.
+//! as it can, then seeks to the middle; reports frame size, timing, and the
+//! process's CPU time and peak private memory.
 //! Usage: preview_clip <path.mp4> [max width]
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use capture_engine::VideoPreview;
+use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows::Win32::Foundation::FILETIME;
+use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
 fn main() {
     let path = std::env::args().nth(1).expect("usage: preview_clip <path.mp4> [max width]");
@@ -50,5 +54,15 @@ fn main() {
             Some(Err(error)) => panic!("decode failed: {error}"),
             _ => std::thread::sleep(Duration::from_millis(1)),
         }
+    }
+
+    let [mut created, mut exited, mut kernel, mut user] = [FILETIME::default(); 4];
+    if unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) }.is_ok() {
+        let hns = |time: FILETIME| (time.dwHighDateTime as u64) << 32 | time.dwLowDateTime as u64;
+        println!("CPU time {:.2}s", (hns(kernel) + hns(user)) as f64 / 1e7);
+    }
+    let mut counters = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+    if unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) }.is_ok() {
+        println!("peak private memory {:.0} MB", counters.PeakPagefileUsage as f64 / 1048576.0);
     }
 }

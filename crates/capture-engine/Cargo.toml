@@ -26,4 +26,4 @@ windows = { version = "0.62.2", features = [
 windows-core = "=0.62.2"
 
 [dev-dependencies]
-windows = { version = "0.62.2", features = ["Win32_UI_HiDpi", "Win32_System_Com_StructuredStorage"] }
+windows = { version = "0.62.2", features = ["Win32_UI_HiDpi", "Win32_System_Com_StructuredStorage", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
