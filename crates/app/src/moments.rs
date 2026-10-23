@@ -776,7 +776,10 @@ impl Moments {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP).with_main_wrap(true), |ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
                     for clip in group {
-                        if clip_card(ui, clip, thumbnails, !by_game) {
+                        // The same spelling of the game as the filter shows.
+                        let key = clips::game_key(&clip.game);
+                        let game = games.iter().find(|(k, ..)| *k == key).map_or(clip.game.as_str(), |(_, name, _)| name.as_str());
+                        if clip_card(ui, clip, thumbnails, (!by_game).then_some(game)) {
                             opened = Some(ClipEditor::open(&ctx, clip));
                         }
                     }
@@ -792,7 +795,7 @@ impl Moments {
 /// One clip's card. Cards off screen only take their space: their
 /// thumbnail and length are loaded once they're scrolled into view.
 /// Returns whether the clip was clicked to open.
-fn clip_card(ui: &mut egui::Ui, clip: &ClipEntry, thumbnails: &mut Thumbnails, show_game: bool) -> bool {
+fn clip_card(ui: &mut egui::Ui, clip: &ClipEntry, thumbnails: &mut Thumbnails, game: Option<&str>) -> bool {
     let size = egui::vec2(CARD_THUMBNAIL.x, CARD_THUMBNAIL.y + 62.0);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
@@ -811,8 +814,8 @@ fn clip_card(ui: &mut egui::Ui, clip: &ClipEntry, thumbnails: &mut Thumbnails, s
     card.add(egui::Label::new(clips::display_name(&clip.name)).truncate());
     card.horizontal(|ui| {
         let mut details = vec![duration.map(clips::format_duration).unwrap_or_else(|| "…".into()), clips::format_size(clip.size)];
-        if show_game {
-            details.insert(0, clip.game.clone());
+        if let Some(game) = game {
+            details.insert(0, game.to_string());
         }
         ui.add(egui::Label::new(egui::RichText::new(details.join(" · ")).small().color(theme::TEXT_MUTED)).truncate());
     });

@@ -126,59 +126,95 @@ fn scan(root: &Path, dir: &Path, depth: usize, found: &mut Vec<ClipEntry>) {
             let Ok(modified) = meta.modified() else { continue };
             let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             let (game, game_from_folder) = game_of(root, &path, &name);
-            let recorded = date_in_name(&name).unwrap_or_else(|| local_timestamp(modified));
+            let recorded = date_in_name(&name).map_or_else(|| local_timestamp(modified), |(date, _)| date);
             found.push(ClipEntry { path, name, game, game_from_folder, recorded, modified, size: meta.len() });
         }
     }
 }
 
-/// The game a clip is from: the first folder under the clips folder it's
-/// in; for a clip right in the clips folder, its file name's game part:
-/// SteelSeries Moments' "Team-Fortress-2__2025-11-23_..." is Team Fortress
-/// 2, and AMD Radeon's "Replay_..." (clips it couldn't tie to a game; it
-/// puts the rest in a folder per game) are Radeon replays.
-/// Also returns whether it came from a folder.
+/// The game a clip is from. Recorders name it in the file name, which
+/// wins: SteelSeries Moments' "Team-Fortress-2__2025-11-23_...", AMD
+/// Radeon's "Counter-Strike 2_replay_2025.01.02-..." or "IMSCARED_2025...".
+/// Otherwise (a clip you renamed, Radeon's "unknown_replay_..."), the first
+/// folder under the clips folder it's in; otherwise, for a clip right in
+/// the clips folder, Radeon replays (its "Replay_..." clips it couldn't tie
+/// to a game), Sonora, or Other. Also returns whether the name shown is a
+/// folder's, since your folder's spelling of a game wins.
 fn game_of(root: &Path, path: &Path, name: &str) -> (String, bool) {
-    if let Some(folder) = path.strip_prefix(root).ok().and_then(|rel| {
+    let folder = path.strip_prefix(root).ok().and_then(|rel| {
         let mut parts = rel.components();
         let first = parts.next()?;
         parts.next().map(|_| first.as_os_str().to_string_lossy().into_owned())
-    }) {
-        return (folder, true);
-    }
-    if let Some((game, _)) = name.split_once("__") {
-        let game = game.replace(['-', '_'], " ").trim().to_string();
-        if !game.is_empty() {
-            return (game, false);
+    });
+    match (game_in_name(name), folder) {
+        (Some(game), Some(folder)) if game_key(&game) == game_key(&folder) => (folder, true),
+        (Some(game), _) => (game, false),
+        (None, Some(folder)) => (folder, true),
+        (None, None) => {
+            let lower = name.to_lowercase();
+            let game = if lower.starts_with("replay") {
+                "Radeon replays"
+            } else if lower.starts_with("sonora") || lower.starts_with("sonar-rs") {
+                "Sonora"
+            } else {
+                "Other"
+            };
+            (game.to_string(), false)
         }
     }
-    let lower = name.to_lowercase();
-    let game = if lower.starts_with("replay") {
-        "Radeon replays"
-    } else if lower.starts_with("sonora") || lower.starts_with("sonar-rs") {
-        "Sonora"
-    } else {
-        "Other"
-    };
-    (game.to_string(), false)
 }
 
-/// The recording date in a clip's file name, as YYYYMMDDHHMMSS: the first
-/// "2025-11-23_20-30-10" (SteelSeries), "2025.02.10-21.16" (Radeon) or
-/// "2026-10-23 01-02-03" (Sonora) style date in it. Seconds are optional.
-fn date_in_name(name: &str) -> Option<u64> {
+/// The game a recorder wrote into a clip's name: the part before its date
+/// (or before "_replay"), if that names one.
+fn game_in_name(name: &str) -> Option<String> {
+    let lower = name.to_lowercase();
+    let end = match date_in_name(name) {
+        Some((_, at)) => at,
+        None => lower.find("_replay")?,
+    };
+    let mut game = &name[..end];
+    // Files copied in by some tools start with a millisecond timestamp.
+    if let Some((stamp, rest)) = game.split_once('-') {
+        if stamp.len() >= 10 && stamp.chars().all(|c| c.is_ascii_digit()) {
+            game = rest;
+        }
+    }
+    let separators: &[char] = &['_', '-', '.', ' '];
+    let mut game = game.trim_matches(separators);
+    if game.to_lowercase().ends_with("_replay") {
+        game = game[..game.len() - "_replay".len()].trim_matches(separators);
+    }
+    let lower = game.to_lowercase();
+    if game.is_empty() || ["replay", "unknown", "sonora", "sonar-rs"].contains(&lower.as_str()) {
+        return None;
+    }
+    // SteelSeries writes spaces as dashes ("Team-Fortress-2").
+    Some(if game.contains(' ') { game.to_string() } else { game.replace('-', " ") })
+}
+
+/// The recording date in a clip's file name, as YYYYMMDDHHMMSS, and where
+/// in the name it starts: the first "2025-11-23_20-30-10" (SteelSeries),
+/// "2025.02.10-21.16" (Radeon) or "2026-10-23 01-02-03" (Sonora) style date
+/// in it, seconds optional. A name with only a year ("..._replay_2024")
+/// counts as the start of that year.
+fn date_in_name(name: &str) -> Option<(u64, usize)> {
     let b = name.as_bytes();
     let digits = |at: usize, n: usize| -> Option<u64> {
         let part = b.get(at..at + n)?;
         part.iter().all(u8::is_ascii_digit).then(|| part.iter().fold(0, |v, d| v * 10 + u64::from(d - b'0')))
     };
     let sep = |at: usize| b.get(at).is_some_and(|c| matches!(c, b'-' | b'.' | b'_' | b' '));
+    let mut year_only = None;
     for start in 0..b.len() {
         if start > 0 && b[start - 1].is_ascii_digit() {
             continue;
         }
         let Some(year) = digits(start, 4).filter(|y| (1990..=2100).contains(y)) else { continue };
+        if b.get(start + 4).is_some_and(u8::is_ascii_digit) {
+            continue;
+        }
         let (Some(month), Some(day)) = (sep(start + 4).then(|| digits(start + 5, 2)).flatten(), sep(start + 7).then(|| digits(start + 8, 2)).flatten()) else {
+            year_only.get_or_insert((year * 10_000_000_000, start));
             continue;
         };
         if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
@@ -204,9 +240,9 @@ fn date_in_name(name: &str) -> Option<u64> {
         } else {
             0
         };
-        return Some(((year * 100 + month) * 100 + day) * 1_000_000 + time);
+        return Some((((year * 100 + month) * 100 + day) * 1_000_000 + time, start));
     }
-    None
+    year_only
 }
 
 /// `time` as local YYYYMMDDHHMMSS, to compare with dates in file names.
@@ -439,6 +475,8 @@ mod tests {
     fn games_come_from_folders_then_file_names() {
         assert_eq!(game(r"Counter-Strike 2\Replay_2025.01.02-20.00.mp4"), "Counter-Strike 2");
         assert_eq!(game(r"Deadlock\session\clip.mp4"), "Deadlock");
+        assert_eq!(game(r"Garry's Mod\watch yo tone.mp4"), "Garry's Mod");
+        assert_eq!(game(r"unknown\unknown_replay_2024.01.01-10.00.mp4"), "unknown");
         assert_eq!(game("Team-Fortress-2__2025-11-23_20-30-10.mp4"), "Team Fortress 2");
         assert_eq!(game("Replay_2025.02.10-21.16.mp4"), "Radeon replays");
         assert_eq!(game("Sonora 2026-10-23 01-02-03.mp4"), "Sonora");
@@ -447,14 +485,33 @@ mod tests {
 
     #[test]
     fn dates_are_read_from_each_recorders_names() {
-        assert_eq!(date_in_name("Team-Fortress-2__2025-11-23_20-30-10"), Some(20251123203010));
-        assert_eq!(date_in_name("Replay_2025.02.10-21.16"), Some(20250210211600));
-        assert_eq!(date_in_name("Replay_2025.01.15-01.47_01"), Some(20250115014700));
-        assert_eq!(date_in_name("Sonora 2026-10-23 01-02-03"), Some(20261023010203));
-        assert_eq!(date_in_name("2024.11.27-00.16"), Some(20241127001600));
-        assert_eq!(date_in_name("PEAK__2025-12-03__16-42-00"), Some(20251203164200));
+        assert_eq!(date_in_name("Team-Fortress-2__2025-11-23_20-30-10").map(|d| d.0), Some(20251123203010));
+        assert_eq!(date_in_name("Replay_2025.02.10-21.16").map(|d| d.0), Some(20250210211600));
+        assert_eq!(date_in_name("Replay_2025.01.15-01.47_01").map(|d| d.0), Some(20250115014700));
+        assert_eq!(date_in_name("Sonora 2026-10-23 01-02-03").map(|d| d.0), Some(20261023010203));
+        assert_eq!(date_in_name("2024.11.27-00.16").map(|d| d.0), Some(20241127001600));
+        assert_eq!(date_in_name("PEAK__2025-12-03__16-42-00").map(|d| d.0), Some(20251203164200));
         assert_eq!(date_in_name("my clip"), None);
         assert_eq!(date_in_name("12025-13-40"), None);
+    }
+
+    #[test]
+    fn a_game_in_the_name_beats_the_folder() {
+        assert_eq!(game(r"Deadlock\Counter-Strike-2__2026-04-03__15-04-33.mp4"), "Counter Strike 2");
+        assert_eq!(game(r"Deadlock\Minecraft-for-Windows__2026-03-25__22-00-00.mp4"), "Minecraft for Windows");
+        assert_eq!(game(r"Imported\1778029526230-Counter-Strike 2_replay_2024.mp4"), "Counter-Strike 2");
+        assert_eq!(game(r"Edits\Deadlock_replay_2025-tr-edit.mp4"), "Deadlock");
+        assert_eq!(game("IMSCARED_2025.01.01-10.00.mp4"), "IMSCARED");
+        assert_eq!(game(r"Counter-Strike 2\Counter-Strike 2_replay_2025.01.02-20.00.mp4"), "Counter-Strike 2");
+        // The folder's spelling wins when both name the same game.
+        assert_eq!(game(r"Counter-Strike 2\Counter-Strike-2__2025-12-06__18-58-53.mp4"), "Counter-Strike 2");
+    }
+
+    #[test]
+    fn a_year_alone_dates_a_clip_to_the_start_of_that_year() {
+        assert_eq!(date_in_name("1778029526230-Counter-Strike 2_replay_2024").map(|d| d.0), Some(20240000000000));
+        assert_eq!(date_in_name("Deadlock_replay_2025-tr-edit").map(|d| d.0), Some(20250000000000));
+        assert_eq!(date_in_name("watch yo tone"), None);
     }
 
     #[test]
