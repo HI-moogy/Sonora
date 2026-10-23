@@ -2,6 +2,9 @@
 name = "app"
 version = "0.1.0-alpha.2"
 edition.workspace = true
+description = "A per-app audio mixer for Windows and Linux"
+license = "MIT"
+repository = "https://github.com/HI-moogy/Sonora"
 
 [[bin]]
 name = "sonora"
