@@ -14,6 +14,7 @@ use eframe::egui;
 
 mod autostart;
 mod clips;
+mod eq_presets;
 mod hotkey;
 mod meter;
 mod moments;
@@ -91,6 +92,7 @@ struct MixerApp {
     quitting: Arc<AtomicBool>,
     /// Whether this run already said it keeps running in the tray.
     tray_hint_shown: bool,
+    eq_presets: EqPresetState,
     /// The main window's handle, found on first use.
     window: Option<windows::Win32::Foundation::HWND>,
     /// Started at sign-in: frames left during which to keep the window
@@ -147,6 +149,7 @@ impl MixerApp {
             tray,
             quitting,
             tray_hint_shown: false,
+            eq_presets: EqPresetState::load(),
             window: None,
             start_hidden_frames: if start_hidden { START_HIDDEN_FRAMES } else { 0 },
         })
@@ -186,6 +189,115 @@ impl MixerApp {
         if let Ok(devices) = list_input_devices() {
             self.input_devices = devices;
         }
+    }
+}
+
+/// Your saved EQ presets, and the name being typed to save one.
+#[derive(Default)]
+struct EqPresetState {
+    saved: Vec<common::NamedEq>,
+    naming: Option<String>,
+    /// Focus the name field on the frame it appears.
+    focus_name: bool,
+    error: Option<String>,
+}
+
+impl EqPresetState {
+    fn load() -> Self {
+        Self { saved: common::load_presets().eq_presets, ..Self::default() }
+    }
+
+    fn store(&mut self) {
+        let saved = self.saved.clone();
+        self.error = common::update_presets(|presets| presets.eq_presets = saved)
+            .err()
+            .map(|e| format!("Couldn't save presets: {e}"));
+    }
+}
+
+/// The preset menu with saving and deleting your own presets.
+fn eq_preset_controls(
+    ui: &mut egui::Ui,
+    mixer: &Mixer,
+    bus_name: &str,
+    gains_db: [f32; EQ_BAND_COUNT],
+    presets: &mut EqPresetState,
+) {
+    let current = eq_presets::matching(&gains_db, &presets.saved).map(str::to_string);
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        ui.label("Preset");
+        egui::ComboBox::from_id_salt("eq-preset")
+            .selected_text(current.as_deref().unwrap_or("Custom"))
+            .height(480.0)
+            .show_ui(ui, |ui| {
+                let mut item = |ui: &mut egui::Ui, name: &str, gains: [f32; EQ_BAND_COUNT]| {
+                    if ui.selectable_label(current.as_deref() == Some(name), name).clicked() {
+                        picked = Some(gains);
+                    }
+                };
+                item(ui, eq_presets::FLAT.name, eq_presets::FLAT.gains_db);
+                ui.separator();
+                ui.weak("Music");
+                for preset in eq_presets::MUSIC {
+                    item(ui, preset.name, preset.gains_db);
+                }
+                ui.separator();
+                ui.weak("Games and voice");
+                for preset in eq_presets::GENERAL {
+                    item(ui, preset.name, preset.gains_db);
+                }
+                if !presets.saved.is_empty() {
+                    ui.separator();
+                    ui.weak("Yours");
+                    for preset in &presets.saved {
+                        item(ui, &preset.name, preset.gains_db);
+                    }
+                }
+            });
+        if presets.naming.is_none() && ui.button("Save as...").clicked() {
+            presets.naming = Some(String::new());
+            presets.focus_name = true;
+        }
+        let yours = current.as_ref().and_then(|name| presets.saved.iter().position(|p| &p.name == name));
+        if let Some(index) = yours {
+            if ui.button("Delete").clicked() {
+                presets.saved.remove(index);
+                presets.store();
+            }
+        }
+    });
+    if let Some(gains) = picked {
+        for (band, gain) in gains.into_iter().enumerate() {
+            mixer.set_bus_eq_band(bus_name, band, gain);
+        }
+    }
+    if let Some(mut typed) = presets.naming.take() {
+        let mut done = false;
+        ui.horizontal(|ui| {
+            let field = ui.add(egui::TextEdit::singleline(&mut typed).hint_text("Preset name").desired_width(160.0));
+            if std::mem::take(&mut presets.focus_name) {
+                field.request_focus();
+            }
+            let name = typed.trim().to_string();
+            let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.add_enabled(!name.is_empty(), egui::Button::new("Save")).clicked() || entered) && !name.is_empty() {
+                // Saving under an existing name replaces that preset.
+                presets.saved.retain(|p| p.name != name);
+                presets.saved.push(common::NamedEq { name, gains_db });
+                presets.store();
+                done = true;
+            }
+            if ui.button("Cancel").clicked() {
+                done = true;
+            }
+        });
+        if !done {
+            presets.naming = Some(typed);
+        }
+    }
+    if let Some(error) = &presets.error {
+        ui.colored_label(egui::Color32::from_rgb(230, 120, 90), error);
     }
 }
 
@@ -374,7 +486,8 @@ impl eframe::App for MixerApp {
                 }
                 ui.separator();
 
-                ui.collapsing("EQ", |ui| {
+                egui::CollapsingHeader::new("EQ").default_open(true).show(ui, |ui| {
+                    eq_preset_controls(ui, &self.mixer, &selected, bus.eq_gains_db, &mut self.eq_presets);
                     eq_controls(ui, &self.mixer, &selected, bus.eq_gains_db);
                 });
                 ui.separator();

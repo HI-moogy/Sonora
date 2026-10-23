@@ -14,6 +14,13 @@ pub struct EqPreset {
     pub gains_db: [f32; EQ_BAND_COUNT],
 }
 
+/// An EQ setting you saved under a name, to pick for any channel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamedEq {
+    pub name: String,
+    pub gains_db: [f32; EQ_BAND_COUNT],
+}
+
 impl Default for EqPreset {
     fn default() -> Self {
         Self {
@@ -34,6 +41,9 @@ pub struct Presets {
     pub moments: MomentsConfig,
     #[serde(default)]
     pub mixer: MixerSetup,
+    /// EQ settings you saved by name.
+    #[serde(default)]
+    pub eq_presets: Vec<NamedEq>,
 }
 
 /// The mixer as it was left: levels, devices, and which apps (and
@@ -274,11 +284,12 @@ fn parse_sections(text: &str) -> (Presets, Vec<String>) {
             T::default()
         })
     }
-    let (eq, moments, mixer) = (section("eq"), section("moments"), section("mixer"));
+    let (eq, moments, mixer, eq_presets) = (section("eq"), section("moments"), section("mixer"), section("eq_presets"));
     let presets = Presets {
         eq: parse("EQ", eq, &mut broken),
         moments: parse("clip settings", moments, &mut broken),
         mixer: parse("mixer", mixer, &mut broken),
+        eq_presets: parse("EQ presets", eq_presets, &mut broken),
     };
     (presets, broken)
 }
