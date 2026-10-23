@@ -22,7 +22,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --release --locked -p app
-      - run: cargo test --release --locked -p common -p app -p audio-engine --lib --bins
+      - run: cargo test --release --locked -p common -p app -p audio-engine -p capture-engine --lib --bins
       - run: cargo clippy --release --locked -p app -p audio-engine
 
   linux:
@@ -37,5 +37,5 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --release --locked -p app
-      - run: cargo test --release --locked -p common -p app -p audio-engine --lib --bins
+      - run: cargo test --release --locked -p common -p app -p audio-engine -p capture-engine --lib --bins
       - run: cargo clippy --release --locked -p app -p audio-engine

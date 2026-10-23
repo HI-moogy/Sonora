@@ -21,6 +21,8 @@ pub enum Icon {
     /// The previous or next item: one triangle.
     Previous,
     Next,
+    /// Split here: scissors.
+    Split,
 }
 
 /// A triangle pointing left or right, `size` tall, centered on `center`.
@@ -59,6 +61,15 @@ fn paint(painter: &egui::Painter, icon: Icon, center: Pos2, size: f32, color: Co
             let bar = Rect::from_center_size(center + vec2(side * s * 0.38, 0.0), vec2(s * 0.16, s * 0.8));
             painter.rect_filled(bar, CornerRadius::same(1), color);
             painter.add(triangle(center + vec2(-side * s * 0.08, 0.0), s * 0.8, icon == Icon::ToEnd, color));
+        }
+        Icon::Split => {
+            // Two blades crossing, each ending in a finger ring on the left.
+            let stroke = Stroke::new((s * 0.14).max(1.5), color);
+            for side in [-1.0, 1.0] {
+                let ring = center + vec2(-s * 0.32, side * s * 0.28);
+                painter.circle_stroke(ring, s * 0.17, stroke);
+                painter.line_segment([ring + vec2(s * 0.14, -side * s * 0.08), center + vec2(s * 0.5, -side * s * 0.34)], stroke);
+            }
         }
         Icon::Previous | Icon::Next => {
             let right = icon == Icon::Next;

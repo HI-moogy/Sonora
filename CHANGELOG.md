@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- **Trim clips**: split a clip at the playhead (scissors, or S), right-click a part to cut it out (or press Delete), and save. Playback skips cut parts. The video is copied, not re-encoded, so no quality is lost; a kept part starts at the keyframe just before your split, which the timeline shows in amber.
+
 ## 0.1.0-alpha.2 (2026-10-23)
 
 ### New

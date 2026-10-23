@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use audio_engine::atomic_f32::AtomicF32;
 use audio_engine::ComGuard;
-use capture_engine::{decode_clip_audio, save_edited_clip, ClipAudio, ClipEdit, PreviewFrame, TrackAudio, VideoPreview};
+use capture_engine::{
+    decode_clip_audio, save_edited_clip, ClipAudio, ClipEdit, ClipTimeline, PreviewFrame, TrackAudio, VideoPreview,
+};
 use eframe::egui;
 
 use super::{format_duration, format_size, play, show_in_folder, ClipEntry};
@@ -53,6 +55,9 @@ const RULER_HEIGHT: f32 = 22.0;
 /// Tall enough for a track's name above its volume slider.
 const ROW_HEIGHT: f32 = 60.0;
 const ROW_GAP: f32 = 6.0;
+/// How close (in pixels) a right-click must be to a split to offer
+/// removing it.
+const SPLIT_GRAB: f32 = 6.0;
 
 /// What a clip's audio track holds, from its position (see the module docs).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -121,6 +126,9 @@ impl Row {
 struct Loaded {
     audio: Arc<ClipAudio>,
     peaks: Vec<Vec<f32>>,
+    /// The video's frame times and keyframes, for cutting; `None` if they
+    /// couldn't be read (the clip still plays, but can't be cut).
+    timeline: Option<ClipTimeline>,
 }
 
 enum Saving {
@@ -146,6 +154,14 @@ pub struct ClipEditor {
     paused_at: i64,
     last_drag_seek: Option<Instant>,
     saving: Saving,
+    timeline: Option<ClipTimeline>,
+    /// Where you split the clip (100 ns units, in order): the clip is in
+    /// `splits.len() + 1` parts.
+    splits: Vec<i64>,
+    /// Per part: whether it's cut out of the saved clip.
+    deleted: Vec<bool>,
+    /// Where the open right-click menu was opened.
+    menu_at: i64,
 }
 
 impl ClipEditor {
@@ -167,6 +183,7 @@ impl ClipEditor {
                 let loaded = decode_clip_audio(&load_path).map_err(|e| e.to_string()).map(|audio| Loaded {
                     peaks: audio.tracks.iter().map(peaks).collect(),
                     audio: Arc::new(audio),
+                    timeline: ClipTimeline::read(&load_path).ok(),
                 });
                 let _ = tx.send(loaded);
                 repaint.request_repaint();
@@ -187,6 +204,80 @@ impl ClipEditor {
             paused_at: 0,
             last_drag_seek: None,
             saving: Saving::Idle,
+            timeline: None,
+            splits: Vec::new(),
+            deleted: vec![false],
+            menu_at: 0,
+        }
+    }
+
+    /// Part `index`'s start and end.
+    fn part_bounds(&self, index: usize) -> (i64, i64) {
+        let start = if index == 0 { 0 } else { self.splits[index - 1] };
+        (start, self.splits.get(index).copied().unwrap_or(self.duration()))
+    }
+
+    /// The part playing at `time`.
+    fn part_at(&self, time: i64) -> usize {
+        self.splits.partition_point(|&split| split <= time)
+    }
+
+    /// Splits the part playing at `time` there; both halves keep whether it
+    /// was cut out.
+    fn split_at(&mut self, time: i64) {
+        if self.timeline.is_none() || time <= 0 || time >= self.duration() || self.splits.contains(&time) {
+            return;
+        }
+        let part = self.part_at(time);
+        self.splits.insert(part, time);
+        self.deleted.insert(part, self.deleted[part]);
+        self.cuts_changed();
+    }
+
+    fn set_deleted(&mut self, part: usize, deleted: bool) {
+        self.deleted[part] = deleted;
+        self.cuts_changed();
+    }
+
+    /// Joins the parts either side of split `index`; the joined part is cut
+    /// out only if both were.
+    fn remove_split(&mut self, index: usize) {
+        self.splits.remove(index);
+        let right = self.deleted.remove(index + 1);
+        self.deleted[index] &= right;
+        self.cuts_changed();
+    }
+
+    fn cuts_changed(&mut self) {
+        if matches!(self.saving, Saving::Done(_)) {
+            self.saving = Saving::Idle;
+        }
+    }
+
+    fn has_cuts(&self) -> bool {
+        self.deleted.iter().any(|&deleted| deleted)
+    }
+
+    /// The parts you're keeping, adjacent ones joined.
+    fn wanted_parts(&self) -> Vec<(i64, i64)> {
+        let mut wanted: Vec<(i64, i64)> = Vec::new();
+        for index in (0..self.deleted.len()).filter(|&index| !self.deleted[index]) {
+            let (start, end) = self.part_bounds(index);
+            match wanted.last_mut() {
+                Some(last) if last.1 == start => last.1 = end,
+                _ => wanted.push((start, end)),
+            }
+        }
+        wanted
+    }
+
+    /// What saving would keep: each part starts at a keyframe (see
+    /// [`ClipTimeline::kept_parts`]).
+    fn kept_parts(&self) -> Vec<(i64, i64)> {
+        let wanted = self.wanted_parts();
+        match &self.timeline {
+            Some(timeline) if self.has_cuts() => timeline.kept_parts(&wanted).iter().map(|part| (part.start, part.end)).collect(),
+            _ => wanted,
         }
     }
 
@@ -253,11 +344,11 @@ impl ClipEditor {
                 Role::EarlierMix => None,
             })
             .collect();
-        ClipEdit { keep, mix: self.mix() }
+        ClipEdit { keep, mix: self.mix(), parts: self.has_cuts().then(|| self.wanted_parts()) }
     }
 
     fn is_edited(&self) -> bool {
-        self.rows.iter().any(|row| row.volume != row.default_volume())
+        self.rows.iter().any(|row| row.volume != row.default_volume()) || self.has_cuts()
     }
 
     fn start_save(&mut self, ctx: &egui::Context, overwrite: bool) {
@@ -348,10 +439,34 @@ impl ClipEditor {
             .collect();
         let player = Player::start(ctx, loaded.audio.clone());
         self.audio = Some(loaded.audio);
+        self.timeline = loaded.timeline;
         let mix = self.mix();
         player.set_gains(&mix);
         player.seek(hns_to_frames(self.paused_at));
         self.player = Some(player);
+    }
+
+    /// While playing, jumps over what saving would cut out, so you hear and
+    /// see the clip as it'll be; stops where the last kept part ends.
+    fn skip_cut_parts(&mut self) {
+        if !self.is_playing() || !self.has_cuts() {
+            return;
+        }
+        let position = self.position();
+        let kept = self.kept_parts();
+        if kept.iter().any(|&(start, end)| (start..end).contains(&position)) {
+            return;
+        }
+        match kept.iter().find(|&&(start, _)| start > position) {
+            Some(&(start, _)) => self.seek(start),
+            None => {
+                if let Some(player) = &self.player {
+                    player.set_playing(false);
+                }
+                let end = kept.last().map_or(0, |&(_, end)| end);
+                self.seek(end);
+            }
+        }
     }
 
     /// Shows the latest decoded frame due at the current position.
@@ -402,6 +517,16 @@ impl ClipEditor {
         if !typing && ui.input(|i| i.key_pressed(egui::Key::Space)) {
             self.toggle_play();
         }
+        if !typing && self.player.is_some() {
+            if ui.input(|i| i.key_pressed(egui::Key::S)) {
+                self.split_at(self.position());
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+                let part = self.part_at(self.position());
+                self.set_deleted(part, !self.deleted[part]);
+            }
+        }
+        self.skip_cut_parts();
 
         ui.horizontal(|ui| {
             if ui.button("← Clips").clicked() {
@@ -494,6 +619,17 @@ impl ClipEditor {
                 .monospace()
                 .color(theme::text_muted()),
         );
+        let can_split = self.player.is_some() && self.timeline.is_some();
+        let split = icon_button(&mut left, Icon::Split, false, can_split)
+            .on_hover_text("Split the clip at the playhead (S). Right-click a part to cut it out.")
+            .on_disabled_hover_text("This clip's video can't be cut");
+        if split.clicked() {
+            self.split_at(position);
+        }
+        if self.has_cuts() {
+            let kept: i64 = self.kept_parts().iter().map(|&(start, end)| end - start).sum();
+            left.label(egui::RichText::new(format!("Keeping {}", format_duration_precise(kept))).color(theme::accent()));
+        }
         let transport = egui::Rect::from_center_size(row.center(), egui::vec2(TRANSPORT_WIDTH, row.height()));
         let mut middle = ui.new_child(egui::UiBuilder::new().max_rect(transport).layout(egui::Layout::left_to_right(egui::Align::Center)));
         self.transport_ui(&mut middle);
@@ -539,18 +675,20 @@ impl ClipEditor {
     fn save_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let ready = self.player.is_some();
         let busy = matches!(self.saving, Saving::Running { .. });
-        let can_save = ready && !busy;
+        let something_kept = self.deleted.iter().any(|&deleted| !deleted);
+        let can_save = ready && !busy && something_kept;
+        let not_ready = if something_kept { "Change a volume or cut something first" } else { "Keep at least one part" };
         let overwrite = ui
             .add_enabled(can_save && self.is_edited(), egui::Button::new("Overwrite"))
-            .on_hover_text("Replace this clip with the new mix")
-            .on_disabled_hover_text("Change a volume first");
+            .on_hover_text("Replace this clip with the edited one")
+            .on_disabled_hover_text(not_ready);
         if overwrite.clicked() {
             self.start_save(ctx, true);
         }
         let save_new = ui
             .add_enabled(can_save && self.is_edited(), egui::Button::new(egui::RichText::new("Save as new clip").strong()))
-            .on_hover_text("Save a copy with the new mix; this clip stays as it is")
-            .on_disabled_hover_text("Change a volume first");
+            .on_hover_text("Save an edited copy; this clip stays as it is")
+            .on_disabled_hover_text(not_ready);
         if save_new.clicked() {
             self.start_save(ctx, false);
         }
@@ -561,6 +699,8 @@ impl ClipEditor {
             if let Some(player) = &self.player {
                 player.set_gains(&self.mix());
             }
+            self.splits.clear();
+            self.deleted = vec![false];
         }
         match &self.saving {
             Saving::Idle => {}
@@ -597,6 +737,38 @@ impl ClipEditor {
         let scrub = ui
             .interact(lanes, ui.scope_id().with("clip-timeline"), egui::Sense::click_and_drag())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let time_at = |x: f32| (duration as f64 * ((x - lanes.left()) / lanes.width()).clamp(0.0, 1.0) as f64) as i64;
+        if scrub.secondary_clicked() {
+            if let Some(pointer) = scrub.interact_pointer_pos() {
+                self.menu_at = time_at(pointer.x);
+            }
+        }
+        if self.timeline.is_some() && self.player.is_some() {
+            let at = self.menu_at;
+            let part = self.part_at(at);
+            let near_split = self.splits.iter().position(|&split| (x_of(split) - x_of(at)).abs() <= SPLIT_GRAB);
+            scrub.context_menu(|ui| {
+                if self.deleted[part] {
+                    if ui.button("Keep this part").clicked() {
+                        self.set_deleted(part, false);
+                        ui.close();
+                    }
+                } else if ui.button("Cut this part out").clicked() {
+                    self.set_deleted(part, true);
+                    ui.close();
+                }
+                if ui.button("Split here").clicked() {
+                    self.split_at(at);
+                    ui.close();
+                }
+                if let Some(split) = near_split {
+                    if ui.button("Remove this split").clicked() {
+                        self.remove_split(split);
+                        ui.close();
+                    }
+                }
+            });
+        }
         if let Some(pointer) = scrub.interact_pointer_pos().filter(|_| self.player.is_some()) {
             let throttled = scrub.dragged() && self.last_drag_seek.is_some_and(|at| at.elapsed() < Duration::from_millis(60));
             if (scrub.clicked() || scrub.drag_started() || scrub.drag_stopped() || scrub.dragged()) && !throttled {
@@ -702,8 +874,55 @@ impl ClipEditor {
         }
 
         if duration > 0 {
+            self.draw_cuts(ui, &painter, lanes, ruler.bottom(), &x_of);
             let x = x_of(self.position().min(duration));
             painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], egui::Stroke::new(2.0, visuals.strong_text_color()));
+        }
+    }
+}
+
+impl ClipEditor {
+    /// Shades what saving cuts out, marks what a cut leaves in because
+    /// the video can only start at a keyframe, and draws the splits.
+    fn draw_cuts(&self, ui: &egui::Ui, painter: &egui::Painter, lanes: egui::Rect, top: f32, x_of: &dyn Fn(i64) -> f32) {
+        let span = |from: i64, to: i64| egui::Rect::from_min_max(egui::pos2(x_of(from), top), egui::pos2(x_of(to), lanes.bottom()));
+        if self.has_cuts() {
+            let kept = self.kept_parts();
+            // Cut out: everything between the kept parts.
+            let mut from = 0;
+            for &(start, end) in kept.iter().chain(std::iter::once(&(self.duration(), self.duration()))) {
+                if start > from {
+                    painter.rect_filled(span(from, start), 0.0, theme::danger().gamma_multiply(0.35));
+                }
+                from = from.max(end);
+            }
+            // Kept although you cut it: before a keyframe.
+            for part in (0..self.deleted.len()).filter(|&part| self.deleted[part]) {
+                let (start, end) = self.part_bounds(part);
+                for &(kept_start, kept_end) in &kept {
+                    let (overlap_start, overlap_end) = (start.max(kept_start), end.min(kept_end));
+                    if overlap_end > overlap_start {
+                        let area = span(overlap_start, overlap_end);
+                        painter.rect_filled(area, 0.0, theme::warning().gamma_multiply(0.25));
+                        if ui.rect_contains_pointer(area) {
+                            egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), ui.scope_id().with("keyframe-tip"), egui::PopupAnchor::Pointer)
+                                .show(|ui| {
+                                    ui.label("Kept: the video can only start at a keyframe (one each second in Sonora's clips), so this part starts a little early.");
+                                });
+                        }
+                    }
+                }
+            }
+        }
+        for &split in &self.splits {
+            let x = x_of(split);
+            painter.line_segment([egui::pos2(x, top), egui::pos2(x, lanes.bottom())], egui::Stroke::new(2.0, theme::accent()));
+            let tip = egui::pos2(x, top + 7.0);
+            painter.add(egui::Shape::convex_polygon(
+                vec![egui::pos2(x - 5.0, top), egui::pos2(x + 5.0, top), tip],
+                theme::accent(),
+                egui::Stroke::NONE,
+            ));
         }
     }
 }

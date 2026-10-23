@@ -107,6 +107,13 @@ guide** shows it again.
   seconds (also changeable). A sound plays when it's saved.
 - Clips in subfolders show too; sort them by date or game, or show one game.
 - Click a clip to watch it, rebalance each audio track, and save a copy.
+- To trim a clip, move the playhead and press the scissors (or **S**) to
+  split it, then right-click a part and **Cut this part out** (or press
+  **Delete** with the playhead on it). Playback skips cut parts, so you hear
+  the result. **Save as new clip** or **Overwrite** keeps only what's left.
+  The video isn't re-encoded, so a kept part starts at the keyframe just
+  before your split (up to a second early in Sonora's clips); the timeline
+  shows that bit in amber.
 
 **Colors**
 

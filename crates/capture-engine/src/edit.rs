@@ -1,6 +1,7 @@
 //! Clip editing: decode a saved clip's audio tracks, then write a copy with
-//! each track's volume changed and a new default mix. The video is copied
-//! as is, never re-encoded.
+//! each track's volume changed, a new default mix, and parts cut out. The
+//! video is copied as is, never re-encoded, so a kept part can only start at
+//! a keyframe (see [`ClipTimeline::kept_parts`]).
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek};
@@ -33,6 +34,8 @@ pub enum EditError {
     Save(#[from] SaveError),
     #[error(transparent)]
     Windows(#[from] windows::core::Error),
+    #[error("every part of the clip is cut out")]
+    NothingKept,
 }
 
 /// A saved clip's audio, decoded to 48 kHz stereo.
@@ -84,6 +87,125 @@ pub struct ClipEdit {
     /// Per source audio track: its weight in the new default track, which
     /// is written last.
     pub mix: Vec<f32>,
+    /// The parts to keep, as `(start, end)` in 100 ns units, in order and
+    /// not overlapping; `None` keeps the whole clip. Each starts at the
+    /// keyframe at or before its start (see [`ClipTimeline::kept_parts`]).
+    pub parts: Option<Vec<(i64, i64)>>,
+}
+
+/// When each of a clip's video frames starts and which are keyframes, from
+/// the MP4's index alone (no frame data is read).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClipTimeline {
+    /// Each frame's start, in 100 ns units from the clip's start.
+    pub frame_times: Vec<i64>,
+    /// Which frames playback can start from.
+    pub keyframes: Vec<bool>,
+    /// When the last frame ends.
+    pub end: i64,
+}
+
+/// A part of a clip a save keeps: frames `first_frame..end_frame`, which
+/// play from `start` to `end` (100 ns units).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeptPart {
+    pub first_frame: usize,
+    pub end_frame: usize,
+    pub start: i64,
+    pub end: i64,
+}
+
+impl ClipTimeline {
+    pub fn read(path: &Path) -> Result<Self, EditError> {
+        let mp4 = open_mp4(path)?;
+        let layout = read_layout(&mp4)?;
+        Ok(Self::of_track(&mp4.tracks()[&layout.video]))
+    }
+
+    fn of_track(track: &mp4::Mp4Track) -> Self {
+        let stbl = &track.trak.mdia.minf.stbl;
+        let timescale = track.timescale() as i64;
+        let mut frame_times = Vec::new();
+        let mut ticks = 0i64;
+        for entry in &stbl.stts.entries {
+            for _ in 0..entry.sample_count {
+                frame_times.push(ticks_to_hns(ticks, timescale));
+                ticks += entry.sample_delta as i64;
+            }
+        }
+        // No sync sample table means every frame is a keyframe.
+        let keyframes = match &stbl.stss {
+            Some(stss) => {
+                let mut keyframes = vec![false; frame_times.len()];
+                for &sample in &stss.entries {
+                    if let Some(keyframe) = keyframes.get_mut((sample as usize).wrapping_sub(1)) {
+                        *keyframe = true;
+                    }
+                }
+                keyframes
+            }
+            None => vec![true; frame_times.len()],
+        };
+        Self { frame_times, keyframes, end: ticks_to_hns(ticks, timescale) }
+    }
+
+    /// What a save keeps of the parts `wanted` (`(start, end)` in 100 ns
+    /// units, in order). The video is copied, not re-encoded, so a part
+    /// can only start at a keyframe: each starts at the keyframe at or
+    /// before its start (Sonora's clips have one every second), and ends
+    /// with the last frame starting before its end. Parts that then touch
+    /// or overlap are joined: the cut between them is shorter than the
+    /// keyframes allow.
+    pub fn kept_parts(&self, wanted: &[(i64, i64)]) -> Vec<KeptPart> {
+        let mut parts: Vec<KeptPart> = Vec::new();
+        for &(start, end) in wanted {
+            if end <= start || self.frame_times.is_empty() {
+                continue;
+            }
+            // The frame showing at `start`, then the keyframe it needs.
+            let showing = self.frame_times.partition_point(|&t| t <= start).saturating_sub(1);
+            let first_frame = (0..=showing).rev().find(|&frame| self.keyframes[frame]).unwrap_or(0);
+            let end_frame = self.frame_times.partition_point(|&t| t < end);
+            if end_frame <= first_frame {
+                continue;
+            }
+            match parts.last_mut() {
+                Some(last) if first_frame <= last.end_frame => last.end_frame = last.end_frame.max(end_frame),
+                _ => parts.push(KeptPart { first_frame, end_frame, start: 0, end: 0 }),
+            }
+        }
+        for part in &mut parts {
+            part.start = self.frame_times[part.first_frame];
+            part.end = self.frame_times.get(part.end_frame).copied().unwrap_or(self.end);
+        }
+        parts
+    }
+}
+
+/// `audio` cut down to `parts`, joined end to end.
+fn cut_audio(audio: &ClipAudio, parts: &[KeptPart]) -> ClipAudio {
+    let to_frames = |hns: i64| (hns.max(0) as i128 * SAMPLE_RATE as i128 / HNS_PER_SECOND as i128) as usize;
+    let frames = parts.iter().map(|part| to_frames(part.end) - to_frames(part.start)).sum();
+    let tracks = audio
+        .tracks
+        .iter()
+        .map(|track| TrackAudio {
+            samples: if track.is_silent() {
+                Vec::new()
+            } else {
+                let mut samples = Vec::with_capacity(frames * CHANNELS);
+                for part in parts {
+                    let (from, to) = (to_frames(part.start) * CHANNELS, to_frames(part.end) * CHANNELS);
+                    let available = &track.samples[from.min(track.samples.len())..to.min(track.samples.len())];
+                    samples.extend_from_slice(available);
+                    // Silence where the track ended early, so later parts stay in sync.
+                    samples.resize(samples.len() + (to - from - available.len()), 0);
+                }
+                samples
+            },
+        })
+        .collect();
+    ClipAudio { tracks, frames }
 }
 
 /// Where a clip's tracks are, from its MP4 header. Only the layout
@@ -178,6 +300,7 @@ pub fn save_edited_clip(source: &Path, destination: &Path, audio: &ClipAudio, ed
     let (width, height) = (video.width(), video.height());
     let (sps, pps) = (video.sequence_parameter_set()?.to_vec(), video.picture_parameter_set()?.to_vec());
     let timescale = video.timescale() as i64;
+    let timeline = ClipTimeline::of_track(video);
     let mut frames = Vec::new();
     let mut last_duration = 0;
     for id in 1..=mp4.sample_count(layout.video)? {
@@ -193,9 +316,48 @@ pub fn save_edited_clip(source: &Path, destination: &Path, audio: &ClipAudio, ed
         last_duration = sample.duration;
     }
 
+    // Cutting: keep the parts' frames, closing the gaps between them, and
+    // the audio from the same moments.
+    let mut frame_duration = ticks_to_hns(last_duration as i64, timescale);
+    let cut = match &edit.parts {
+        Some(wanted) => {
+            let parts = timeline.kept_parts(wanted);
+            if parts.is_empty() {
+                return Err(EditError::NothingKept);
+            }
+            let mut kept = Vec::new();
+            let mut offset = 0;
+            for part in &parts {
+                for frame in &frames[part.first_frame..part.end_frame] {
+                    kept.push(VideoSample { pts: frame.pts - part.start + offset, keyframe: frame.keyframe, data: frame.data.clone() });
+                }
+                offset += part.end - part.start;
+            }
+            let (last_part, last_frame) = (parts[parts.len() - 1], &frames[parts[parts.len() - 1].end_frame - 1]);
+            frame_duration = last_part.end - last_frame.pts;
+            frames = kept;
+            Some(cut_audio(audio, &parts))
+        }
+        None => None,
+    };
+
     let _mf = MfThread::init()?;
     let mut tracks = Vec::new();
+    if let Some(cut) = &cut {
+        // Cut audio is encoded afresh (AAC blocks don't line up with cuts).
+        let blocks = cut.frames.div_ceil(BLOCK_FRAMES as usize);
+        for (index, volume) in edit.keep.iter().enumerate() {
+            let Some(volume) = volume else { continue };
+            let mut weights = vec![0.0; cut.tracks.len()];
+            weights[index] = *volume;
+            tracks.push(encode_mix(cut, &weights, blocks)?);
+        }
+        tracks.push(encode_mix(cut, &edit.mix, blocks)?);
+    }
     for (index, &track_id) in layout.audio.iter().enumerate() {
+        if cut.is_some() {
+            break;
+        }
         let Some(volume) = edit.keep[index] else { continue };
         let original_frames = mp4.sample_count(track_id)? as usize;
         tracks.push(if volume == 1.0 || audio.tracks[index].is_silent() {
@@ -211,8 +373,10 @@ pub fn save_edited_clip(source: &Path, destination: &Path, audio: &ClipAudio, ed
             encode_mix(audio, &weights, original_frames)?
         });
     }
-    let longest = layout.audio.iter().map(|&id| mp4.sample_count(id)).collect::<Result<Vec<_>, _>>()?.into_iter().max().unwrap_or(0);
-    tracks.push(encode_mix(audio, &edit.mix, longest as usize)?);
+    if cut.is_none() {
+        let longest = layout.audio.iter().map(|&id| mp4.sample_count(id)).collect::<Result<Vec<_>, _>>()?.into_iter().max().unwrap_or(0);
+        tracks.push(encode_mix(audio, &edit.mix, longest as usize)?);
+    }
 
     let clip = Clip {
         width,
@@ -220,7 +384,7 @@ pub fn save_edited_clip(source: &Path, destination: &Path, audio: &ClipAudio, ed
         sps,
         pps,
         frames,
-        frame_duration: ticks_to_hns(last_duration as i64, timescale),
+        frame_duration,
         audio: tracks,
     };
     // Written under a temporary name first, so a failed save never leaves
@@ -279,6 +443,93 @@ mod tests {
         for ticks in [0, 1, 1499, 1500, 1501, 3000, 89_999, 90_000, 5_400_123] {
             assert_eq!(to_ticks(ticks_to_hns(ticks, 90_000)), ticks);
         }
+    }
+
+    /// A 10 s clip at 10 fps with a keyframe every second.
+    fn timeline() -> ClipTimeline {
+        let frame_times: Vec<i64> = (0..100).map(|i| i * HNS_PER_SECOND / 10).collect();
+        let keyframes = (0..100).map(|i| i % 10 == 0).collect();
+        ClipTimeline { frame_times, keyframes, end: 10 * HNS_PER_SECOND }
+    }
+
+    fn secs(s: f64) -> i64 {
+        (s * HNS_PER_SECOND as f64).round() as i64
+    }
+
+    #[test]
+    fn a_kept_part_starts_at_the_keyframe_before_it_and_ends_where_asked() {
+        let parts = timeline().kept_parts(&[(secs(2.5), secs(6.25))]);
+        assert_eq!(parts, [KeptPart { first_frame: 20, end_frame: 63, start: secs(2.0), end: secs(6.3) }]);
+        // Starting right on a keyframe keeps exactly that.
+        let parts = timeline().kept_parts(&[(secs(3.0), secs(4.0))]);
+        assert_eq!((parts[0].start, parts[0].end), (secs(3.0), secs(4.0)));
+        // A part running to the end ends with the clip.
+        let parts = timeline().kept_parts(&[(secs(9.0), secs(10.0))]);
+        assert_eq!((parts[0].end_frame, parts[0].end), (100, secs(10.0)));
+    }
+
+    #[test]
+    fn a_cut_shorter_than_the_keyframes_allow_joins_its_parts() {
+        // Cutting 4.2-4.6 s: the second part would start back at 4 s.
+        let parts = timeline().kept_parts(&[(0, secs(4.2)), (secs(4.6), secs(10.0))]);
+        assert_eq!(parts.len(), 1);
+        assert_eq!((parts[0].start, parts[0].end), (0, secs(10.0)));
+        // Cutting 3-6 s works (the second part starts on a keyframe).
+        let parts = timeline().kept_parts(&[(0, secs(3.0)), (secs(6.0), secs(10.0))]);
+        assert_eq!(parts.iter().map(|p| (p.start, p.end)).collect::<Vec<_>>(), [(0, secs(3.0)), (secs(6.0), secs(10.0))]);
+    }
+
+    #[test]
+    fn cut_audio_joins_the_kept_moments() {
+        // 1 s of audio counting up, one frame per sample pair.
+        let samples: Vec<i16> = (0..48_000).flat_map(|i| [(i / 100) as i16, 0]).collect();
+        let audio = ClipAudio { tracks: vec![TrackAudio { samples }, TrackAudio { samples: Vec::new() }], frames: 48_000 };
+        let parts = [
+            KeptPart { first_frame: 0, end_frame: 0, start: 0, end: secs(0.25) },
+            KeptPart { first_frame: 0, end_frame: 0, start: secs(0.75), end: secs(1.0) },
+        ];
+        let cut = cut_audio(&audio, &parts);
+        assert_eq!(cut.frames, 24_000);
+        assert_eq!(cut.tracks[0].samples.len(), 48_000);
+        assert_eq!(cut.tracks[0].frame(11_999)[0], ((11_999 / 100) as f32) / 32768.0);
+        assert_eq!(cut.tracks[0].frame(12_000)[0], ((36_000 / 100) as f32) / 32768.0);
+        assert!(cut.tracks[1].is_silent());
+    }
+
+    /// Cuts the middle out of a real clip (`SONORA_TEST_CLIP`), writing to
+    /// a temporary folder, and checks the result's length, keyframes and
+    /// audio: `cargo test -p capture-engine --lib real_clip -- --ignored`.
+    #[test]
+    #[ignore]
+    fn cutting_a_real_clip_keeps_just_the_kept_parts() {
+        let source = std::path::PathBuf::from(std::env::var("SONORA_TEST_CLIP").expect("set SONORA_TEST_CLIP"));
+        let destination = std::env::temp_dir().join(format!("sonora-cut-test-{}.mp4", std::process::id()));
+        let timeline = ClipTimeline::read(&source).unwrap();
+        let audio = decode_clip_audio(&source).unwrap();
+        let length = timeline.end;
+        // Keep the first quarter and the last quarter.
+        let wanted = [(0, length / 4), (length * 3 / 4, length)];
+        let parts = timeline.kept_parts(&wanted);
+        let expected: i64 = parts.iter().map(|p| p.end - p.start).sum();
+        let tracks = audio.tracks.len();
+        let edit = ClipEdit { keep: vec![Some(1.0); tracks], mix: vec![1.0; tracks], parts: Some(wanted.to_vec()) };
+        save_edited_clip(&source, &destination, &audio, &edit).unwrap();
+
+        let cut = ClipTimeline::read(&destination).unwrap();
+        assert!((cut.end - expected).abs() < HNS_PER_SECOND / 50, "video is {} long, expected {}", cut.end, expected);
+        assert!(cut.keyframes[0], "the cut clip starts on a keyframe");
+        let cut_audio = decode_clip_audio(&destination).unwrap();
+        let audio_length = cut_audio.frames as i64 * HNS_PER_SECOND / SAMPLE_RATE as i64;
+        assert!((audio_length - expected).abs() < HNS_PER_SECOND / 10, "audio is {audio_length} long, video {expected}");
+        assert_eq!(cut_audio.tracks.len(), tracks + 1, "every track plus the new mix");
+        eprintln!(
+            "cut {:.2} s down to {:.2} s ({} parts, starting at {:?} s)",
+            length as f64 / 1e7,
+            cut.end as f64 / 1e7,
+            parts.len(),
+            parts.iter().map(|p| p.start as f64 / 1e7).collect::<Vec<_>>()
+        );
+        std::fs::remove_file(destination).unwrap();
     }
 
     #[test]
