@@ -168,5 +168,6 @@ fn main() -> windows::core::Result<()> {
     }
     drop(mixer);
     let _ = tone.kill();
+    let _ = tone.wait();
     Ok(())
 }
