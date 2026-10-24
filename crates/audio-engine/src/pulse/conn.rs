@@ -16,6 +16,7 @@ use pa::proplist::{properties, Proplist};
 use pa::sample::{Format, Spec};
 use pa::stream::{FlagSet as StreamFlags, PeekResult, State as StreamState, Stream};
 use pa::time::MicroSeconds;
+use pa::volume::ChannelVolumes;
 
 use crate::error::{timed_out, Error, Result};
 
@@ -46,6 +47,8 @@ pub(crate) struct SinkInput {
     pub(crate) binary: Option<String>,
     /// Event sounds (notifications, clicks) rather than an app's audio.
     pub(crate) is_event: bool,
+    /// Its own volume, per channel.
+    pub(crate) volume: ChannelVolumes,
 }
 
 pub(crate) struct Module {
@@ -169,6 +172,7 @@ impl Connection {
                     app_name: property(properties::APPLICATION_NAME),
                     binary: property(properties::APPLICATION_PROCESS_BINARY),
                     is_event: property(properties::MEDIA_ROLE).as_deref() == Some("event"),
+                    volume: info.volume,
                 });
             }
         });
@@ -224,13 +228,32 @@ impl Connection {
         self.wait(operation)
     }
 
+    /// Sets an app's stream's own volume.
+    pub(crate) fn set_sink_input_volume(&mut self, index: u32, volume: &ChannelVolumes) -> Result<()> {
+        let operation = self.context.introspect().set_sink_input_volume(index, volume, None);
+        self.wait(operation)
+    }
+
     /// Starts recording `device` (`None`: the default microphone) as f32 at
     /// 48 kHz, in blocks of about 10 ms. A chosen device that goes away ends
     /// the recording; the default one follows the server's default.
     pub(crate) fn record(&mut self, device: Option<&str>, channels: u8, purpose: &str) -> Result<Stream> {
+        self.record_stream(device, None, channels, purpose)
+    }
+
+    /// Starts recording just app stream `sink_input`, as it plays on
+    /// `sink` (at its own volume), like [`Self::record`].
+    pub(crate) fn record_sink_input(&mut self, sink: &str, sink_input: u32, purpose: &str) -> Result<Stream> {
+        self.record_stream(Some(&format!("{sink}.monitor")), Some(sink_input), 2, purpose)
+    }
+
+    fn record_stream(&mut self, device: Option<&str>, sink_input: Option<u32>, channels: u8, purpose: &str) -> Result<Stream> {
         let spec = Spec { format: Format::F32le, channels, rate: SAMPLE_RATE };
         let mut stream = Stream::new(&mut self.context, purpose, &spec, None)
             .ok_or_else(|| Error::new("couldn't create a recording stream"))?;
+        if let Some(sink_input) = sink_input {
+            stream.set_monitor_stream(sink_input).map_err(|error| Error::new(format!("couldn't record an app: {error}")))?;
+        }
         let block = SAMPLE_RATE / 100 * u32::from(channels) * 4;
         let attr = BufferAttr { maxlength: u32::MAX, tlength: u32::MAX, prebuf: u32::MAX, minreq: u32::MAX, fragsize: block };
         let flags = if device.is_some() { StreamFlags::ADJUST_LATENCY | StreamFlags::DONT_MOVE } else { StreamFlags::ADJUST_LATENCY };

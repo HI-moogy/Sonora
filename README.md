@@ -81,11 +81,11 @@ guide** shows it again.
 - **Plays on** picks where that channel plays (headset, speakers, TV...).
   "If it disconnects" decides whether it falls back to your default output
   or goes silent.
-- **Windows:** a channel with a flat EQ plays its apps straight on its
-  device, with no added delay (the panel says so). Turn its EQ on, or an
-  app above 100%, and Sonora plays them itself, about 60 to 90 ms later. An
-  app that's already playing switches once it opens its sound again:
-  restart it to switch now.
+- A channel with a flat EQ plays its apps straight on its device, with no
+  added delay (the panel says so). Turn its EQ on, or an app above 100%,
+  and Sonora plays them itself, a little later (about 60 to 90 ms on
+  Windows, 40 ms on Linux). On Windows, an app that's already playing
+  switches once it opens its sound again: restart it to switch now.
 - **Priority** trades delay for safety from crackles when Sonora plays a
   channel: High for games and voice, Normal or Low for music and video.
 - **EQ** has presets for games, music, voice and video; **Save as...** keeps
@@ -152,10 +152,10 @@ recording) keeps going. Click the icon to open it again; right-click it for
   until it starts again, which puts them back.
 - Don't run Sonora together with SteelSeries Sonar or similar mixers; they
   fight over the same apps.
-- Apps that Sonora plays itself (a channel with EQ on, an app above 100%,
-  and every routed app on Linux) play late: about 60 to 90 ms on Windows,
-  most of it Windows' own capture, which Sonora can't shorten. Keep the EQ
-  flat on your game channel for no added delay, and use High priority
+- Apps that Sonora plays itself (a channel with EQ on, or an app above
+  100%) play late: about 60 to 90 ms on Windows, most of it Windows' own
+  capture, which Sonora can't shorten, and about 40 ms on Linux. Keep the
+  EQ flat on your game channel for no added delay, and use High priority
   otherwise.
 - Recording only while a game is open hasn't been tried with many games
   yet.

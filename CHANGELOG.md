@@ -4,7 +4,9 @@
 
 ### New
 
-- **No added delay** (Windows): a channel with a flat EQ now plays its apps straight on its device, as Windows' own per-app output setting does, instead of capturing them and playing them again. Measured: routed apps came out 83 ms after they were due, now 18 ms, the same as not routing them at all. Volume, mute, meters and clip tracks work as before. With the EQ on (or an app turned above 100%), Sonora still plays the channel itself, about 60 to 90 ms late, and the channel's panel says which it is. An app that's already playing switches once it opens its sound again (restart it to switch now).
+- **No added delay**: a channel with a flat EQ now plays its apps straight on its device instead of capturing them and playing them again. Volume, mute, meters and clip tracks work as before. With the EQ on (or an app turned above 100%), Sonora still plays the channel itself, and the channel's panel says which it is.
+  - **Windows** uses its own per-app output setting. Measured: routed apps came out 83 ms after they were due, now 18 ms, the same as not routing them. An app that's already playing switches once it opens its sound again (restart it to switch now).
+  - **Linux** moves the app's streams straight to the channel's output, right away. Measured on PulseAudio: 40 ms through Sonora, now none.
 
 ## 0.1.0-alpha.5 (2026-10-23)
 

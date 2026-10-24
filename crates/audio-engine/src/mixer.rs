@@ -61,10 +61,10 @@ pub(crate) const MAX_BUFFERED_SAMPLES: usize = 48_000 * CHANNELS * 2;
 /// How an app should be routed, as the render loop works it out from its
 /// channel each tick; its capture thread carries it out.
 #[derive(Debug, Clone, Default, PartialEq)]
-#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) struct RoutePlan {
-    /// Play straight on the channel's device (Windows' per-app output), with
-    /// no delay added: possible when nothing needs the mixer's processing
+    /// Play straight on the channel's device, with no delay added (Windows'
+    /// per-app output; on Linux, its streams moved there): possible when
+    /// nothing needs the mixer's processing
     /// (flat EQ, no boost above 100%) and the channel plays on its own device.
     pub(crate) direct: bool,
     /// The channel's device; `None` is Windows' default.
@@ -88,7 +88,6 @@ pub(crate) struct SourceInner {
     pub(crate) samples: Mutex<VecDeque<f32>>,
     pub(crate) stop: Arc<AtomicBool>,
     /// Set by the render loop, carried out by the capture thread.
-    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) plan: Mutex<RoutePlan>,
     /// Set by the capture thread once the app plays straight on its
     /// channel's device: its captured audio (at the app's own volume) is
@@ -743,8 +742,7 @@ fn update_route_plans(bus_snapshot: &[BusSnapshot], master_gain: f32) {
     for snapshot in bus_snapshot {
         let bus = &snapshot.bus;
         let flat = bus.eq.lock().unwrap().gains().iter().all(|gain| gain.abs() < 0.01);
-        let bus_direct = cfg!(windows)
-            && snapshot.device_ok
+        let bus_direct = snapshot.device_ok
             && flat
             && !snapshot.send
             && bus.heard.load(Ordering::Relaxed);
@@ -1219,18 +1217,16 @@ mod tests {
 
     #[test]
     fn apps_play_direct_only_when_nothing_needs_the_mixer() {
-        // Only Windows can point an app at a device.
-        let direct = cfg!(windows);
         let (game, app) = (bus(), source(Some(100), "Game"));
         game.gain.store(0.5);
         app.gain.store(0.8);
         let plan = plan_for(&game, &app, true, 1.0);
-        assert_eq!(plan, RoutePlan { direct, device: Some("headset".into()), volume: 0.4 });
-        assert_eq!(game.direct.load(Ordering::Relaxed), direct);
+        assert_eq!(plan, RoutePlan { direct: true, device: Some("headset".into()), volume: 0.4 });
+        assert!(game.direct.load(Ordering::Relaxed));
 
         // Muted, it still plays direct, at no volume.
         game.muted.store(true, Ordering::Relaxed);
-        assert_eq!(plan_for(&game, &app, true, 1.0), RoutePlan { direct, device: Some("headset".into()), volume: 0.0 });
+        assert_eq!(plan_for(&game, &app, true, 1.0), RoutePlan { direct: true, device: Some("headset".into()), volume: 0.0 });
         game.muted.store(false, Ordering::Relaxed);
 
         // Above 100% overall, only the mixer can boost it.
