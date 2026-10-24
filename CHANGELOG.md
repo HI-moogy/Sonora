@@ -1,13 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.4 (2026-10-23)
 
 ### New
 
 - **Add a program by name**: under a channel's **Add an app**, **Can't find your program? Add it manually** takes a program's name (like `deadlock.exe`) or the program picked with **Browse…**. It joins the channel whenever it plays, and is saved and removed like any app you added.
 
+### Changed
+
+- **Copy details** also says how your voice gets to Discord: which mic is recorded, where the Mic channel sends it, **Listen to my mic**, noise removal and EQ, and on Windows the mic's format and whether your default output is the virtual cable. That's what's needed to tell why a voice sounds wrong.
+- The Mic panel suggests turning off Discord's own noise suppression while Sonora's is on, since two in a row make a voice sound underwater.
+
 ### Fixed
 
+- **A doubled, underwater voice in Discord.** If your saved mic couldn't open when Sonora started (a headset not connected yet) and you picked a mic again, both were recorded and sent to the cable a few milliseconds apart, and it came back on every start. Sonora now records one mic, and switching mics never plays both.
+- **Listen to my mic** no longer sends a second copy of your voice when Windows' default output is the virtual cable.
+- Mics and virtual cables that don't run at 48 kHz sound cleaner: Windows now converts them with its better converter.
 - A game started from Steam was missing from **Add an app** while Steam itself had a sound going (voice chat, a notification): the game was counted as part of Steam. Programs with a window of their own are listed on their own now.
 - An app Sonora isn't allowed to look into (some run as administrator, or protected by anti-cheat) was missing from **Add an app**, and wasn't routed again when it opened.
 
