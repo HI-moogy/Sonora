@@ -91,6 +91,9 @@ guide** shows it again.
   channel: High for games and voice, Normal or Low for music and video.
 - **EQ** has presets for games, music, voice and video; **Save as...** keeps
   your own.
+- **Virtual surround for headphones** plays a channel as if from speakers in
+  a room around you, rather than inside your head. **Speaker distance**
+  moves them closer (drier) or farther (more room).
 - Drag a fader (or scroll on it) to change the volume; double-click it for
   100%. **Mute** silences the whole channel. **Master** changes everything
   you hear.

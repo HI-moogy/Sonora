@@ -7,13 +7,14 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::sync::Condvar;
 use std::time::{Duration, Instant};
 
-use common::Priority;
+use common::{Priority, Surround};
 
 use crate::atomic_f32::AtomicF32;
 use crate::denoise::MicCleanup;
 use crate::eq::{EqBands, EQ_BAND_COUNT};
 use crate::error::{self, Result};
 use crate::platform::{self, DeviceOutput};
+use crate::surround::VirtualSurround;
 
 pub(crate) const CHANNELS: usize = 2;
 pub(crate) const SAMPLE_RATE: f32 = 48_000.0;
@@ -196,6 +197,7 @@ struct BusInner {
     /// Peak since the UI last looked.
     level: AtomicF32,
     eq: Mutex<EqBands>,
+    surround: Mutex<VirtualSurround>,
     /// `None` renders to the system default output device.
     device_id: Mutex<Option<String>>,
     /// Whether the bus plays on the default device while its own device is
@@ -271,10 +273,12 @@ pub struct BusInfo {
     /// See [`Mixer::set_bus_monitor`].
     pub monitor: bool,
     /// Whether its apps can play straight on its device, with no delay
-    /// added: nothing needs the mixer (EQ flat) and the device is there.
-    /// An app turned above 100% still goes through the mixer, and one
-    /// already playing moves once it opens its audio again.
+    /// added: nothing needs the mixer (EQ flat, surround off) and the device
+    /// is there. An app turned above 100% still goes through the mixer, and
+    /// one already playing moves once it opens its audio again.
     pub direct: bool,
+    /// See [`Mixer::set_bus_surround`].
+    pub surround: Surround,
 }
 
 /// Captures audio from any number of processes (plus optionally the
@@ -562,6 +566,16 @@ impl Mixer {
         }
     }
 
+    /// Plays `bus` as if from speakers in a room around you (for headphones),
+    /// or not, and sets how far away they are. Turning it on or off fades
+    /// over a few ms. Only what you hear changes: meters and clips keep the
+    /// bus's own sound, and a send bus never gets it. Off by default.
+    pub fn set_bus_surround(&self, bus: &str, surround: Surround) {
+        if let Some(bus) = self.buses.lock().unwrap().get(bus) {
+            bus.surround.lock().unwrap().set(surround);
+        }
+    }
+
     /// Sets one band (0..[`EQ_BAND_COUNT`]) of `bus`'s EQ, in dB.
     pub fn set_bus_eq_band(&self, bus: &str, band: usize, gain_db: f32) {
         if let Some(bus) = self.buses.lock().unwrap().get(bus) {
@@ -665,6 +679,7 @@ impl Mixer {
                 send: b.send.load(Ordering::Relaxed),
                 monitor: b.monitor.load(Ordering::Relaxed),
                 direct: b.direct.load(Ordering::Relaxed),
+                surround: b.surround.lock().unwrap().settings(),
             })
             .collect()
     }
@@ -686,6 +701,7 @@ impl Mixer {
                 muted: AtomicBool::new(false),
                 level: AtomicF32::new(0.0),
                 eq: Mutex::new(EqBands::from_gains(SAMPLE_RATE, gains_db)),
+                surround: Mutex::new(VirtualSurround::new(Surround::default())),
                 device_id: Mutex::new(None),
                 fallback_to_default: AtomicBool::new(true),
                 heard: AtomicBool::new(true),
@@ -741,17 +757,18 @@ struct BusSnapshot {
 
 /// Works out how each app should be routed (see [`RoutePlan`]) for its
 /// capture thread to carry out. Its bus can play direct when nothing needs
-/// the mixer: a flat EQ, a bus you hear on its own device (not a send, and
-/// not falling back to the default because its device is gone). An app
-/// turned above 100% overall still needs the mixer to boost it. Where the
-/// mixer can't capture apps (`can_process` false: Windows 10), direct is
-/// all there is: the EQ and boosts don't reach them.
+/// the mixer: a flat EQ, surround off, a bus you hear on its own device (not
+/// a send, and not falling back to the default because its device is gone).
+/// An app turned above 100% overall still needs the mixer to boost it. Where
+/// the mixer can't capture apps (`can_process` false: Windows 10), direct is
+/// all there is: the EQ, surround and boosts don't reach them.
 fn update_route_plans(bus_snapshot: &[BusSnapshot], master_gain: f32, can_process: bool) {
     for snapshot in bus_snapshot {
         let bus = &snapshot.bus;
         let flat = bus.eq.lock().unwrap().gains().iter().all(|gain| gain.abs() < 0.01);
+        let surround = bus.surround.lock().unwrap().settings().enabled;
         let bus_direct = snapshot.device_ok
-            && (flat || !can_process)
+            && ((flat && !surround) || !can_process)
             && !snapshot.send
             && bus.heard.load(Ordering::Relaxed);
         bus.direct.store(bus_direct, Ordering::Relaxed);
@@ -1028,6 +1045,14 @@ fn run_render_loop(
                 .iter()
                 .map(|snapshot| (&snapshot.device_id == device_id).then(|| snapshot.bus.eq.lock().unwrap()))
                 .collect();
+            // And its surround, which is for what you hear: never on a send
+            // bus (a voice going to other apps).
+            let mut surrounds: Vec<_> = bus_snapshot
+                .iter()
+                .map(|snapshot| {
+                    (&snapshot.device_id == device_id && !snapshot.send).then(|| snapshot.bus.surround.lock().unwrap())
+                })
+                .collect();
 
             for frame in 0..available as usize {
                 let mut device_mix = [0.0f32; CHANNELS];
@@ -1083,6 +1108,16 @@ fn run_render_loop(
                     }
                     let bus_frame_peak = bus_mix.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
                     bus_peaks[bus_idx] = bus_peaks[bus_idx].max(bus_frame_peak);
+                    // What you hear can be surround; meters and clips keep the
+                    // bus's own sound. Apps on a bus with surround on don't
+                    // play direct, so the mixer plays all of it.
+                    if let Some(surround) = surrounds[bus_idx].as_mut() {
+                        if !bus.muted.load(Ordering::Relaxed) && bus.heard.load(Ordering::Relaxed) {
+                            surround.process(&mut played_mix);
+                        } else {
+                            surround.skip();
+                        }
+                    }
 
                     if !bus.muted.load(Ordering::Relaxed) {
                         let bus_gain = bus.gain.load();
@@ -1106,6 +1141,7 @@ fn run_render_loop(
             }
 
             drop(eqs);
+            drop(surrounds);
             if output.write(&rendered).is_err() {
                 broken_devices.push(device_id.clone());
             }
@@ -1200,6 +1236,7 @@ mod tests {
             muted: AtomicBool::new(false),
             level: AtomicF32::new(0.0),
             eq: Mutex::new(EqBands::new(SAMPLE_RATE)),
+            surround: Mutex::new(VirtualSurround::new(Surround::default())),
             device_id: Mutex::new(Some("headset".into())),
             fallback_to_default: AtomicBool::new(true),
             heard: AtomicBool::new(true),
@@ -1258,6 +1295,13 @@ mod tests {
         game.eq.lock().unwrap().set_band(2, 3.0);
         assert!(!plan_for(&game, &app, true, 1.0).direct);
         game.eq.lock().unwrap().set_band(2, 0.0);
+
+        // So does surround.
+        game.surround.lock().unwrap().set(Surround { enabled: true, ..Surround::default() });
+        assert!(!plan_for(&game, &app, true, 1.0).direct);
+        assert!(!game.direct.load(Ordering::Relaxed));
+        game.surround.lock().unwrap().set(Surround::default());
+        assert!(plan_for(&game, &app, true, 1.0).direct);
 
         // So does a bus whose own device is gone (it's on its fallback).
         assert!(!plan_for(&game, &app, false, 1.0).direct);

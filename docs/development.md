@@ -14,8 +14,14 @@
 
 `mixer.rs` is shared: every app or microphone is a *source* whose captured
 audio queues up as 48 kHz stereo f32; one render thread mixes each channel
-(source gain, EQ, meters, the clip recorder's tap), and keeps each output
-device filled only as far as its most urgent channel's priority allows.
+(source gain, EQ, meters, the clip recorder's tap, then virtual surround for
+what you hear), and keeps each output device filled only as far as its most
+urgent channel's priority allows.
+
+Virtual surround (`surround/`) plays a channel's stereo through two virtual
+speakers in a room: measured head-related impulse responses (SADIE II, a
+KU100 dummy head; `scripts/make_hrir_table.py` regenerates `hrir.rs` from its
+download), wall reflections, and a short reverb.
 
 Each system provides the rest, chosen in `lib.rs`'s `platform` module:
 

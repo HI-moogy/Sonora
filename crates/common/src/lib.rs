@@ -224,6 +224,8 @@ pub struct SavedBus {
     /// Whether a copy also plays on the default device (hearing your own
     /// mic); `None` is off.
     pub monitor: Option<bool>,
+    /// Virtual surround; off in settings from before it.
+    pub surround: Surround,
     /// Older settings' `#RRGGBB` color for the bus. Read only: it moves
     /// into [`ThemeColors::channels`] the first time colors are saved.
     #[serde(skip_serializing)]
@@ -232,7 +234,40 @@ pub struct SavedBus {
 
 impl Default for SavedBus {
     fn default() -> Self {
-        Self { gain: 1.0, muted: false, device: None, fallback_to_default: true, heard: None, priority: None, monitor: None, color: None }
+        Self {
+            gain: 1.0,
+            muted: false,
+            device: None,
+            fallback_to_default: true,
+            heard: None,
+            priority: None,
+            monitor: None,
+            surround: Surround::default(),
+            color: None,
+        }
+    }
+}
+
+/// Virtual surround for headphones: a channel played as if from speakers in
+/// a room around you, rather than inside your head.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Surround {
+    pub enabled: bool,
+    /// How far away the speakers are, in meters, from [`Self::MIN_DISTANCE_M`]
+    /// to [`Self::MAX_DISTANCE_M`]: farther brings more of the room.
+    pub distance_m: f32,
+}
+
+impl Surround {
+    pub const MIN_DISTANCE_M: f32 = 0.5;
+    pub const MAX_DISTANCE_M: f32 = 4.0;
+    pub const DEFAULT_DISTANCE_M: f32 = 1.5;
+}
+
+impl Default for Surround {
+    fn default() -> Self {
+        Self { enabled: false, distance_m: Self::DEFAULT_DISTANCE_M }
     }
 }
 
@@ -579,6 +614,15 @@ mod tests {
     }
 
     #[test]
+    fn buses_saved_before_surround_have_it_off() {
+        let bus: SavedBus = serde_json::from_str(r#"{ "gain": 0.5, "muted": false }"#).unwrap();
+        assert_eq!(bus.surround, Surround::default());
+        assert!(!bus.surround.enabled);
+        let partial: SavedBus = serde_json::from_str(r#"{ "surround": { "enabled": true } }"#).unwrap();
+        assert_eq!(partial.surround, Surround { enabled: true, distance_m: Surround::DEFAULT_DISTANCE_M });
+    }
+
+    #[test]
     fn colors_are_saved_as_hex_and_missing_ones_are_sonoras() {
         assert_eq!(Rgb::from_hex("#FF6000"), Some(Rgb::new(0xFF, 0x60, 0x00)));
         assert_eq!(Rgb::from_hex("5865f2"), Some(Rgb::new(0x58, 0x65, 0xF2)));
@@ -621,7 +665,17 @@ mod tests {
         });
         presets.mixer.buses.insert(
             "Aux".into(),
-            SavedBus { gain: 0.5, muted: false, device: Some("{0.0.0.00000000}.{tv}".into()), fallback_to_default: false, heard: Some(false), priority: Some(Priority::Low), monitor: Some(true), color: None },
+            SavedBus {
+                gain: 0.5,
+                muted: false,
+                device: Some("{0.0.0.00000000}.{tv}".into()),
+                fallback_to_default: false,
+                heard: Some(false),
+                priority: Some(Priority::Low),
+                monitor: Some(true),
+                surround: Surround { enabled: true, distance_m: 3.0 },
+                color: None,
+            },
         );
         let json = serde_json::to_string(&presets).unwrap();
         let loaded: Presets = serde_json::from_str(&json).unwrap();
