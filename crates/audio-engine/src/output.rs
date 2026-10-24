@@ -2,27 +2,38 @@
 //! the mixer's format (48 kHz stereo f32).
 
 use windows::core::Result;
-use windows::Win32::Media::Audio::{IAudioClient, IAudioRenderClient};
+use windows::Win32::Media::Audio::{eRender, IAudioClient, IAudioRenderClient};
 
+use crate::devices::{endpoint, endpoint_id};
 use crate::loopback::standard_format;
-use crate::render::open_render_client_for_device;
+use crate::render::open_render_client;
 
 /// One opened output device, kept alive only while something plays on it.
 pub(crate) struct DeviceOutput {
     client: IAudioClient,
     render_service: IAudioRenderClient,
     buffer_frames: u32,
+    /// The device opened: for the default, whichever device that was then
+    /// (the stream stays on it).
+    endpoint_id: Option<String>,
 }
 
 impl DeviceOutput {
     /// Opens and starts `device_id` (`None` = the system default).
     pub(crate) fn open(device_id: Option<&str>) -> Result<Self> {
-        let (client, render_service) = open_render_client_for_device(device_id, &standard_format())?;
+        let device = endpoint(device_id, eRender)?;
+        let (client, render_service) = open_render_client(&device, &standard_format())?;
         unsafe {
             let buffer_frames = client.GetBufferSize()?;
             client.Start()?;
-            Ok(Self { client, render_service, buffer_frames })
+            Ok(Self { client, render_service, buffer_frames, endpoint_id: endpoint_id(&device).ok() })
         }
+    }
+
+    /// The device playing, as [`crate::devices::list_output_devices`] names
+    /// it; `None` if Windows didn't say.
+    pub(crate) fn endpoint_id(&self) -> Option<&str> {
+        self.endpoint_id.as_deref()
     }
 
     /// The most frames the device can have queued.

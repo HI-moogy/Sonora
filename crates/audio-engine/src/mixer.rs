@@ -121,6 +121,24 @@ impl Drop for FinishOnDrop {
 const FINISH_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl SourceInner {
+    fn new(pid: Option<u32>, name: String, bus: String, input_device: Option<String>, gain: f32, muted: bool) -> Self {
+        Self {
+            pid,
+            name,
+            bus: Mutex::new(bus),
+            gain: AtomicF32::new(gain),
+            muted: AtomicBool::new(muted),
+            level: AtomicF32::new(0.0),
+            input_device,
+            samples: Mutex::new(VecDeque::new()),
+            stop: Arc::new(AtomicBool::new(false)),
+            #[cfg(windows)]
+            routed: Mutex::default(),
+            #[cfg(not(windows))]
+            finished: Finished::default(),
+        }
+    }
+
     /// Stops capturing and, for an app, gives it back its own output (on
     /// Linux its capture thread does, as it stops: see [`Self::wait_restored`]).
     fn stop_and_restore(&self) {
@@ -323,21 +341,7 @@ impl Mixer {
         let bus_name = bus.into();
         self.ensure_bus(&bus_name);
 
-        let inner = Arc::new(SourceInner {
-            pid: Some(pid),
-            name: name.into(),
-            bus: Mutex::new(bus_name),
-            gain: AtomicF32::new(1.0),
-            muted: AtomicBool::new(false),
-            level: AtomicF32::new(0.0),
-            input_device: None,
-            samples: Mutex::new(VecDeque::new()),
-            stop: Arc::new(AtomicBool::new(false)),
-            #[cfg(windows)]
-            routed: Mutex::default(),
-            #[cfg(not(windows))]
-            finished: Finished::default(),
-        });
+        let inner = Arc::new(SourceInner::new(Some(pid), name.into(), bus_name, None, 1.0, false));
 
         let (ready_tx, ready_rx) = mpsc::channel();
         let thread_source = inner.clone();
@@ -361,46 +365,18 @@ impl Mixer {
     /// [`crate::devices::list_input_devices`], or the system default when
     /// `None`), cleaned up as [`Self::mic_cleanup`] says, into the named bus. Same
     /// activation/blocking contract as [`Self::add_source`].
+    ///
+    /// The mixer records one microphone: this replaces the one running, if
+    /// any, once the new one has started (on failure the old one keeps
+    /// going). Two would put two copies of your voice in the mix, a few ms
+    /// apart, which sounds doubled and underwater.
     pub fn add_mic_source(
         &self,
         name: impl Into<String>,
         bus: impl Into<String>,
         device_id: Option<String>,
     ) -> Result<u64> {
-        let bus_name = bus.into();
-        self.ensure_bus(&bus_name);
-
-        let inner = Arc::new(SourceInner {
-            pid: None,
-            name: name.into(),
-            bus: Mutex::new(bus_name),
-            gain: AtomicF32::new(1.0),
-            muted: AtomicBool::new(false),
-            level: AtomicF32::new(0.0),
-            input_device: device_id.clone(),
-            samples: Mutex::new(VecDeque::new()),
-            stop: Arc::new(AtomicBool::new(false)),
-            #[cfg(windows)]
-            routed: Mutex::default(),
-            #[cfg(not(windows))]
-            finished: Finished::default(),
-        });
-
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let thread_source = inner.clone();
-        let cleanup = self.mic_cleanup.clone();
-        std::thread::Builder::new()
-            .name("capture-mic".into())
-            .spawn(move || platform::run_mic_capture(thread_source, device_id, cleanup, ready_tx))
-            .expect("spawn mic capture thread");
-
-        ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| error::timed_out())??;
-
-        let id = self.next_id();
-        self.sources.lock().unwrap().insert(id, inner);
-        Ok(id)
+        self.start_mic(name.into(), bus.into(), device_id, 1.0, false)
     }
 
     /// Switches microphone source `id` to another capture device, keeping
@@ -418,11 +394,35 @@ impl Mixer {
             return Err(error::invalid_argument());
         };
         let bus = old.bus.lock().unwrap().clone();
-        let new_id = self.add_mic_source(old.name.clone(), bus, device_id)?;
-        self.set_source_gain(new_id, old.gain.load());
-        self.set_source_muted(new_id, old.muted.load(Ordering::Relaxed));
-        self.remove_source(id);
-        Ok(new_id)
+        self.start_mic(old.name.clone(), bus, device_id, old.gain.load(), old.muted.load(Ordering::Relaxed))
+    }
+
+    fn start_mic(&self, name: String, bus: String, device_id: Option<String>, gain: f32, muted: bool) -> Result<u64> {
+        self.ensure_bus(&bus);
+        let inner = Arc::new(SourceInner::new(None, name, bus, device_id.clone(), gain, muted));
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let thread_source = inner.clone();
+        let cleanup = self.mic_cleanup.clone();
+        std::thread::Builder::new()
+            .name("capture-mic".into())
+            .spawn(move || platform::run_mic_capture(thread_source, device_id, cleanup, ready_tx))
+            .expect("spawn mic capture thread");
+
+        let started = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| Err(error::timed_out()));
+        if started.is_err() {
+            // So a capture that starts after all can't run unseen.
+            inner.stop_and_restore();
+        }
+        started?;
+
+        let id = self.next_id();
+        let replaced = swap_in_mic(&mut self.sources.lock().unwrap(), id, inner);
+        for old in replaced {
+            old.stop_and_restore();
+            old.wait_restored();
+        }
+        Ok(id)
     }
 
     /// Stops capturing `id`; its thread exits and cleans up its capture
@@ -654,6 +654,16 @@ impl Mixer {
     }
 }
 
+/// Puts microphone `mic` into `sources` as `id`, taking out any other
+/// microphone in the same step (so the mix never has both), and returns
+/// those for the caller to stop.
+fn swap_in_mic(sources: &mut HashMap<u64, Arc<SourceInner>>, id: u64, mic: Arc<SourceInner>) -> Vec<Arc<SourceInner>> {
+    let old_ids: Vec<u64> = sources.iter().filter(|(_, s)| s.pid.is_none()).map(|(&id, _)| id).collect();
+    let replaced = old_ids.iter().filter_map(|old_id| sources.remove(old_id)).collect();
+    sources.insert(id, mic);
+    replaced
+}
+
 impl Drop for Mixer {
     fn drop(&mut self) {
         self.render_stop.store(true, Ordering::Relaxed);
@@ -797,6 +807,17 @@ fn run_render_loop(
         device_outputs.retain(|device_id, _| {
             bus_snapshot.iter().any(|s| s.device_id == *device_id) || (device_id.is_none() && monitoring)
         });
+        // A monitor copy plays on the default device. When that's the very
+        // device the bus plays on (Windows' default output set to the
+        // virtual cable), the copy would land there too, a few ms after the
+        // first: a doubled voice. So it's skipped.
+        if let Some(default) = device_outputs.get(&None) {
+            for snapshot in &mut bus_snapshot {
+                if snapshot.device_id.is_some() && snapshot.device_id.as_deref() == default.endpoint_id() {
+                    snapshot.monitor = false;
+                }
+            }
+        }
         // Buses with nowhere to play drop their audio rather than queue it
         // up to play late once a device is back; the rest drop any backlog
         // beyond what their priority allows.
@@ -1022,4 +1043,39 @@ fn run_render_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(pid: Option<u32>, bus: &str) -> Arc<SourceInner> {
+        Arc::new(SourceInner::new(pid, "test".into(), bus.into(), None, 1.0, false))
+    }
+
+    #[test]
+    fn starting_a_microphone_replaces_the_one_running() {
+        let mut sources = HashMap::new();
+        let game = source(Some(100), "Game");
+        let old_mic = source(None, "Mic");
+        sources.insert(0, game.clone());
+        sources.insert(1, old_mic.clone());
+
+        let new_mic = source(None, "Mic");
+        let replaced = swap_in_mic(&mut sources, 2, new_mic.clone());
+
+        assert_eq!(replaced.len(), 1);
+        assert!(Arc::ptr_eq(&replaced[0], &old_mic));
+        let mics: Vec<u64> = sources.iter().filter(|(_, s)| s.pid.is_none()).map(|(&id, _)| id).collect();
+        assert_eq!(mics, [2], "one microphone, the new one");
+        assert!(Arc::ptr_eq(&sources[&0], &game), "apps stay");
+    }
+
+    #[test]
+    fn the_first_microphone_replaces_nothing() {
+        let mut sources = HashMap::new();
+        sources.insert(0, source(Some(100), "Game"));
+        assert!(swap_in_mic(&mut sources, 1, source(None, "Mic")).is_empty());
+        assert_eq!(sources.len(), 2);
+    }
 }

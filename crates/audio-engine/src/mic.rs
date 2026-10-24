@@ -1,18 +1,18 @@
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 
-use windows::core::{Result, PCWSTR};
+use windows::core::Result;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
-    eCapture, eConsole, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-    WAVEFORMATEX,
+    eCapture, IAudioCaptureClient, IAudioClient, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, WAVEFORMATEX,
 };
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+use windows::Win32::System::Com::CLSCTX_ALL;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::com::ComGuard;
 use crate::denoise::{MicCleanup, MicPipeline};
+use crate::devices::endpoint;
 use crate::mixer::SourceInner;
 
 const CAPTURE_BUFFER_DURATION_100NS: i64 = 2_000_000;
@@ -40,15 +40,7 @@ fn open_capture_client(
     format: &WAVEFORMATEX,
 ) -> Result<(IAudioClient, IAudioCaptureClient, HANDLE)> {
     unsafe {
-        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let device = match device_id {
-            Some(id) => {
-                let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
-                enumerator.GetDevice(PCWSTR(wide.as_ptr()))?
-            }
-            None => enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)?,
-        };
-        let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+        let client: IAudioClient = endpoint(device_id, eCapture)?.Activate(CLSCTX_ALL, None)?;
         let event = CreateEventW(None, false, false, None)?;
         client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,

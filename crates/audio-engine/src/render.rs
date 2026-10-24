@@ -1,9 +1,11 @@
-use windows::core::{Result, PCWSTR};
+use windows::core::Result;
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
-    MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, WAVEFORMATEX,
+    eRender, IAudioClient, IAudioRenderClient, IMMDevice, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, WAVEFORMATEX,
 };
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+use windows::Win32::System::Com::CLSCTX_ALL;
+
+use crate::devices::endpoint;
 
 /// 200ms shared-mode buffer: generous enough to avoid glitches on a
 /// background thread without adding noticeable latency for this prototype.
@@ -21,15 +23,12 @@ pub fn open_render_client_for_device(
     device_id: Option<&str>,
     format: &WAVEFORMATEX,
 ) -> Result<(IAudioClient, IAudioRenderClient)> {
+    open_render_client(&endpoint(device_id, eRender)?, format)
+}
+
+/// Opens `device` in shared mode with `format`, ready to `Start()`.
+pub(crate) fn open_render_client(device: &IMMDevice, format: &WAVEFORMATEX) -> Result<(IAudioClient, IAudioRenderClient)> {
     unsafe {
-        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let device: IMMDevice = match device_id {
-            Some(id) => {
-                let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
-                enumerator.GetDevice(PCWSTR(wide.as_ptr()))?
-            }
-            None => enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?,
-        };
         let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
         client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,

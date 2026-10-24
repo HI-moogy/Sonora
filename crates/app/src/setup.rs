@@ -72,7 +72,7 @@ impl MixerPersistence {
             last_check: Instant::now() - CHECK_INTERVAL,
             last_mic_try: Instant::now() - MIC_RETRY_INTERVAL,
         };
-        persistence.restore_mic(mixer);
+        persistence.restore_mic(mixer, &[]);
         persistence
     }
 
@@ -95,7 +95,7 @@ impl MixerPersistence {
         }
         self.last_check = Instant::now();
         let sources = mixer.source_settings();
-        self.restore_mic(mixer);
+        self.restore_mic(mixer, &sources);
         self.restore_apps(mixer, &sources, sessions);
         self.save_now(mixer);
     }
@@ -105,7 +105,15 @@ impl MixerPersistence {
         self.save_if_changed(mixer, &mixer.bus_settings(), &mixer.source_settings());
     }
 
-    fn restore_mic(&mut self, mixer: &Mixer) {
+    /// Retries the saved microphone until it opens. Sonora records one
+    /// microphone, so once one is running (this, or one picked by hand while
+    /// this couldn't open) the saved one is done with; settings saved by
+    /// versions that recorded two keep only the first.
+    fn restore_mic(&mut self, mixer: &Mixer, sources: &[SourceInfo]) {
+        if sources.iter().any(|s| s.pid.is_none()) {
+            self.pending.retain(|s| s.app.is_some());
+            return;
+        }
         let Some(index) = self.pending.iter().position(|s| s.app.is_none()) else { return };
         if self.last_mic_try.elapsed() < MIC_RETRY_INTERVAL {
             return;
@@ -115,7 +123,7 @@ impl MixerPersistence {
         if let Ok(id) = mixer.add_mic_source("Microphone", saved.bus.clone(), saved.input_device.clone()) {
             mixer.set_source_gain(id, saved.gain);
             mixer.set_source_muted(id, saved.muted);
-            self.pending.remove(index);
+            self.pending.retain(|s| s.app.is_some());
         }
     }
 

@@ -1,9 +1,11 @@
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::{
-    eCapture, eRender, EDataFlow, IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    eCapture, eConsole, eRender, EDataFlow, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator,
+    MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL, STGM_READ};
+use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
 #[derive(Debug, Clone)]
@@ -34,25 +36,56 @@ pub fn list_input_devices() -> windows::core::Result<Vec<AudioDevice>> {
 
 fn list_devices(flow: EDataFlow) -> windows::core::Result<Vec<AudioDevice>> {
     unsafe {
-        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let collection: IMMDeviceCollection = enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE)?;
+        let collection: IMMDeviceCollection = enumerator()?.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE)?;
         let count = collection.GetCount()?;
 
         let mut devices = Vec::with_capacity(count as usize);
         for i in 0..count {
             let device = collection.Item(i)?;
-            let id = device.GetId()?.to_string().unwrap_or_default();
-
-            let store: IPropertyStore = device.OpenPropertyStore(STGM_READ)?;
-            let name = match store.GetValue(&PKEY_DEVICE_FRIENDLY_NAME as *const _) {
-                Ok(value) => propvariant_to_string(&value),
-                Err(_) => id.clone(),
-            };
+            let id = endpoint_id(&device)?;
+            let name = friendly_name(&device).unwrap_or_else(|| id.clone());
 
             let voice_cable_mic = (flow == eRender && is_virtual_cable(&name)).then(|| "CABLE Output".to_string());
             devices.push(AudioDevice { id, name, voice_cable_mic });
         }
         Ok(devices)
+    }
+}
+
+/// `device`'s id, as the device lists give it.
+pub(crate) fn endpoint_id(device: &IMMDevice) -> windows::core::Result<String> {
+    unsafe {
+        let id = device.GetId()?;
+        let text = id.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(id.0 as *const _));
+        Ok(text)
+    }
+}
+
+fn friendly_name(device: &IMMDevice) -> Option<String> {
+    unsafe {
+        let store: IPropertyStore = device.OpenPropertyStore(STGM_READ).ok()?;
+        let value = store.GetValue(&PKEY_DEVICE_FRIENDLY_NAME as *const _).ok()?;
+        Some(propvariant_to_string(&value))
+    }
+}
+
+fn enumerator() -> windows::core::Result<IMMDeviceEnumerator> {
+    unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+}
+
+/// The device `device_id` names (from the device lists), or Windows' default
+/// for `flow` when `None`.
+pub(crate) fn endpoint(device_id: Option<&str>, flow: EDataFlow) -> windows::core::Result<IMMDevice> {
+    let enumerator = enumerator()?;
+    unsafe {
+        match device_id {
+            Some(id) => {
+                let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+                enumerator.GetDevice(PCWSTR(wide.as_ptr()))
+            }
+            None => enumerator.GetDefaultAudioEndpoint(flow, eConsole),
+        }
     }
 }
 

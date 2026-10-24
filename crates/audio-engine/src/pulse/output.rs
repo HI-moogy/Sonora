@@ -51,6 +51,12 @@ impl DeviceOutput {
         Ok(Self { stream, connection, capacity_frames, bytes: Vec::new() })
     }
 
+    /// Which output is playing, when known. The default one follows the
+    /// server's default, so it isn't pinned to any one.
+    pub(crate) fn endpoint_id(&self) -> Option<&str> {
+        None
+    }
+
     /// The most frames that can be queued.
     pub(crate) fn capacity_frames(&self) -> u32 {
         self.capacity_frames
