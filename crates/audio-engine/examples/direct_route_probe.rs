@@ -2,10 +2,15 @@
 //! app in Settings > Sound > Volume mixer, which EarTrumpet also sets) on
 //! this PC: a child plays clicks to "the default device", is pointed at
 //! another device, and the clicks are timed there. Run once with the
-//! choice made before the child opens its stream, and once while it's
-//! already playing (does it follow?). The choice is cleared afterwards.
+//! choice made while the child plays with its stream left open, and once
+//! with it reopened. The choice is cleared afterwards. `mixer` instead
+//! routes the child through Sonora's mixer to that device, then has it
+//! reopen its audio: it should end up playing direct.
 //!
-//! Usage: direct_route_probe <part of a device name>
+//! The clicks are at -80 dB, inaudible on the default device the child
+//! starts on, and still found in the captured output.
+//!
+//! Usage: direct_route_probe <part of a device name> [mixer | recover <pid>]
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -13,84 +18,20 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use audio_engine::loopback::standard_format;
-use audio_engine::{list_output_devices, ComGuard};
-use windows::core::{HRESULT, HSTRING, PCWSTR};
+use audio_engine::{app_output, list_output_devices, ComGuard, Mixer};
+use common::Priority;
+use windows::core::PCWSTR;
 use windows::Win32::Media::Audio::{
-    eConsole, eMultimedia, eRender, EDataFlow, ERole, IAudioCaptureClient, IAudioClient, IAudioRenderClient,
-    IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-    AUDCLNT_STREAMFLAGS_LOOPBACK,
+    eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDeviceEnumerator,
+    MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use windows::Win32::System::WinRT::RoGetActivationFactory;
 
 const RATE: f64 = 48_000.0;
 const CLICK_EVERY: Duration = Duration::from_millis(500);
 const CLICK_FRAMES: usize = 240;
-const AMPLITUDE: f32 = 0.02;
-
-/// Windows' audio policy, as its own Settings app uses it (Windows 10 21H2
-/// and later; undocumented). Only the last three methods are used. It's a
-/// WinRT interface: the first three slots are IInspectable's.
-#[windows_core::interface("ab3d4648-e242-459f-b02f-541c70306324")]
-unsafe trait IAudioPolicyConfigFactory: windows_core::IUnknown {
-    fn get_iids(&self) -> HRESULT;
-    fn get_runtime_class_name(&self) -> HRESULT;
-    fn get_trust_level(&self) -> HRESULT;
-    fn add_ctx_volume_change(&self) -> HRESULT;
-    fn remove_ctx_volume_changed(&self) -> HRESULT;
-    fn add_ringer_vibrate_state_changed(&self) -> HRESULT;
-    fn remove_ringer_vibrate_state_change(&self) -> HRESULT;
-    fn set_volume_group_gain_for_id(&self) -> HRESULT;
-    fn get_volume_group_gain_for_id(&self) -> HRESULT;
-    fn get_active_volume_group_for_endpoint_id(&self) -> HRESULT;
-    fn get_volume_groups_for_endpoint(&self) -> HRESULT;
-    fn get_current_volume_context(&self) -> HRESULT;
-    fn set_volume_group_mute_for_id(&self) -> HRESULT;
-    fn get_volume_group_mute_for_id(&self) -> HRESULT;
-    fn set_ringer_vibrate_state(&self) -> HRESULT;
-    fn get_ringer_vibrate_state(&self) -> HRESULT;
-    fn set_preferred_chat_application(&self) -> HRESULT;
-    fn reset_preferred_chat_application(&self) -> HRESULT;
-    fn get_preferred_chat_application(&self) -> HRESULT;
-    fn get_current_chat_applications(&self) -> HRESULT;
-    fn add_chat_context_changed(&self) -> HRESULT;
-    fn remove_chat_context_changed(&self) -> HRESULT;
-    fn set_persisted_default_audio_endpoint(&self, process: u32, flow: EDataFlow, role: ERole, device: *mut core::ffi::c_void) -> HRESULT;
-    fn get_persisted_default_audio_endpoint(&self, process: u32, flow: EDataFlow, role: ERole, device: *mut *mut core::ffi::c_void) -> HRESULT;
-    fn clear_all_persisted_application_default_endpoints(&self) -> HRESULT;
-}
-
-fn policy() -> windows::core::Result<IAudioPolicyConfigFactory> {
-    unsafe { RoGetActivationFactory(&HSTRING::from("Windows.Media.Internal.AudioPolicyConfig")) }
-}
-
-/// Points process `pid`'s "default output" at `device_id` (an endpoint id),
-/// or back at the real default with `None`.
-fn set_app_output(policy: &IAudioPolicyConfigFactory, pid: u32, device_id: Option<&str>) -> windows::core::Result<()> {
-    // The policy names endpoints by their device interface path.
-    let device = device_id
-        .map(|id| HSTRING::from(format!("\\\\?\\SWD#MMDEVAPI#{id}#{{e6327cad-dcec-4949-ae8a-991e976a79d2}}")))
-        .unwrap_or_default();
-    for role in [eConsole, eMultimedia] {
-        unsafe {
-            policy
-                .set_persisted_default_audio_endpoint(pid, eRender, role, std::mem::transmute_copy(&device))
-                .ok()?;
-        }
-    }
-    Ok(())
-}
-
-fn app_output(policy: &IAudioPolicyConfigFactory, pid: u32) -> windows::core::Result<String> {
-    let mut device: HSTRING = HSTRING::new();
-    unsafe {
-        policy
-            .get_persisted_default_audio_endpoint(pid, eRender, eMultimedia, &mut device as *mut HSTRING as *mut _)
-            .ok()?;
-    }
-    Ok(device.to_string())
-}
+const AMPLITUDE: f32 = 1e-4;
 
 fn now_hns() -> i64 {
     let (mut counter, mut frequency) = (0i64, 0i64);
@@ -148,7 +89,8 @@ fn play_until(reopen: &mpsc::Receiver<()>) -> windows::core::Result<()> {
             let in_click = position >= next_click && position < next_click + CLICK_FRAMES as u64;
             if position == next_click {
                 let due = now + ((padding as u64 + i as u64) as f64 / RATE * 1e7) as i64;
-                println!("click {due}");
+                // Ignored once the probe is gone (a crash test kills it).
+                let _ = writeln!(std::io::stdout(), "click {due}");
             }
             frame.fill(if in_click { AMPLITUDE } else { 0.0 });
             if position + 1 == next_click + CLICK_FRAMES as u64 {
@@ -160,14 +102,16 @@ fn play_until(reopen: &mpsc::Receiver<()>) -> windows::core::Result<()> {
     }
 }
 
-/// When clicks start in what `device_id` plays over `seconds`.
-fn click_onsets(device_id: &str, seconds: f64) -> windows::core::Result<Vec<i64>> {
+/// When clicks start in what `device_id` plays over `seconds`, and the
+/// loudest sample.
+fn click_onsets(device_id: &str, seconds: f64) -> windows::core::Result<(Vec<i64>, f32)> {
     let wide: Vec<u16> = device_id.encode_utf16().chain(std::iter::once(0)).collect();
     let client: IAudioClient = unsafe {
         let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         enumerator.GetDevice(PCWSTR(wide.as_ptr()))?.Activate(CLSCTX_ALL, None)?
     };
     let mut onsets = Vec::new();
+    let mut peak = 0.0f32;
     let mut quiet_for = usize::MAX;
     unsafe {
         client.Initialize(
@@ -188,7 +132,8 @@ fn click_onsets(device_id: &str, seconds: f64) -> windows::core::Result<Vec<i64>
                 service.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
                 let samples = std::slice::from_raw_parts(data as *const f32, frames as usize * 2);
                 for (i, s) in samples.iter().step_by(2).enumerate() {
-                    if s.abs() > AMPLITUDE / 4.0 {
+                    peak = peak.max(s.abs());
+                    if s.abs() > AMPLITUDE / 8.0 {
                         if quiet_for > 4_800 {
                             onsets.push(qpc as i64 + (i as f64 / RATE * 1e7) as i64);
                         }
@@ -201,7 +146,7 @@ fn click_onsets(device_id: &str, seconds: f64) -> windows::core::Result<Vec<i64>
             }
         }
     }
-    Ok(onsets)
+    Ok((onsets, peak))
 }
 
 /// The child, stopped however the probe ends.
@@ -214,9 +159,9 @@ impl Drop for Player {
     }
 }
 
-/// One run: points a playing child at `device_id`; with `reopen`, the
-/// child then opens its stream again.
-fn run(policy: &IAudioPolicyConfigFactory, device_id: &str, reopen: bool) -> windows::core::Result<()> {
+/// Starts a child playing clicks on the default device: the child, a
+/// line on its stdin reopens its stream, and each click's due time.
+fn start_player() -> (Player, std::process::ChildStdin, mpsc::Receiver<i64>) {
     let mut child = Player(
         Command::new(std::env::current_exe().unwrap())
             .arg("--play-default")
@@ -225,7 +170,6 @@ fn run(policy: &IAudioPolicyConfigFactory, device_id: &str, reopen: bool) -> win
             .spawn()
             .unwrap(),
     );
-    let pid = child.0.id();
     let stdout = child.0.stdout.take().unwrap();
     let (due_tx, due_rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -237,16 +181,13 @@ fn run(policy: &IAudioPolicyConfigFactory, device_id: &str, reopen: bool) -> win
     });
     let mut control = child.0.stdin.take().unwrap();
     writeln!(control, "go").unwrap();
-    std::thread::sleep(Duration::from_secs(1));
-    set_app_output(policy, pid, Some(device_id))?;
-    println!("  Windows now says the app plays on: {}", app_output(policy, pid)?);
-    if reopen {
-        writeln!(control, "reopen").unwrap();
-    }
-    std::thread::sleep(Duration::from_millis(500));
-    let onsets = click_onsets(device_id, 5.0)?;
-    set_app_output(policy, pid, None)?;
-    let dues: Vec<i64> = due_rx.try_iter().collect();
+    (child, control, due_rx)
+}
+
+/// How many clicks came out on `device_id` and how late (median).
+fn report(device_id: &str, dues: &mpsc::Receiver<i64>) -> windows::core::Result<()> {
+    let (onsets, peak) = click_onsets(device_id, 5.0)?;
+    let dues: Vec<i64> = dues.try_iter().collect();
     let mut delays: Vec<f64> = onsets
         .iter()
         .filter_map(|&onset| {
@@ -257,10 +198,74 @@ fn run(policy: &IAudioPolicyConfigFactory, device_id: &str, reopen: bool) -> win
         .collect();
     delays.sort_by(f64::total_cmp);
     println!(
-        "  {} clicks heard there, median {:.1} ms after due",
+        "  {} clicks heard there, median {:.1} ms after due, at {:.0}% of the click's level",
         delays.len(),
-        delays.get(delays.len() / 2).copied().unwrap_or(f64::NAN)
+        delays.get(delays.len() / 2).copied().unwrap_or(f64::NAN),
+        peak / AMPLITUDE * 100.0
     );
+    Ok(())
+}
+
+/// One run: points a playing child at `device_id`; with `reopen`, the
+/// child then opens its stream again.
+fn run(device_id: &str, reopen: bool) -> windows::core::Result<()> {
+    let (child, mut control, dues) = start_player();
+    let pid = child.0.id();
+    std::thread::sleep(Duration::from_secs(1));
+    app_output::set(pid, Some(device_id))?;
+    println!("  Windows now says the app plays on: {:?}", app_output::get(pid)?);
+    if reopen {
+        writeln!(control, "reopen").unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let result = report(device_id, &dues);
+    app_output::set(pid, None)?;
+    result
+}
+
+/// Through the mixer: the child's channel plays on `device_id`, the child
+/// on the default device. It's played through the mixer until it opens
+/// its audio again on the device Sonora pointed it at, then direct.
+fn run_mixer(device_id: &str) -> windows::core::Result<()> {
+    let (child, mut control, dues) = start_player();
+    let pid = child.0.id();
+    std::thread::sleep(Duration::from_secs(1));
+    let mixer = Mixer::start()?;
+    mixer.ensure_bus("Game");
+    mixer.set_bus_device("Game", Some(device_id.to_string()));
+    mixer.set_bus_priority("Game", Priority::High);
+    let id = mixer.add_source(pid, "probe", "Game")?;
+    let direct = || mixer.sources().iter().any(|source| source.direct);
+    std::thread::sleep(Duration::from_millis(1500));
+    println!(
+        "  routed: {}; Windows has it on {:?}",
+        if direct() { "playing direct" } else { "through the mixer" },
+        app_output::get(pid)?
+    );
+    report(device_id, &dues)?;
+    writeln!(control, "reopen").unwrap();
+    let reopened = Instant::now();
+    while !direct() && reopened.elapsed() < Duration::from_secs(6) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    println!(
+        "  reopened its audio: {} after {:.1} s",
+        if direct() { "playing direct" } else { "still through the mixer" },
+        reopened.elapsed().as_secs_f64()
+    );
+    let _ = dues.try_iter().count();
+    report(device_id, &dues)?;
+    // Its fader and its channel's still set its volume.
+    mixer.set_source_gain(id, 0.5);
+    std::thread::sleep(Duration::from_millis(300));
+    println!("  app at 50%:");
+    report(device_id, &dues)?;
+    mixer.set_bus_gain("Game", 0.5);
+    std::thread::sleep(Duration::from_millis(300));
+    println!("  and its channel at 50%:");
+    report(device_id, &dues)?;
+    drop(mixer);
+    println!("  removed: Windows has it back on {:?}", app_output::get(pid)?);
     Ok(())
 }
 
@@ -274,14 +279,25 @@ fn main() -> windows::core::Result<()> {
         .into_iter()
         .find(|d| d.name.contains(args.first().expect("part of a device name").as_str()))
         .expect("no active output device with that name");
-    let policy = policy()?;
     // A read-only look at apps playing now: what Windows has them set to.
     for pid in std::env::args().skip(2).filter_map(|pid| pid.parse::<u32>().ok()) {
-        println!("process {pid} plays on: {:?}", app_output(&policy, pid));
+        println!("process {pid} plays on: {:?}", app_output::get(pid));
     }
     println!("device: {}", device.name);
+    // After a crash: starting the mixer should give app `pid` back its own
+    // output (`recover <pid>`).
+    if let Some(pid) = args.iter().position(|arg| arg == "recover").and_then(|at| args.get(at + 1)?.parse::<u32>().ok()) {
+        println!("before: Windows has {pid} on {:?}", app_output::get(pid));
+        drop(Mixer::start()?);
+        println!("after starting the mixer: {:?}", app_output::get(pid));
+        return Ok(());
+    }
+    if args.iter().any(|arg| arg == "mixer") {
+        println!("routed through the mixer to it:");
+        return run_mixer(&device.id);
+    }
     println!("pointed there while playing, stream left open:");
-    run(&policy, &device.id, false)?;
+    run(&device.id, false)?;
     println!("pointed there while playing, then the stream reopened:");
-    run(&policy, &device.id, true)
+    run(&device.id, true)
 }

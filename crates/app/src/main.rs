@@ -314,6 +314,7 @@ impl MixerApp {
                     });
                 }
                 self.priority_row(ui, selected, bus);
+                route_note(ui, bus);
             });
         }
         if selected == "Mic" {
@@ -374,6 +375,16 @@ impl MixerApp {
                         self.mixer.set_source_gain(source.id, gain);
                     }
                 });
+                // Why an app in a channel that plays direct doesn't yet.
+                if bus.direct && !source.direct {
+                    let boosted = source.gain * bus.gain * self.mixer.master_gain() > 1.0 + 1e-3;
+                    let why = if boosted {
+                        "Above 100%, it plays through Sonora, which adds delay."
+                    } else {
+                        "Plays through Sonora until it opens its sound again. Restart it for no added delay."
+                    };
+                    ui.label(egui::RichText::new(why).small().color(theme::text_muted()));
+                }
             });
         }
         for app in waiting {
@@ -504,6 +515,27 @@ impl MixerApp {
         });
     }
 
+}
+
+/// Under an app channel's priority: whether its apps play straight on its
+/// device (no added delay) or through Sonora, and why.
+fn route_note(ui: &mut egui::Ui, bus: &audio_engine::BusInfo) {
+    let eq_on = bus.eq_gains_db.iter().any(|gain| gain.abs() >= 0.01);
+    let (text, color) = if bus.direct {
+        ("Apps here play straight on the device: no added delay.", theme::accent())
+    } else if eq_on {
+        (
+            "The EQ is on, so apps here play through Sonora, about 60 ms later. With a flat EQ they play \
+             straight on the device, with no added delay.",
+            theme::text_muted(),
+        )
+    } else {
+        return;
+    };
+    ui.label(egui::RichText::new(text).small().color(color));
+}
+
+impl MixerApp {
     /// Where the Mic channel sends your processed voice: a virtual cable
     /// that Discord and games then use as a microphone, or nowhere.
     fn voice_send_ui(&mut self, ui: &mut egui::Ui, bus_name: &str, bus: &audio_engine::BusInfo) {

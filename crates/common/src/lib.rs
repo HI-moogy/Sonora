@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -376,13 +376,22 @@ fn legacy_config_path() -> PathBuf {
     config_dir().join("presets.json")
 }
 
-/// Apps whose own volume Sonora turned down to route them through the
-/// mixer, with the volume each had before (keyed by lowercase executable
-/// name). Kept on disk so a crash can't leave an app near-silent: Windows
-/// remembers per-app volumes, so the next run restores leftovers.
+/// Apps whose own volume Sonora changed to route them, with the volume each
+/// had before (keyed by lowercase executable name). Kept on disk so a crash
+/// can't leave an app near-silent: Windows remembers per-app volumes, so
+/// the next run restores leftovers.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RoutedApps {
     pub original_volumes: HashMap<String, f32>,
+    /// Apps playing straight on their channel's device: Sonora set their
+    /// volume to the channel's rather than turning them down, so they're
+    /// restored like the others but never left silent.
+    pub direct: HashSet<String>,
+    /// Apps Sonora pointed at their channel's device with Windows' per-app
+    /// output setting, with the device each was set to before (`None`: the
+    /// default device).
+    pub pointed: HashMap<String, Option<String>>,
 }
 
 fn routed_apps_path() -> PathBuf {

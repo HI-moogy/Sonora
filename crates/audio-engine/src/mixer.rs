@@ -57,6 +57,23 @@ fn ms_to_frames(ms: f32) -> u32 {
 /// Bounds how far a source's buffer can grow if the render thread falls
 /// behind, so a stalled render loop can't leak memory indefinitely.
 pub(crate) const MAX_BUFFERED_SAMPLES: usize = 48_000 * CHANNELS * 2;
+
+/// How an app should be routed, as the render loop works it out from its
+/// channel each tick; its capture thread carries it out.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct RoutePlan {
+    /// Play straight on the channel's device (Windows' per-app output), with
+    /// no delay added: possible when nothing needs the mixer's processing
+    /// (flat EQ, no boost above 100%) and the channel plays on its own device.
+    pub(crate) direct: bool,
+    /// The channel's device; `None` is Windows' default.
+    pub(crate) device: Option<String>,
+    /// The app's own volume while direct: its fader times its channel's
+    /// and the master (0 when either is muted).
+    pub(crate) volume: f32,
+}
+
 pub(crate) struct SourceInner {
     /// `None` for the microphone source, which has no owning process.
     pub(crate) pid: Option<u32>,
@@ -70,6 +87,13 @@ pub(crate) struct SourceInner {
     input_device: Option<String>,
     pub(crate) samples: Mutex<VecDeque<f32>>,
     pub(crate) stop: Arc<AtomicBool>,
+    /// Set by the render loop, carried out by the capture thread.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) plan: Mutex<RoutePlan>,
+    /// Set by the capture thread once the app plays straight on its
+    /// channel's device: its captured audio (at the app's own volume) is
+    /// then only metered and recorded, not played again.
+    pub(crate) direct: AtomicBool,
     /// The app's audio processes currently turned down. Held while turning
     /// them down or restoring them, so removal can't race with the capture
     /// thread turning them down again.
@@ -132,6 +156,8 @@ impl SourceInner {
             input_device,
             samples: Mutex::new(VecDeque::new()),
             stop: Arc::new(AtomicBool::new(false)),
+            plan: Mutex::default(),
+            direct: AtomicBool::new(false),
             #[cfg(windows)]
             routed: Mutex::default(),
             #[cfg(not(windows))]
@@ -183,6 +209,9 @@ struct BusInner {
     send: AtomicBool,
     /// Also play a copy on the default device, to hear a send bus.
     monitor: AtomicBool,
+    /// Whether its apps can play straight on its device (see
+    /// [`RoutePlan::direct`]), as of the last render tick.
+    direct: AtomicBool,
 }
 
 /// Receives every bus's audio as the mixer renders it: after the bus's EQ,
@@ -208,6 +237,9 @@ pub struct SourceInfo {
     /// The microphone's capture device; `None` is the system default (and
     /// always `None` for apps).
     pub input_device: Option<String>,
+    /// Whether the app plays straight on its channel's device, with no
+    /// delay added (see [`BusInfo::direct`]).
+    pub direct: bool,
 }
 
 /// A snapshot of one bus's current state for UI display.
@@ -233,6 +265,11 @@ pub struct BusInfo {
     pub send: bool,
     /// See [`Mixer::set_bus_monitor`].
     pub monitor: bool,
+    /// Whether its apps can play straight on its device, with no delay
+    /// added: nothing needs the mixer (EQ flat) and the device is there.
+    /// An app turned above 100% still goes through the mixer, and one
+    /// already playing moves once it opens its audio again.
+    pub direct: bool,
 }
 
 /// Captures audio from any number of processes (plus optionally the
@@ -588,6 +625,7 @@ impl Mixer {
                 muted: s.muted.load(Ordering::Relaxed),
                 level: if take_levels { s.level.take() } else { s.level.load() },
                 input_device: s.input_device.clone(),
+                direct: s.direct.load(Ordering::Relaxed),
             })
             .collect()
     }
@@ -621,6 +659,7 @@ impl Mixer {
                 delay_ms: b.delay_ms.load(),
                 send: b.send.load(Ordering::Relaxed),
                 monitor: b.monitor.load(Ordering::Relaxed),
+                direct: b.direct.load(Ordering::Relaxed),
             })
             .collect()
     }
@@ -649,6 +688,7 @@ impl Mixer {
                 delay_ms: AtomicF32::new(0.0),
                 send: AtomicBool::new(false),
                 monitor: AtomicBool::new(false),
+                direct: AtomicBool::new(false),
             }),
         );
     }
@@ -683,10 +723,57 @@ struct BusSnapshot {
     name: String,
     bus: Arc<BusInner>,
     members: Vec<Arc<SourceInner>>,
+    /// For each member, whether it plays straight on the device itself
+    /// (see [`SourceInner::direct`]).
+    members_direct: Vec<bool>,
     device_id: Option<String>,
+    /// Whether the bus's own device opened (rather than its fallback).
+    device_ok: bool,
     priority: Priority,
     send: bool,
     monitor: bool,
+}
+
+/// Works out how each app should be routed (see [`RoutePlan`]) for its
+/// capture thread to carry out. Its bus can play direct when nothing needs
+/// the mixer: a flat EQ, a bus you hear on its own device (not a send, and
+/// not falling back to the default because its device is gone). An app
+/// turned above 100% overall still needs the mixer to boost it.
+fn update_route_plans(bus_snapshot: &[BusSnapshot], master_gain: f32) {
+    for snapshot in bus_snapshot {
+        let bus = &snapshot.bus;
+        let flat = bus.eq.lock().unwrap().gains().iter().all(|gain| gain.abs() < 0.01);
+        let bus_direct = cfg!(windows)
+            && snapshot.device_ok
+            && flat
+            && !snapshot.send
+            && bus.heard.load(Ordering::Relaxed);
+        bus.direct.store(bus_direct, Ordering::Relaxed);
+        let bus_volume = if bus.muted.load(Ordering::Relaxed) { 0.0 } else { bus.gain.load() * master_gain };
+        for source in snapshot.members.iter().filter(|source| source.pid.is_some()) {
+            let volume = if source.muted.load(Ordering::Relaxed) { 0.0 } else { source.gain.load() * bus_volume };
+            let plan = RoutePlan {
+                direct: bus_direct && volume <= 1.0 + 1e-3,
+                device: snapshot.device_id.clone(),
+                volume: volume.min(1.0),
+            };
+            let mut current = source.plan.lock().unwrap();
+            if *current != plan {
+                *current = plan;
+            }
+        }
+    }
+}
+
+/// Turns a direct app's capture, taken at its own volume (its fader times
+/// its channel's and the master), back into what the mixer would have had
+/// after its fader: the level meters and clips use.
+fn direct_correction(bus_volume: f32) -> f32 {
+    if bus_volume > 1e-3 {
+        1.0 / bus_volume
+    } else {
+        0.0
+    }
 }
 
 /// How long to wait before trying an output device again after it failed
@@ -744,16 +831,19 @@ fn run_render_loop(
                     let priority = *bus.priority.lock().unwrap();
                     let send = bus.send.load(Ordering::Relaxed);
                     let monitor = bus.monitor.load(Ordering::Relaxed);
-                    let members = sources
+                    let members: Vec<Arc<SourceInner>> = sources
                         .values()
                         .filter(|s| *s.bus.lock().unwrap() == *name)
                         .cloned()
                         .collect();
+                    let members_direct = members.iter().map(|s| s.direct.load(Ordering::Relaxed)).collect();
                     BusSnapshot {
                         name: name.clone(),
                         bus: bus.clone(),
                         members,
+                        members_direct,
                         device_id,
+                        device_ok: false,
                         priority,
                         send,
                         monitor,
@@ -790,7 +880,8 @@ fn run_render_loop(
             }
         };
         for snapshot in &mut bus_snapshot {
-            if !ensure_open(&snapshot.device_id)
+            snapshot.device_ok = ensure_open(&snapshot.device_id);
+            if !snapshot.device_ok
                 && !snapshot.send
                 && snapshot.bus.fallback_to_default.load(Ordering::Relaxed)
             {
@@ -798,6 +889,8 @@ fn run_render_loop(
                 ensure_open(&None);
             }
         }
+        let master_gain_value = master_gain.load();
+        update_route_plans(&bus_snapshot, master_gain_value);
         let monitoring = bus_snapshot.iter().any(|s| s.monitor && s.device_id.is_some());
         if monitoring {
             ensure_open(&None);
@@ -821,12 +914,14 @@ fn run_render_loop(
         // Buses with nowhere to play drop their audio rather than queue it
         // up to play late once a device is back; the rest drop any backlog
         // beyond what their priority allows.
-        let mut queued_ms = vec![0.0f32; bus_snapshot.len()];
+        // Only apps the mixer plays count towards a bus's delay; direct ones
+        // play on the device themselves.
+        let mut queued_ms: Vec<Option<f32>> = vec![None; bus_snapshot.len()];
         for (bus_idx, snapshot) in bus_snapshot.iter().enumerate() {
             let playing = device_outputs.contains_key(&snapshot.device_id);
             let limit = ms_to_frames(queue_limit_ms(snapshot.priority)) as usize * CHANNELS;
             let keep = ms_to_frames(device_target_ms(snapshot.priority)) as usize * CHANNELS;
-            for source in &snapshot.members {
+            for (source, &direct) in snapshot.members.iter().zip(&snapshot.members_direct) {
                 let mut samples = source.samples.lock().unwrap();
                 if !playing {
                     samples.clear();
@@ -834,8 +929,10 @@ fn run_render_loop(
                     let excess = samples.len() - keep;
                     samples.drain(..excess - excess % CHANNELS);
                 }
-                let ms = samples.len() as f32 / CHANNELS as f32 / SAMPLE_RATE * 1000.0;
-                queued_ms[bus_idx] = queued_ms[bus_idx].max(ms);
+                if !direct {
+                    let ms = samples.len() as f32 / CHANNELS as f32 / SAMPLE_RATE * 1000.0;
+                    queued_ms[bus_idx] = Some(queued_ms[bus_idx].unwrap_or(0.0).max(ms));
+                }
             }
         }
         // Each device is kept only as full as its most urgent bus allows.
@@ -853,7 +950,6 @@ fn run_render_loop(
             .collect();
         let mut device_queued_ms: HashMap<Option<String>, f32> = HashMap::new();
 
-        let master_gain_value = master_gain.load();
         let mut master_peak = 0.0f32;
         let mut source_peaks: Vec<Vec<f32>> = bus_snapshot
             .iter()
@@ -903,12 +999,17 @@ fn run_render_loop(
                 if &snapshot.device_id != device_id {
                     continue;
                 }
+                let bus_volume = snapshot.bus.gain.load() * master_gain_value;
                 for (src_idx, source) in snapshot.members.iter().enumerate() {
                     let block = &mut blocks[block_starts[bus_idx] + src_idx];
                     block.clear();
                     let mut buffer = source.samples.lock().unwrap();
                     let take = wanted.min(buffer.len() - buffer.len() % CHANNELS);
-                    if source.muted.load(Ordering::Relaxed) {
+                    if snapshot.members_direct[src_idx] {
+                        // Its own volume (and mute) is already in it.
+                        let correction = direct_correction(bus_volume);
+                        block.extend(buffer.drain(..take).map(|sample| sample * correction));
+                    } else if source.muted.load(Ordering::Relaxed) {
                         buffer.drain(..take);
                     } else {
                         let gain = source.gain.load();
@@ -937,6 +1038,7 @@ fn run_render_loop(
                     BusSnapshot {
                         bus,
                         members,
+                        members_direct,
                         device_id: bus_device,
                         ..
                     },
@@ -945,14 +1047,18 @@ fn run_render_loop(
                     if bus_device != device_id {
                         continue;
                     }
-                    let mut bus_mix = [0.0f32; CHANNELS];
+                    // What the mixer plays, and what direct apps play on the
+                    // device themselves (only metered and recorded here).
+                    let mut played_mix = [0.0f32; CHANNELS];
+                    let mut direct_mix = [0.0f32; CHANNELS];
                     for src_idx in 0..members.len() {
                         let block = &blocks[block_starts[bus_idx] + src_idx];
                         let Some(samples) = block.get(frame * CHANNELS..(frame + 1) * CHANNELS) else {
                             continue;
                         };
+                        let mix = if members_direct[src_idx] { &mut direct_mix } else { &mut played_mix };
                         let mut local_peak = 0.0f32;
-                        for (channel_mix, &sample) in bus_mix.iter_mut().zip(samples) {
+                        for (channel_mix, &sample) in mix.iter_mut().zip(samples) {
                             *channel_mix += sample;
                             local_peak = local_peak.max(sample.abs());
                         }
@@ -961,8 +1067,11 @@ fn run_render_loop(
                     }
 
                     if let Some(eq) = eqs[bus_idx].as_mut() {
-                        eq.process(&mut bus_mix);
+                        eq.process(&mut played_mix);
                     }
+                    // Direct apps only play while the EQ is flat, so the sum
+                    // is the bus as heard.
+                    let bus_mix: [f32; CHANNELS] = std::array::from_fn(|c| played_mix[c] + direct_mix[c]);
                     if tap.is_some() {
                         tap_buffers[bus_idx].extend_from_slice(&bus_mix);
                     }
@@ -973,12 +1082,12 @@ fn run_render_loop(
                         let bus_gain = bus.gain.load();
                         if bus.heard.load(Ordering::Relaxed) {
                             let mix = if bus_snapshot[bus_idx].send { &mut send_mix } else { &mut device_mix };
-                            for (m, b) in mix.iter_mut().zip(bus_mix.iter()) {
+                            for (m, b) in mix.iter_mut().zip(played_mix.iter()) {
                                 *m += b * bus_gain;
                             }
                         }
                         if bus_snapshot[bus_idx].monitor && bus_device.is_some() {
-                            monitor_queue.extend(bus_mix.iter().map(|b| b * bus_gain));
+                            monitor_queue.extend(played_mix.iter().map(|b| b * bus_gain));
                         }
                     }
                 }
@@ -1023,7 +1132,9 @@ fn run_render_loop(
 
         for (bus_idx, snapshot) in bus_snapshot.iter().enumerate() {
             let device_ms = device_queued_ms.get(&snapshot.device_id).copied().unwrap_or(0.0);
-            snapshot.bus.delay_ms.store(device_ms + queued_ms[bus_idx]);
+            // A bus whose apps all play direct adds nothing.
+            let delay = queued_ms[bus_idx].map_or(0.0, |queued| device_ms + queued);
+            snapshot.bus.delay_ms.store(delay);
         }
 
         if !rendered_any {
@@ -1069,6 +1180,87 @@ mod tests {
         let mics: Vec<u64> = sources.iter().filter(|(_, s)| s.pid.is_none()).map(|(&id, _)| id).collect();
         assert_eq!(mics, [2], "one microphone, the new one");
         assert!(Arc::ptr_eq(&sources[&0], &game), "apps stay");
+    }
+
+    fn bus() -> Arc<BusInner> {
+        Arc::new(BusInner {
+            gain: AtomicF32::new(1.0),
+            muted: AtomicBool::new(false),
+            level: AtomicF32::new(0.0),
+            eq: Mutex::new(EqBands::new(SAMPLE_RATE)),
+            device_id: Mutex::new(Some("headset".into())),
+            fallback_to_default: AtomicBool::new(true),
+            heard: AtomicBool::new(true),
+            priority: Mutex::new(Priority::High),
+            delay_ms: AtomicF32::new(0.0),
+            send: AtomicBool::new(false),
+            monitor: AtomicBool::new(false),
+            direct: AtomicBool::new(false),
+        })
+    }
+
+    /// The plan for one app on `bus` after a tick (`device_ok`: whether the
+    /// bus's own device opened).
+    fn plan_for(bus: &Arc<BusInner>, app: &Arc<SourceInner>, device_ok: bool, master: f32) -> RoutePlan {
+        let snapshot = BusSnapshot {
+            name: "Game".into(),
+            bus: bus.clone(),
+            members: vec![app.clone()],
+            members_direct: vec![false],
+            device_id: bus.device_id.lock().unwrap().clone(),
+            device_ok,
+            priority: Priority::High,
+            send: bus.send.load(Ordering::Relaxed),
+            monitor: false,
+        };
+        update_route_plans(&[snapshot], master);
+        app.plan.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn apps_play_direct_only_when_nothing_needs_the_mixer() {
+        // Only Windows can point an app at a device.
+        let direct = cfg!(windows);
+        let (game, app) = (bus(), source(Some(100), "Game"));
+        game.gain.store(0.5);
+        app.gain.store(0.8);
+        let plan = plan_for(&game, &app, true, 1.0);
+        assert_eq!(plan, RoutePlan { direct, device: Some("headset".into()), volume: 0.4 });
+        assert_eq!(game.direct.load(Ordering::Relaxed), direct);
+
+        // Muted, it still plays direct, at no volume.
+        game.muted.store(true, Ordering::Relaxed);
+        assert_eq!(plan_for(&game, &app, true, 1.0), RoutePlan { direct, device: Some("headset".into()), volume: 0.0 });
+        game.muted.store(false, Ordering::Relaxed);
+
+        // Above 100% overall, only the mixer can boost it.
+        app.gain.store(2.0);
+        let plan = plan_for(&game, &app, true, 1.5);
+        assert!(!plan.direct);
+        assert_eq!(plan.volume, 1.0);
+        app.gain.store(0.8);
+
+        // The EQ needs the mixer.
+        game.eq.lock().unwrap().set_band(2, 3.0);
+        assert!(!plan_for(&game, &app, true, 1.0).direct);
+        game.eq.lock().unwrap().set_band(2, 0.0);
+
+        // So does a bus whose own device is gone (it's on its fallback).
+        assert!(!plan_for(&game, &app, false, 1.0).direct);
+    }
+
+    #[test]
+    fn a_microphone_has_no_route_plan() {
+        let (mic_bus, mic) = (bus(), source(None, "Mic"));
+        mic_bus.send.store(true, Ordering::Relaxed);
+        assert_eq!(plan_for(&mic_bus, &mic, true, 1.0), RoutePlan::default());
+        assert!(!mic_bus.direct.load(Ordering::Relaxed), "a send bus never plays direct");
+    }
+
+    #[test]
+    fn direct_audio_is_metered_as_after_its_own_fader() {
+        assert_eq!(direct_correction(0.5), 2.0);
+        assert_eq!(direct_correction(0.0), 0.0, "a silenced bus captures nothing to undo");
     }
 
     #[test]

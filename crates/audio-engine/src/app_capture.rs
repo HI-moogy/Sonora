@@ -1,6 +1,10 @@
 //! Capturing one app's audio on Windows: process loopback of the app (and
-//! its helper processes), with the app's own sessions turned down so only
-//! the mixer's copy is heard (see [`crate::session_volume`]).
+//! its helper processes). Routed through the mixer, the app's own sessions
+//! are turned down so only the mixer's copy is heard (see
+//! [`crate::session_volume`]). When nothing needs the mixer, the app is
+//! instead pointed at its channel's device and, once Windows shows it
+//! playing there, plays direct: its sessions get the channel's volume and
+//! the capture only feeds meters and clips (see [`crate::mixer::RoutePlan`]).
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -16,6 +20,7 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::com::{ComGuard, ProAudioThread};
+use crate::devices::default_output_device_id;
 use crate::loopback::{activate_process_loopback_client, standard_format};
 use crate::mixer::{SourceInner, CHANNELS, MAX_BUFFERED_SAMPLES};
 use crate::process_tree::ProcessTree;
@@ -43,6 +48,10 @@ const ROUTED_HEADROOM: f32 = 2.0;
 /// reading back as turned down (audio we can't reach, e.g. a child process),
 /// don't boost again for this long.
 const BOOST_BLOCK: Duration = Duration::from_secs(2);
+/// How often an app pointed at its channel's device is looked up again
+/// while it hasn't moved there yet: its new session there is how Sonora
+/// sees that it has.
+const MOVE_RESCAN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A started process-loopback capture of one process (and its descendants).
 struct LoopbackCapture {
@@ -114,7 +123,7 @@ struct AppAudio {
 /// just `pid` if the process list can't be read.
 fn app_audio(pid: u32) -> AppAudio {
     let all = session_volume::all_sessions().unwrap_or_default();
-    let owners: HashSet<u32> = all.iter().map(|&(owner, _)| owner).collect();
+    let owners: HashSet<u32> = all.iter().map(|session| session.pid).collect();
     let (processes, target) = match ProcessTree::snapshot() {
         Ok(tree) => (
             tree.app_audio_processes(pid, &owners),
@@ -124,13 +133,31 @@ fn app_audio(pid: u32) -> AppAudio {
     };
     let sessions = all
         .into_iter()
-        .filter(|(owner, _)| processes.contains(owner))
+        .filter(|session| processes.contains(&session.pid))
         .collect();
     AppAudio {
         processes,
         target,
         sessions,
     }
+}
+
+/// Whether the app can play direct on `device` (`None`: Windows' default
+/// output), as its sessions show: while `direct`, it stays so unless it
+/// plays on another device; otherwise it becomes so once it plays on that
+/// device and nowhere else. An app that's gone quiet keeps its route.
+fn plays_on(sessions: &[OwnedSession], device: Option<&str>, direct: bool) -> bool {
+    let target = match device {
+        Some(id) => id.to_string(),
+        None => match default_output_device_id() {
+            Ok(id) => id,
+            Err(_) => return false,
+        },
+    };
+    let playing: Vec<&OwnedSession> = sessions.iter().filter(|session| session.is_playing()).collect();
+    let elsewhere = playing.iter().any(|session| session.device != target);
+    let there = playing.iter().any(|session| session.device == target);
+    !elsewhere && (direct || there)
 }
 
 /// Runs entirely on its own OS thread: initializes this thread's own COM
@@ -172,6 +199,11 @@ pub(crate) fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: m
     let mut all_routed = false;
     let mut boost_blocked_until = Instant::now();
     let mut boosted = Vec::new();
+    // The device Sonora last pointed the app's processes at (`Some(None)`:
+    // gave them back their own), so it's only done when that changes.
+    let mut pointed: Option<Option<String>> = None;
+    // Playing straight on its channel's device (see `crate::mixer::RoutePlan`).
+    let mut direct = false;
 
     while !source.stop.load(Ordering::Relaxed) {
         if found.is_none() && Instant::now() >= next_scan {
@@ -194,6 +226,10 @@ pub(crate) fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: m
                 session_volume::unroute(&gone);
             }
             session_volume::record_originals(&app.sessions);
+            // New processes are pointed too.
+            if *routed != app.processes {
+                pointed = None;
+            }
             *routed = app.processes;
             sessions = app.sessions;
             last_scan = Instant::now();
@@ -201,11 +237,35 @@ pub(crate) fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: m
             last_routed = Instant::now() - ROUTE_ENFORCE_INTERVAL;
         }
         if last_routed.elapsed() >= ROUTE_ENFORCE_INTERVAL {
-            let _routed = source.routed.lock().unwrap();
+            let routed = source.routed.lock().unwrap();
             if source.stop.load(Ordering::Relaxed) {
                 break;
             }
-            all_routed = session_volume::enforce(&sessions);
+            let plan = source.plan.lock().unwrap().clone();
+            // Point the app at its channel's device, or give it back its own.
+            let wanted = if plan.direct { plan.device.clone() } else { None };
+            if pointed.as_ref() != Some(&wanted) {
+                session_volume::point(&routed, wanted.as_deref());
+                pointed = Some(wanted);
+            }
+            let now_direct = plan.direct && plays_on(&sessions, plan.device.as_deref(), direct);
+            if now_direct != direct {
+                direct = now_direct;
+                session_volume::mark_direct(&sessions, direct);
+                // What's queued was captured the other way.
+                source.samples.lock().unwrap().clear();
+                source.direct.store(direct, Ordering::Relaxed);
+            }
+            if direct {
+                session_volume::set_volume(&sessions, plan.volume);
+                all_routed = false;
+            } else {
+                all_routed = session_volume::enforce(&sessions);
+                if plan.direct {
+                    // Pointed there: look for it playing there sooner.
+                    next_scan = next_scan.min(last_scan + MOVE_RESCAN_INTERVAL);
+                }
+            }
             last_routed = Instant::now();
         }
 
@@ -243,19 +303,24 @@ pub(crate) fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: m
                         num_frames as usize * CHANNELS,
                     )
                 };
-                let raw_peak = samples.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
-                let turned_down = raw_peak <= ROUTED_VOLUME * ROUTED_HEADROOM;
-                if all_routed && !turned_down {
-                    // Louder than a turned-down app can be: some of its audio
-                    // isn't turned down, likely a session we haven't found
-                    // yet. Don't boost; look for it soon.
-                    boost_blocked_until = Instant::now() + BOOST_BLOCK;
-                    next_scan = next_scan.min(last_scan + APP_RESCAN_SOON);
-                }
-                let gain = if all_routed && turned_down && Instant::now() >= boost_blocked_until {
-                    ROUTED_BOOST
-                } else {
+                // A direct app's audio is at its own volume: nothing to boost.
+                let gain = if direct {
                     1.0
+                } else {
+                    let raw_peak = samples.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
+                    let turned_down = raw_peak <= ROUTED_VOLUME * ROUTED_HEADROOM;
+                    if all_routed && !turned_down {
+                        // Louder than a turned-down app can be: some of its
+                        // audio isn't turned down, likely a session we
+                        // haven't found yet. Don't boost; look for it soon.
+                        boost_blocked_until = Instant::now() + BOOST_BLOCK;
+                        next_scan = next_scan.min(last_scan + APP_RESCAN_SOON);
+                    }
+                    if all_routed && turned_down && Instant::now() >= boost_blocked_until {
+                        ROUTED_BOOST
+                    } else {
+                        1.0
+                    }
                 };
                 boosted.clear();
                 boosted.extend(samples.iter().map(|&s| s * gain));

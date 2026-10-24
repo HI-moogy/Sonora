@@ -298,6 +298,7 @@ mod tests {
             muted: false,
             level: 0.0,
             input_device: None,
+            direct: false,
         }
     }
 

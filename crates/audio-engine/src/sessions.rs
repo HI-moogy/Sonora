@@ -11,6 +11,7 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
+use crate::devices::endpoint_id;
 use crate::process_tree::{listed_executable_name, ProcessTree};
 
 #[derive(Debug, Clone)]
@@ -20,22 +21,22 @@ pub struct AudioSession {
     pub is_system_sounds: bool,
 }
 
-/// Calls `visit` with every audio session on every active output device.
-/// Apps don't all play to the default device (some pick their own output,
-/// or are routed to a virtual one), so looking at just the default misses
-/// them. A device or session that can't be read is skipped.
+/// Calls `visit` with every audio session on every active output device,
+/// and the id of the device it's on. Apps don't all play to the default
+/// device (some pick their own output, or are routed to a virtual one), so
+/// looking at just the default misses them. A device or session that can't
+/// be read is skipped.
 pub(crate) fn visit_sessions(
-    mut visit: impl FnMut(&IAudioSessionControl2),
+    mut visit: impl FnMut(&str, &IAudioSessionControl2),
 ) -> windows::core::Result<()> {
     unsafe {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         let devices = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
         for d in 0..devices.GetCount()? {
-            let Ok(manager) = devices
-                .Item(d)
-                .and_then(|device| device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None))
-            else {
+            let Ok(device) = devices.Item(d) else { continue };
+            let Ok(device_id) = endpoint_id(&device) else { continue };
+            let Ok(manager) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else {
                 continue;
             };
             let Ok(list) = manager.GetSessionEnumerator() else {
@@ -46,7 +47,7 @@ pub(crate) fn visit_sessions(
                     .GetSession(s)
                     .and_then(|c| c.cast::<IAudioSessionControl2>())
                 {
-                    visit(&control);
+                    visit(&device_id, &control);
                 }
             }
         }
@@ -60,7 +61,7 @@ pub(crate) fn visit_sessions(
 /// A process playing to several devices appears once per device.
 pub fn enumerate_sessions() -> windows::core::Result<Vec<AudioSession>> {
     let mut sessions = Vec::new();
-    visit_sessions(|control2| unsafe {
+    visit_sessions(|_, control2| unsafe {
         let process_id = control2.GetProcessId().unwrap_or(0);
         let is_system_sounds = control2.IsSystemSoundsSession() == S_OK;
 

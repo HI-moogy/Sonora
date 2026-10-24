@@ -7,6 +7,8 @@ pub mod mixer;
 #[cfg(windows)]
 mod app_capture;
 #[cfg(windows)]
+pub mod app_output;
+#[cfg(windows)]
 pub mod com;
 #[cfg(windows)]
 pub mod devices;

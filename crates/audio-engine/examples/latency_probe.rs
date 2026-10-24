@@ -12,9 +12,11 @@
 //! In `capture` mode it times only Windows' per-app capture (no mixer).
 //! With `short`, the device's audio engine is held at its shortest cycle
 //! while measuring (as a low-latency app would). `periods` lists each
-//! output device's engine cycles.
+//! output device's engine cycles. With a flat EQ the routed app plays
+//! direct (straight on the device); `eq` turns one band up so it goes
+//! through the mixer instead.
 //!
-//! Usage: latency_probe <part of a device name> [priority: high|normal|low] [clicks|tone|capture] [short]
+//! Usage: latency_probe <part of a device name> [priority: high|normal|low] [clicks|tone|capture] [short] [eq]
 //!        latency_probe periods
 
 use std::io::{BufRead, BufReader};
@@ -189,7 +191,7 @@ fn dropouts(packets: &[(i64, Vec<f32>)]) -> usize {
     gaps
 }
 
-fn run(device_id: &str, routed: Option<Priority>, tone: bool) -> windows::core::Result<()> {
+fn run(device_id: &str, routed: Option<Priority>, tone: bool, eq: bool) -> windows::core::Result<()> {
     let mut child = Player(
         Command::new(std::env::current_exe().unwrap())
             .args(["--play", device_id, if tone { "tone" } else { "clicks" }])
@@ -216,6 +218,9 @@ fn run(device_id: &str, routed: Option<Priority>, tone: bool) -> windows::core::
             mixer.ensure_bus("Game");
             mixer.set_bus_device("Game", Some(device_id.to_string()));
             mixer.set_bus_priority("Game", priority);
+            if eq {
+                mixer.set_bus_eq_band("Game", 2, 3.0);
+            }
             mixer.add_source(child.0.id(), "probe", "Game")?;
             std::thread::sleep(Duration::from_millis(1500));
             Some(mixer)
@@ -223,14 +228,18 @@ fn run(device_id: &str, routed: Option<Priority>, tone: bool) -> windows::core::
         None => None,
     };
     let packets = capture(device_id, 5.0)?;
-    let mut label = routed.map_or("direct".to_string(), |p| format!("routed, {p:?} priority"));
+    let mut label = routed.map_or("not routed".to_string(), |p| format!("routed, {p:?} priority"));
     if let Some(mixer) = &mixer {
         let delay = mixer
             .buses()
             .into_iter()
             .find(|b| b.name == "Game")
             .map_or(0.0, |b| b.delay_ms);
-        label += &format!(" (mixer's own estimate {delay:.0} ms)");
+        let direct = mixer.sources().iter().any(|s| s.direct);
+        label += &format!(
+            " {} (mixer's own estimate {delay:.0} ms)",
+            if direct { "playing direct" } else { "through the mixer" }
+        );
     }
     if tone {
         println!("{label}: {} dropouts in 5 s", dropouts(&packets));
@@ -432,7 +441,8 @@ fn main() -> windows::core::Result<()> {
         return capture_stage(&device.id);
     }
     let tone = args.get(2).map(String::as_str) == Some("tone");
+    let eq = args.iter().any(|arg| arg == "eq");
     println!("device: {}", device.name);
-    run(&device.id, None, tone)?;
-    run(&device.id, Some(priority), tone)
+    run(&device.id, None, tone, false)?;
+    run(&device.id, Some(priority), tone, eq)
 }
