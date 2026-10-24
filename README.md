@@ -74,6 +74,10 @@ guide** shows it again.
 - Click a channel (Game, Chat, Aux, Media, Mic) to open its settings.
 - Under **Add an app**, click **Add** next to an app to send it to that
   channel. From then on the channel's fader, EQ and mute control it.
+  Apps show up there once they've played a sound. For one that isn't
+  there, click **Can't find your program? Add it manually** and type its
+  name (like `deadlock.exe`) or **Browse…** to it; it joins the channel
+  whenever it plays.
 - **Plays on** picks where that channel plays (headset, speakers, TV...).
   "If it disconnects" decides whether it falls back to your default output
   or goes silent.

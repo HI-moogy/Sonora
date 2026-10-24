@@ -24,6 +24,31 @@ struct Snapshot {
     mic: MicConfig,
 }
 
+/// Why a program typed in by name wasn't added.
+#[derive(Debug, PartialEq)]
+pub enum AddAppError {
+    /// What was typed isn't a program's file name.
+    NotAProgram,
+    /// It's already in a channel (this one, or the one named).
+    AlreadyIn(String),
+}
+
+/// The saved name (lowercase executable name, as apps are saved) of the
+/// program `typed` names: "Deadlock", "deadlock.exe" or a path to it.
+pub fn app_key(typed: &str) -> Option<String> {
+    let path = typed.trim().trim_matches('"');
+    let name = path.rsplit(['\\', '/']).next()?.trim().to_lowercase();
+    if name.is_empty() || name.contains(['<', '>', ':', '"', '|', '?', '*']) {
+        return None;
+    }
+    // Windows programs are always .exe; dots elsewhere are part of the
+    // name (Battle.net.exe).
+    if cfg!(windows) && !name.ends_with(".exe") {
+        return Some(format!("{name}.exe"));
+    }
+    Some(name)
+}
+
 pub struct MixerPersistence {
     /// Saved routes that aren't running yet (the app isn't open, or the
     /// microphone couldn't be opened). Restored when possible, and kept in
@@ -84,6 +109,32 @@ impl MixerPersistence {
     /// Forgets a saved route that's waiting for its app.
     pub fn forget_waiting_app(&mut self, bus: &str, app: &str) {
         self.pending.retain(|s| !(s.bus == bus && s.app.as_deref() == Some(app)));
+    }
+
+    /// The app (lowercase executable name) running source `id` is, once
+    /// known (within a check of it starting).
+    pub fn app_of(&self, id: u64) -> Option<&str> {
+        self.exe_names.get(&id).map(String::as_str)
+    }
+
+    /// Saves the program `typed` names (as typed, e.g. "Deadlock", or the
+    /// path to it) to join `bus` whenever it plays, as if added from the
+    /// list. Returns the name saved.
+    pub fn add_app_by_name(&mut self, bus: &str, typed: &str, sources: &[SourceInfo]) -> Result<String, AddAppError> {
+        let app = app_key(typed).ok_or(AddAppError::NotAProgram)?;
+        let running = sources.iter().filter_map(|source| {
+            let exe = match self.exe_names.get(&source.id) {
+                Some(exe) => exe.clone(),
+                None => process_executable_name(source.pid?)?.to_lowercase(),
+            };
+            Some((exe, source.bus.clone()))
+        });
+        let waiting = self.pending.iter().filter_map(|saved| Some((saved.app.clone()?, saved.bus.clone())));
+        if let Some((_, channel)) = running.chain(waiting).find(|(exe, _)| *exe == app) {
+            return Err(AddAppError::AlreadyIn(channel));
+        }
+        self.pending.push(SavedSource { app: Some(app.clone()), bus: bus.to_string(), gain: 1.0, muted: false, input_device: None });
+        Ok(app)
     }
 
     /// Call often (every frame is fine) with the apps currently playing
@@ -216,5 +267,86 @@ impl MixerPersistence {
             eq,
             mic,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn persistence(pending: Vec<SavedSource>) -> MixerPersistence {
+        MixerPersistence {
+            pending,
+            exe_names: HashMap::new(),
+            saved: None,
+            last_check: Instant::now(),
+            last_mic_try: Instant::now(),
+        }
+    }
+
+    fn waiting(app: &str, bus: &str) -> SavedSource {
+        SavedSource { app: Some(app.into()), bus: bus.into(), gain: 1.0, muted: false, input_device: None }
+    }
+
+    fn running(id: u64, bus: &str) -> SourceInfo {
+        SourceInfo {
+            id,
+            pid: None,
+            name: String::new(),
+            bus: bus.into(),
+            gain: 1.0,
+            muted: false,
+            level: 0.0,
+            input_device: None,
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn typed_programs_are_saved_by_their_lowercase_exe_name() {
+        for typed in ["deadlock.exe", "Deadlock.EXE", " Deadlock ", r#""C:\Games\Deadlock\game\bin\win64\deadlock.exe""#, "D:/Games/deadlock.exe"] {
+            assert_eq!(app_key(typed).as_deref(), Some("deadlock.exe"), "{typed}");
+        }
+        assert_eq!(app_key("Battle.net").as_deref(), Some("battle.net.exe"));
+    }
+
+    #[test]
+    fn what_isnt_a_program_name_is_refused() {
+        for typed in ["", "   ", r"C:\Games\", "dead|lock", "C:"] {
+            assert_eq!(app_key(typed), None, "{typed:?}");
+        }
+    }
+
+    #[test]
+    fn a_program_added_by_name_waits_for_it_and_is_saved() {
+        let app = app_key("deadlock").unwrap();
+        let mut saved = persistence(Vec::new());
+        assert_eq!(saved.add_app_by_name("Game", "Deadlock", &[]), Ok(app.clone()));
+        assert_eq!(saved.waiting_apps("Game").collect::<Vec<_>>(), [app.as_str()]);
+
+        // Saved like any routed app, and removable again.
+        let snapshot = saved.snapshot(1.0, &[], &[], MicConfig::default());
+        assert_eq!(snapshot.mixer.sources, [waiting(&app, "Game")]);
+        saved.forget_waiting_app("Game", &app);
+        assert_eq!(saved.waiting_apps("Game").count(), 0);
+    }
+
+    #[test]
+    fn a_program_already_in_a_channel_isnt_added_again() {
+        let app = app_key("deadlock").unwrap();
+        let mut saved = persistence(vec![waiting(&app, "Chat")]);
+        assert_eq!(saved.add_app_by_name("Game", "deadlock", &[]), Err(AddAppError::AlreadyIn("Chat".into())));
+
+        let mut saved = persistence(Vec::new());
+        saved.exe_names.insert(7, app.clone());
+        assert_eq!(saved.add_app_by_name("Game", "Deadlock", &[running(7, "Game")]), Err(AddAppError::AlreadyIn("Game".into())));
+        assert_eq!(saved.waiting_apps("Game").count(), 0);
+    }
+
+    #[test]
+    fn a_program_name_that_isnt_one_is_not_saved() {
+        let mut saved = persistence(Vec::new());
+        assert_eq!(saved.add_app_by_name("Game", "  ", &[]), Err(AddAppError::NotAProgram));
+        assert!(saved.pending.is_empty());
     }
 }

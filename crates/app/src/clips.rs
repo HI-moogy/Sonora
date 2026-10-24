@@ -6,19 +6,14 @@ use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
 use eframe::egui;
-use windows::core::{HSTRING, PWSTR};
+use windows::core::HSTRING;
 use windows::Win32::Foundation::SIZE;
 use windows::Win32::Graphics::Gdi::{
     DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     DIB_RGB_COLORS,
 };
-use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
-};
-use windows::Win32::UI::Shell::{
-    FileOpenDialog, IFileOpenDialog, IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName,
-    FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, SIGDN_FILESYSPATH, SIIGBF_THUMBNAILONLY,
-};
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_THUMBNAILONLY};
 
 pub mod editor;
 
@@ -426,24 +421,6 @@ pub fn show_in_folder(path: &Path) {
 /// saved before the rename start with "sonar-rs ".
 pub fn display_name(name: &str) -> &str {
     name.strip_prefix("Sonora ").or_else(|| name.strip_prefix("sonar-rs ")).unwrap_or(name)
-}
-
-/// Shows the standard Windows folder picker starting at `start`. Blocks
-/// until the user picks a folder (`Some`) or cancels (`None`).
-pub fn pick_folder(start: &Path) -> Option<PathBuf> {
-    unsafe {
-        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-        let options = dialog.GetOptions().ok()?;
-        dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM).ok()?;
-        if let Ok(folder) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(start.as_os_str()), None) {
-            let _ = dialog.SetFolder(&folder);
-        }
-        dialog.Show(None).ok()?;
-        let path: PWSTR = dialog.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
-        let picked = path.to_string().ok();
-        CoTaskMemFree(Some(path.0 as *const _));
-        picked.map(PathBuf::from)
-    }
 }
 
 /// "1:05" / "12:30".

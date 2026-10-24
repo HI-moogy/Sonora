@@ -11,7 +11,7 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use crate::process_tree::ProcessTree;
+use crate::process_tree::{listed_executable_name, ProcessTree};
 
 #[derive(Debug, Clone)]
 pub struct AudioSession {
@@ -76,7 +76,7 @@ pub fn enumerate_sessions() -> windows::core::Result<Vec<AudioSession>> {
         // to Volume Mixer to resolve from the process itself), so fall
         // back to the owning executable's filename.
         let display_name = if session_name.is_empty() {
-            process_executable_name(process_id).unwrap_or_default()
+            opened_executable_name(process_id).unwrap_or_default()
         } else {
             session_name
         };
@@ -88,6 +88,15 @@ pub fn enumerate_sessions() -> windows::core::Result<Vec<AudioSession>> {
         });
     })?;
     if let Ok(tree) = ProcessTree::snapshot() {
+        // A process that can't be opened (one run as administrator, say)
+        // was left nameless above, which kept it out of the app list.
+        for session in &mut sessions {
+            if session.display_name.is_empty() && session.process_id != 0 {
+                if let Some(name) = tree.executable_name(session.process_id) {
+                    session.display_name = name.to_string();
+                }
+            }
+        }
         let owners: HashSet<u32> = sessions
             .iter()
             .map(|s| s.process_id)
@@ -103,9 +112,19 @@ pub fn enumerate_sessions() -> windows::core::Result<Vec<AudioSession>> {
 }
 
 /// Resolves a pid to its owning executable's filename (e.g. "steam.exe"),
-/// for sessions WASAPI doesn't give a display name for. Returns `None` for
-/// pid 0 (the system sounds session) or a process we can't query.
+/// for sessions WASAPI doesn't give a display name for. A process that
+/// can't be opened (one run as administrator, say) is looked up in the
+/// process list instead. Returns `None` for pid 0 (the system sounds
+/// session) or a process that's gone.
 pub fn process_executable_name(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    opened_executable_name(pid).or_else(|| listed_executable_name(pid))
+}
+
+/// [`process_executable_name`] for a process that can be opened.
+fn opened_executable_name(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;
     }
