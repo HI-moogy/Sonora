@@ -1,7 +1,7 @@
 use windows::core::Result;
 use windows::Win32::Media::Audio::{
     eRender, IAudioClient, IAudioRenderClient, IMMDevice, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, WAVEFORMATEX,
+    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::CLSCTX_ALL;
 
@@ -30,9 +30,11 @@ pub fn open_render_client_for_device(
 pub(crate) fn open_render_client(device: &IMMDevice, format: &WAVEFORMATEX) -> Result<(IAudioClient, IAudioRenderClient)> {
     unsafe {
         let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+        // A device not at 48 kHz (a virtual cable left at 44.1 kHz, say) is
+        // converted by Windows; its better converter, for listening.
         client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
             BUFFER_DURATION_100NS,
             0,
             format,

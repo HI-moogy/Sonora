@@ -5,7 +5,7 @@ use windows::core::Result;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     eCapture, IAudioCaptureClient, IAudioClient, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, WAVEFORMATEX,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::CLSCTX_ALL;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
@@ -42,9 +42,13 @@ fn open_capture_client(
     unsafe {
         let client: IAudioClient = endpoint(device_id, eCapture)?.Activate(CLSCTX_ALL, None)?;
         let event = CreateEventW(None, false, false, None)?;
+        // A mic that isn't mono at 48 kHz is converted by Windows; its better
+        // converter, since this is a voice people listen to.
         client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
             CAPTURE_BUFFER_DURATION_100NS,
             0,
             format,
