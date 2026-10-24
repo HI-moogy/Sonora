@@ -673,7 +673,7 @@ impl Moments {
                 crate::support::open_folder(&dir);
             }
             if ui.button("Change folder…").clicked() {
-                if let Some(picked) = clips::pick_folder(&dir) {
+                if let Some(picked) = crate::file_dialogs::pick_folder(&dir) {
                     self.config.clips_dir = Some(picked.clone());
                     *self.shared.dir.lock().unwrap() = picked;
                     self.persist();

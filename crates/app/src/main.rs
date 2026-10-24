@@ -20,6 +20,8 @@ mod autostart;
 mod clips;
 mod eq_presets;
 #[cfg(windows)]
+mod file_dialogs;
+#[cfg(windows)]
 mod games;
 mod guide;
 #[cfg(windows)]
@@ -47,7 +49,7 @@ use meter::level_meter;
 #[cfg(windows)]
 use moments::Moments;
 use strip::Strip;
-use setup::MixerPersistence;
+use setup::{AddAppError, MixerPersistence};
 use tray::{Tray, TrayCommand};
 
 /// The five channels always shown as faders, matching SteelSeries Sonar's
@@ -108,6 +110,7 @@ struct MixerApp {
     /// Whether this run already said it keeps running in the tray.
     tray_hint_shown: bool,
     eq_presets: EqPresetState,
+    add_by_name: AddByName,
     /// Started at sign-in: frames left during which to keep the window
     /// hidden, since eframe shows it once after its first frame whatever it
     /// was created with.
@@ -179,6 +182,7 @@ impl MixerApp {
             quitting,
             tray_hint_shown: false,
             eq_presets: EqPresetState::load(),
+            add_by_name: AddByName::default(),
             start_hidden_frames: if start_hidden { START_HIDDEN_FRAMES } else { 0 },
             colors_window: appearance::ColorsWindow::default(),
             about_window: support::AboutWindow::default(),
@@ -332,11 +336,7 @@ impl MixerApp {
         let mine: Vec<&audio_engine::SourceInfo> = sources.iter().filter(|s| s.bus == selected && s.pid.is_some()).collect();
         // A saved app with one copy already here (a second Discord, say)
         // isn't listed again as waiting.
-        let here: Vec<String> = mine
-            .iter()
-            .filter_map(|s| audio_engine::process_executable_name(s.pid?))
-            .map(|exe| exe.to_lowercase())
-            .collect();
+        let here: Vec<String> = mine.iter().filter_map(|s| self.persistence.app_of(s.id)).map(str::to_string).collect();
         let waiting: Vec<String> = self
             .persistence
             .waiting_apps(selected)
@@ -410,6 +410,63 @@ impl MixerApp {
             if let Err(error) = self.mixer.add_source(pid, name, selected.to_string()) {
                 self.status = Some(format!("Couldn't add that app: {}", error.message()));
             }
+        }
+        self.add_by_name_ui(ui, selected, sources);
+    }
+
+    /// Under the app list: adds a program that isn't listed (it hasn't
+    /// played anything yet, say) by its name, or picked from disk. It's
+    /// saved like an app added from the list, so it joins `bus` whenever
+    /// it plays, and is removed the same way.
+    fn add_by_name_ui(&mut self, ui: &mut egui::Ui, bus: &str, sources: &[audio_engine::SourceInfo]) {
+        let Some(mut typed) = self.add_by_name.typed.take_if(|_| self.add_by_name.bus == bus) else {
+            if ui.link("Can't find your program? Add it manually").clicked() {
+                self.add_by_name = AddByName { bus: bus.to_string(), typed: Some(String::new()), focus: true, error: None };
+            }
+            return;
+        };
+        ui.label(
+            egui::RichText::new("Type the program's name or pick it. It joins this channel whenever it plays.")
+                .small()
+                .color(theme::text_muted()),
+        );
+        let (mut add, mut done) = (false, false);
+        ui.horizontal(|ui| {
+            let field = ui.add(egui::TextEdit::singleline(&mut typed).hint_text(PROGRAM_NAME_HINT).desired_width(140.0));
+            if std::mem::take(&mut self.add_by_name.focus) {
+                field.request_focus();
+            }
+            add = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            #[cfg(windows)]
+            if ui.button("Browse…").clicked() {
+                if let Some(path) = file_dialogs::pick_program() {
+                    typed = path.display().to_string();
+                    add = true;
+                }
+            }
+            add |= ui.add_enabled(!typed.trim().is_empty(), theme::primary_button("Add")).clicked();
+            done = ui.button("Cancel").clicked();
+        });
+        if add && !typed.trim().is_empty() {
+            match self.persistence.add_app_by_name(bus, &typed, sources) {
+                Ok(_) => done = true,
+                Err(error) => {
+                    let app = setup::app_key(&typed).map(|app| capitalized(app_label(&app))).unwrap_or_default();
+                    self.add_by_name.error = Some(match error {
+                        AddAppError::NotAProgram => format!("That isn't a program's name. Try one like {PROGRAM_NAME_HINT}."),
+                        AddAppError::AlreadyIn(channel) if channel == bus => format!("{app} is already in this channel."),
+                        AddAppError::AlreadyIn(channel) => format!("{app} is already in {channel}. Remove it there to add it here."),
+                    });
+                }
+            }
+        }
+        if done {
+            self.add_by_name = AddByName::default();
+            return;
+        }
+        self.add_by_name.typed = Some(typed);
+        if let Some(error) = &self.add_by_name.error {
+            ui.colored_label(theme::danger(), error);
         }
     }
 
@@ -528,6 +585,24 @@ impl MixerApp {
             self.input_devices = devices;
         }
     }
+}
+
+/// What a program's name looks like, for "Add it manually".
+#[cfg(windows)]
+const PROGRAM_NAME_HINT: &str = "deadlock.exe";
+#[cfg(not(windows))]
+const PROGRAM_NAME_HINT: &str = "firefox";
+
+/// A program's name being typed in to add it manually, and why the last
+/// one wasn't added.
+#[derive(Default)]
+struct AddByName {
+    /// The channel it's being added to.
+    bus: String,
+    typed: Option<String>,
+    /// Focus the name field on the frame it appears.
+    focus: bool,
+    error: Option<String>,
 }
 
 /// Your saved EQ presets, and the name being typed to save one.

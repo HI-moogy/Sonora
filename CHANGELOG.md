@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- **Add a program by name**: under a channel's **Add an app**, **Can't find your program? Add it manually** takes a program's name (like `deadlock.exe`) or the program picked with **Browse…**. It joins the channel whenever it plays, and is saved and removed like any app you added.
+
+### Fixed
+
+- A game started from Steam was missing from **Add an app** while Steam itself had a sound going (voice chat, a notification): the game was counted as part of Steam. Programs with a window of their own are listed on their own now.
+- An app Sonora isn't allowed to look into (some run as administrator, or protected by anti-cheat) was missing from **Add an app**, and wasn't routed again when it opened.
+
 ## 0.1.0-alpha.3 (2026-10-23)
 
 ### New
