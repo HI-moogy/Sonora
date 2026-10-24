@@ -10,7 +10,7 @@ use audio_engine::{
     enumerate_sessions, list_input_devices, list_output_devices, AudioDevice, Mixer, EQ_BAND_COUNT,
     EQ_BAND_FREQUENCIES, EQ_GAIN_RANGE_DB,
 };
-use common::Priority;
+use common::{NoiseSuppression, Priority};
 use eframe::egui;
 
 mod appearance;
@@ -486,6 +486,10 @@ impl MixerApp {
             (Some(cable), true) => {
                 let mic = cable.voice_cable_mic.as_deref().unwrap_or_default();
                 ui.weak(format!("In Discord and games, pick \"{mic}\" as your microphone."));
+                // Two noise removers in a row make a voice sound underwater.
+                if self.mixer.mic_cleanup().mode() != NoiseSuppression::Off {
+                    ui.weak("Turn off their own noise suppression (Krisp in Discord): Sonora already cleans your voice.");
+                }
             }
             (Some(cable), false) => {
                 ui.horizontal(|ui| {
@@ -778,7 +782,7 @@ impl eframe::App for MixerApp {
             None => {}
         }
         self.colors_window.show(ui.ctx());
-        self.about_window.show(ui.ctx());
+        self.about_window.show(ui.ctx(), &self.mixer);
         if let Some(guide::Outcome::Done) = self.guide.show(ui.ctx(), &self.clip_hotkey()) {
             self.tab = Tab::Mixer;
             self.selected_bus = None;

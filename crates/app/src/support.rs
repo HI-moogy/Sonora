@@ -1,10 +1,11 @@
 //! Helping testers report problems: crash reports written to the settings
-//! folder, a summary of the system to paste into a bug report, and the
-//! About window that offers both.
+//! folder, a summary of the system and voice setup to paste into a bug
+//! report, and the About window that offers both.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use audio_engine::{list_input_devices, list_output_devices, AudioDevice, Mixer};
 use eframe::egui;
 
 use crate::theme;
@@ -63,6 +64,108 @@ pub fn install_crash_reports() {
 /// Sonora's version and the system it runs on, for a bug report.
 pub fn system_summary() -> String {
     format!("Sonora {} on {}", env!("CARGO_PKG_VERSION"), os_name())
+}
+
+/// What "Copy details" gives: [`system_summary`], and how your voice gets to
+/// other apps, where most setup trouble is (a doubled, underwater-sounding
+/// voice is two copies of it reaching the virtual cable).
+fn details(mixer: &Mixer) -> String {
+    let mut lines = vec![system_summary()];
+    lines.extend(voice_details(mixer));
+    lines.join("
+")
+}
+
+fn voice_details(mixer: &Mixer) -> Vec<String> {
+    let inputs = list_input_devices().unwrap_or_default();
+    let outputs = list_output_devices().unwrap_or_default();
+    let sources = mixer.source_settings();
+    let Some(mic) = sources.iter().find(|s| s.pid.is_none()) else {
+        return vec!["Microphone: not added".into()];
+    };
+    let mic_name = match &mic.input_device {
+        Some(id) => device_name(&inputs, id),
+        None => "system default".into(),
+    };
+    let mut lines = vec![format!("Microphone: {mic_name}{}", if mic.muted { ", muted" } else { "" })];
+
+    let buses = mixer.bus_settings();
+    let Some(bus) = buses.iter().find(|b| b.name == mic.bus) else { return lines };
+    let send_device = bus.device_id.as_ref().filter(|_| bus.heard);
+    let sends_to = match (bus.heard, send_device) {
+        (false, _) => "nowhere".into(),
+        (true, None) => "the default output".into(),
+        (true, Some(id)) => device_name(&outputs, id),
+    };
+    let cleanup = mixer.mic_cleanup();
+    let eq = if bus.eq_gains_db.iter().all(|&g| g == 0.0) {
+        "flat".into()
+    } else {
+        format!("{:?} dB", bus.eq_gains_db)
+    };
+    lines.push(format!(
+        "{} channel: sends to {sends_to}; Listen to my mic {}; noise removal {:?}{}; EQ {eq}{}",
+        bus.name,
+        if bus.monitor { "on" } else { "off" },
+        cleanup.mode(),
+        if cleanup.quiet_far_voices() { " + quiet far voices" } else { "" },
+        if bus.muted { "; muted" } else { "" },
+    ));
+    if let Some(id) = send_device {
+        let also: Vec<&str> = buses
+            .iter()
+            .filter(|b| b.name != bus.name && b.heard && b.device_id.as_ref() == Some(id))
+            .map(|b| b.name.as_str())
+            .collect();
+        if !also.is_empty() {
+            lines.push(format!("Also playing there: {}", also.join(", ")));
+        }
+    }
+    #[cfg(windows)]
+    lines.extend(windows_voice_details(mic.input_device.as_deref(), send_device, &inputs, &outputs));
+    lines
+}
+
+/// What Windows adds: how it records the mic, its default output, and any
+/// microphone it plays straight to an output ("Listen to this device").
+#[cfg(windows)]
+fn windows_voice_details(
+    mic: Option<&str>,
+    send_device: Option<&String>,
+    inputs: &[AudioDevice],
+    outputs: &[AudioDevice],
+) -> Vec<String> {
+    use audio_engine::devices::{default_input_device_id, default_output_device_id, input_format, listened_inputs};
+    let mut lines = Vec::new();
+    let mut recorded = String::new();
+    if mic.is_none() {
+        if let Ok(id) = default_input_device_id() {
+            recorded = format!("{}, ", device_name(inputs, &id));
+        }
+    }
+    match input_format(mic) {
+        Ok((channels, rate)) => lines.push(format!("Windows records the mic ({recorded}{channels} ch, {rate} Hz)")),
+        Err(error) => lines.push(format!("Windows records the mic ({recorded}format unknown: {})", error.message())),
+    }
+    if let Ok(id) = default_output_device_id() {
+        let same = if send_device == Some(&id) { ", the same device the voice is sent to" } else { "" };
+        lines.push(format!("Windows default output: {}{same}", device_name(outputs, &id)));
+    }
+    match listened_inputs() {
+        Ok(listened) if listened.is_empty() => lines.push("Windows \"Listen to this device\": off for every mic".into()),
+        Ok(listened) => {
+            for input in listened {
+                let plays_on = input.plays_on.map_or("the default output".into(), |id| device_name(outputs, &id));
+                lines.push(format!("Windows \"Listen to this device\": {} plays on {plays_on}", input.name));
+            }
+        }
+        Err(_) => lines.push("Windows \"Listen to this device\": couldn't check".into()),
+    }
+    lines
+}
+
+fn device_name(devices: &[AudioDevice], id: &str) -> String {
+    devices.iter().find(|d| d.id == id).map_or_else(|| "a disconnected device".into(), |d| d.name.clone())
 }
 
 #[cfg(windows)]
@@ -137,7 +240,7 @@ impl AboutWindow {
         self.copied = false;
     }
 
-    pub fn show(&mut self, ctx: &egui::Context) {
+    pub fn show(&mut self, ctx: &egui::Context, mixer: &Mixer) {
         if !self.open {
             return;
         }
@@ -161,12 +264,12 @@ impl AboutWindow {
                     "Tell whoever gave you Sonora what you did, what happened and what you expected. Paste the details below into your message, and attach the newest crash report if Sonora crashed."
                 });
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("Copy details").on_hover_text("Sonora's version and your system").clicked() {
-                        ui.ctx().copy_text(system_summary());
+                    if ui.button("Copy details").on_hover_text("Sonora's version, your system, and how your voice is sent").clicked() {
+                        ui.ctx().copy_text(details(mixer));
                         self.copied = true;
                     }
                     if REPOSITORY_IS_PUBLIC && !REPOSITORY.is_empty() && ui.button("Report on GitHub").clicked() {
-                        ui.ctx().copy_text(system_summary());
+                        ui.ctx().copy_text(details(mixer));
                         self.copied = true;
                         open_url(&format!("{REPOSITORY}/issues/new/choose"));
                     }

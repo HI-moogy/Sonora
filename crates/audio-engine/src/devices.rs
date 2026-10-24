@@ -1,11 +1,12 @@
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::{
-    eCapture, eConsole, eRender, EDataFlow, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator,
+    eCapture, eConsole, eRender, EDataFlow, IAudioClient, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator,
     MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
+use windows::Win32::System::Variant::VT_BOOL;
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
 #[derive(Debug, Clone)]
@@ -23,6 +24,13 @@ const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {
     fmtid: windows::core::GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0),
     pid: 14,
 };
+
+// A microphone's "Listen to this device" checkbox (Sound Control Panel,
+// Recording, Properties, Listen) and its "Playback through this device"
+// choice; undocumented, but where Windows keeps them on the device.
+const LISTEN_FMTID: windows::core::GUID = windows::core::GUID::from_u128(0x24dbb0fc_9311_4b3d_9cf0_18ff155639d4);
+const PKEY_LISTEN_ENABLED: PROPERTYKEY = PROPERTYKEY { fmtid: LISTEN_FMTID, pid: 1 };
+const PKEY_LISTEN_PLAYBACK_DEVICE: PROPERTYKEY = PROPERTYKEY { fmtid: LISTEN_FMTID, pid: 0 };
 
 /// Lists every currently active audio render (output/playback) device.
 pub fn list_output_devices() -> windows::core::Result<Vec<AudioDevice>> {
@@ -86,6 +94,64 @@ pub(crate) fn endpoint(device_id: Option<&str>, flow: EDataFlow) -> windows::cor
             }
             None => enumerator.GetDefaultAudioEndpoint(flow, eConsole),
         }
+    }
+}
+
+/// The id of Windows' default output device (where "System default" plays).
+pub fn default_output_device_id() -> windows::core::Result<String> {
+    endpoint_id(&endpoint(None, eRender)?)
+}
+
+/// The id of Windows' default microphone.
+pub fn default_input_device_id() -> windows::core::Result<String> {
+    endpoint_id(&endpoint(None, eCapture)?)
+}
+
+/// How Windows records microphone `device_id` (`None`: the default one):
+/// its channels and sample rate. Sonora asks for mono at 48 kHz, so Windows
+/// converts anything else.
+pub fn input_format(device_id: Option<&str>) -> windows::core::Result<(u16, u32)> {
+    unsafe {
+        let client: IAudioClient = endpoint(device_id, eCapture)?.Activate(CLSCTX_ALL, None)?;
+        let format = client.GetMixFormat()?;
+        let channels_and_rate = ((*format).nChannels, (*format).nSamplesPerSec);
+        CoTaskMemFree(Some(format as *const _));
+        Ok(channels_and_rate)
+    }
+}
+
+/// A microphone with Windows' "Listen to this device" on: Windows plays it
+/// straight to an output, alongside anything Sonora does with it.
+pub struct ListenedInput {
+    pub name: String,
+    /// The output it plays on; `None` is the default output.
+    pub plays_on: Option<String>,
+}
+
+/// Every active microphone with "Listen to this device" on. Played into the
+/// virtual cable, it's a second, unprocessed copy of your voice there.
+pub fn listened_inputs() -> windows::core::Result<Vec<ListenedInput>> {
+    unsafe {
+        let collection = enumerator()?.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)?;
+        let mut listened = Vec::new();
+        for i in 0..collection.GetCount()? {
+            let device = collection.Item(i)?;
+            let Ok(store) = device.OpenPropertyStore(STGM_READ) else { continue };
+            let on = store.GetValue(&PKEY_LISTEN_ENABLED as *const _).is_ok_and(|value| {
+                value.Anonymous.Anonymous.vt == VT_BOOL && value.Anonymous.Anonymous.Anonymous.boolVal.0 != 0
+            });
+            if !on {
+                continue;
+            }
+            let plays_on = store
+                .GetValue(&PKEY_LISTEN_PLAYBACK_DEVICE as *const _)
+                .map(|value| propvariant_to_string(&value))
+                .ok()
+                .filter(|id| !id.is_empty());
+            let name = friendly_name(&device).unwrap_or_else(|| endpoint_id(&device).unwrap_or_default());
+            listened.push(ListenedInput { name, plays_on });
+        }
+        Ok(listened)
     }
 }
 
