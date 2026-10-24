@@ -105,8 +105,15 @@ guide** shows it again.
 
 **Clips (Windows)**
 
-- The first time, the Clips tab asks what to record: the **whole screen**,
-  or **only games and apps you choose** (found automatically).
+- The first time, the Clips tab asks what to record: the **whole screen
+  while a game is open**, **just the game's window**, or the **whole screen
+  all the time**. The last one keeps your graphics card's video encoder busy
+  nonstop (Task Manager can show Sonora at half the GPU), so the first two
+  are lighter: nothing is recorded while no game is open.
+- Games are found on their own: Steam and Epic games, other launchers'
+  games, and the ones Windows knows. The ⚙ clip settings list them with a
+  search box; **Remove** leaves one out (**Put back** undoes it), and
+  **Browse…** or an open app's **Add** makes any program count.
 - Press **Alt+F10** (changeable in the ⚙ clip settings) to save the last 30
   seconds (also changeable). A sound plays when it's saved.
 - Clips in subfolders show too; sort them by date or game, or show one game.
@@ -142,7 +149,8 @@ recording) keeps going. Click the icon to open it again; right-click it for
   fight over the same apps.
 - Routed apps play about 60 to 90 ms later than they would directly (half
   of that is Windows' own capture). Use High priority for games and voice.
-- "Only games" recording hasn't been tried with many games yet.
+- Recording only while a game is open hasn't been tried with many games
+  yet.
 - Linux has only been tested on PulseAudio so far; PipeWire reports are
   very welcome.
 

@@ -22,6 +22,8 @@ mod eq_presets;
 #[cfg(windows)]
 mod file_dialogs;
 #[cfg(windows)]
+mod game_library;
+#[cfg(windows)]
 mod games;
 mod guide;
 #[cfg(windows)]

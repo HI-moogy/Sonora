@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -11,9 +13,10 @@ use eframe::egui;
 
 use crate::clips::editor::{ClipEditor, EditorAction, Neighbours};
 use crate::clips::{self, ClipEntry, ClipList, Thumbnails};
+use crate::game_library::{self, Library};
 use crate::games::{self, AppWindow, GameFinder};
 use crate::hotkey::{self, GlobalHotkey};
-use crate::{sounds, theme, FIXED_BUSES};
+use crate::{app_label, capitalized, file_dialogs, sounds, theme, FIXED_BUSES};
 
 /// How often the clips folder (and its subfolders) is looked through again.
 const CLIP_SCAN_INTERVAL: Duration = Duration::from_secs(10);
@@ -21,6 +24,56 @@ const CLIP_SCAN_INTERVAL: Duration = Duration::from_secs(10);
 const GAME_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// On-screen size of a clip's thumbnail in the Clips tab.
 const CARD_THUMBNAIL: egui::Vec2 = egui::vec2(256.0, 144.0);
+
+/// What clips can record, as the settings list them: the mode, its name,
+/// and what it means.
+const RECORD_MODES: [(RecordMode, &str, &str); 3] = [
+    (
+        RecordMode::ScreenWhilePlaying,
+        "Whole screen, while a game is open",
+        "The monitor the game is on, with anything else on it. Nothing is recorded while no game is open.",
+    ),
+    (
+        RecordMode::Games,
+        "Just the game's window",
+        "Only the game, even when something covers it. Nothing is recorded while no game is open.",
+    ),
+    (RecordMode::Screen, "Whole screen, all the time", "Your main monitor, game or not."),
+];
+
+/// Shown with "Whole screen, all the time". Measured on a Radeon RX 6700
+/// XT at 1080p 60 fps: its video encoder about 52% busy, nonstop.
+const SCREEN_WARNING: &str = "⚠ Heavy on your graphics card: its video encoder works nonstop, even on an idle \
+    desktop, and Task Manager can show Sonora using half the GPU. Games lose little, since the encoder is separate \
+    from what draws them, but it uses power. The other two choices record only while a game is open.";
+
+/// One row of the games list in clip settings.
+struct GameEntry {
+    name: String,
+    /// Where it comes from: "Steam", "Added by you"...
+    source: String,
+    /// Searched besides the name: the program or folder.
+    path: String,
+    left_out: bool,
+    open: bool,
+    recording: bool,
+    /// What its button does.
+    action: GameAction,
+}
+
+/// A change to which games and apps start a recording.
+#[derive(Clone)]
+enum GameAction {
+    /// Adds a choice (see [`games::covers`]) to `never_record`.
+    LeaveOut(String),
+    /// Takes out of `never_record` the game's choice, and any choice
+    /// covering its open programs (`paths`).
+    PutBack { choice: String, paths: Vec<String> },
+    /// Takes a choice out of `always_record`.
+    Remove(String),
+    /// Records a program (a lowercase full path), wherever it's installed.
+    Add(String),
+}
 
 /// Every audio track a clip has, in file order: one per bus, then desktop
 /// audio (the default track).
@@ -105,7 +158,16 @@ pub struct Moments {
     apps: Vec<AppWindow>,
     /// What the recorder was last told to capture.
     target: CaptureTarget,
+    /// The game's (or chosen app's) window that started the recording.
+    game_window: Option<isize>,
     last_game_check: Option<Instant>,
+    /// The installed games, for the games list and finding games.
+    library: Library,
+    library_scan: Option<Receiver<Library>>,
+    /// What's typed in the games list's search box.
+    game_search: String,
+    /// Why the last program picked to add wasn't added.
+    games_note: Option<String>,
 }
 
 impl Moments {
@@ -128,7 +190,12 @@ impl Moments {
             games: GameFinder::new(),
             apps: Vec::new(),
             target: CaptureTarget::Screen,
+            game_window: None,
             last_game_check: None,
+            library: Library::default(),
+            library_scan: Some(game_library::scan_in_background()),
+            game_search: String::new(),
+            games_note: None,
         };
         *moments.shared.dir.lock().unwrap() = moments.clips_dir();
         moments.restart_recorder(mixer);
@@ -173,6 +240,7 @@ impl Moments {
                 // A new recorder starts on the whole screen; switch now
                 // rather than recording the desktop until the next check.
                 self.target = CaptureTarget::Screen;
+                self.game_window = None;
                 self.last_game_check = None;
                 self.tick();
             }
@@ -184,36 +252,58 @@ impl Moments {
     /// game (or chosen app) in front. Runs every frame, also while the
     /// window is hidden in the tray, and checks about once a second.
     pub fn tick(&mut self) {
+        if let Some(library) = self.library_scan.as_ref().and_then(|scan| scan.try_recv().ok()) {
+            self.games.set_library(&library);
+            self.library = library;
+            self.library_scan = None;
+            self.last_game_check = None;
+        }
         if self.last_game_check.is_some_and(|at| at.elapsed() < GAME_CHECK_INTERVAL) {
             return;
         }
         self.last_game_check = Some(Instant::now());
-        let target = match self.config.record {
-            Some(RecordMode::Games) => {
-                self.apps = self.games.app_windows();
-                let current = match self.target {
-                    CaptureTarget::Window(window) => Some(window),
-                    _ => None,
-                };
-                games::pick_window(&self.apps, &self.config.always_record, &self.config.never_record, current)
-                    .map_or(CaptureTarget::Nothing, |app| CaptureTarget::Window(app.window))
-            }
-            Some(RecordMode::Screen) | None => CaptureTarget::Screen,
+        let mode = self.record_mode();
+        let game = if mode == RecordMode::Screen {
+            None
+        } else {
+            self.apps = self.games.app_windows();
+            games::pick_window(&self.apps, &self.config.always_record, &self.config.never_record, self.game_window)
+                .map(|app| app.window)
+        };
+        let target = match (mode, game) {
+            (RecordMode::Screen, _) => CaptureTarget::Screen,
+            (_, None) => CaptureTarget::Nothing,
+            (RecordMode::ScreenWhilePlaying, Some(window)) => CaptureTarget::Monitor(games::monitor_of(window)),
+            (RecordMode::Games, Some(window)) => CaptureTarget::Window(window),
         };
         if target != self.target {
             if let Some(recorder) = &self.recorder {
                 recorder.set_target(target);
             }
             self.target = target;
+        }
+        if game != self.game_window {
+            self.game_window = game;
             *self.shared.game.lock().unwrap() = self.recording_app().and_then(|app| folder_name(&app.title));
         }
     }
 
-    /// The app being recorded in games mode, if any.
+    fn record_mode(&self) -> RecordMode {
+        self.config.record.unwrap_or(RecordMode::UNTIL_PICKED)
+    }
+
+    /// The game (or chosen app) that started the recording, if any.
     fn recording_app(&self) -> Option<&AppWindow> {
-        match self.target {
-            CaptureTarget::Window(window) => self.apps.iter().find(|app| app.window == window),
-            _ => None,
+        let window = self.game_window?;
+        self.apps.iter().find(|app| app.window == window)
+    }
+
+    /// Opens clip settings, and looks for installed games again for its
+    /// games list (you may have installed one since).
+    fn open_settings(&mut self) {
+        self.show_settings = true;
+        if self.library_scan.is_none() {
+            self.library_scan = Some(game_library::scan_in_background());
         }
     }
 
@@ -257,12 +347,11 @@ impl Moments {
             return (format!("Stopped: {error}"), true);
         }
         let buffered = status.buffered().min(Duration::from_secs(self.config.buffer_secs as u64));
-        let what = match self.config.record {
-            Some(RecordMode::Games) => match self.recording_app() {
-                Some(app) => format!("Recording {} · ", app.title),
-                None => "No game open, nothing being recorded · ".to_string(),
-            },
-            _ => String::new(),
+        let what = match (self.record_mode(), self.recording_app()) {
+            (RecordMode::Screen, _) => String::new(),
+            (RecordMode::ScreenWhilePlaying, Some(app)) => format!("{} is open, recording its screen · ", app.title),
+            (RecordMode::Games, Some(app)) => format!("Recording {} · ", app.title),
+            (_, None) => "No game open, nothing being recorded · ".to_string(),
         };
         (
             format!(
@@ -360,15 +449,19 @@ impl Moments {
         theme::section(ui, "What to record");
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let mode = self.config.record.unwrap_or(RecordMode::Screen);
-            if ui.radio(mode == RecordMode::Screen, "Whole screen").clicked() {
-                self.set_record_mode(RecordMode::Screen);
+            let mode = self.record_mode();
+            for (choice, label, meaning) in RECORD_MODES {
+                if ui.radio(mode == choice, label).clicked() {
+                    self.set_record_mode(choice);
+                }
+                ui.indent(label, |ui| ui.label(egui::RichText::new(meaning).small().color(theme::text_muted())));
             }
-            if ui.radio(mode == RecordMode::Games, "Only games and apps I choose").clicked() {
-                self.set_record_mode(RecordMode::Games);
+            if mode == RecordMode::Screen {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(SCREEN_WARNING).color(theme::warning()));
             }
         });
-        if self.config.record == Some(RecordMode::Games) {
+        if self.record_mode() != RecordMode::Screen {
             theme::section(ui, "Games and apps");
             theme::card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -504,101 +597,199 @@ impl Moments {
         });
     }
 
-    /// Which games and apps get recorded: what's open now, and the apps
-    /// you added or left out.
+    /// The games and apps that start a recording: the installed games
+    /// Sonora found, the apps you added, and games found while open. Any
+    /// can be left out (and put back), and any program added.
     fn games_ui(&mut self, ui: &mut egui::Ui) {
         ui.weak(
-            "Games are found automatically. Only the game's own window is recorded (not the rest of the screen), \
-             and nothing while no game is open. The one in front is recorded.",
+            "Games from Steam, Epic and other launchers, and the ones Windows knows, are found on their own. \
+             If several are open, the one in front is recorded.",
         );
-        let mut changed = false;
-        ui.label("Open now");
-        let mut seen = std::collections::HashSet::new();
-        let apps: Vec<AppWindow> = self.apps.iter().filter(|app| seen.insert(app.exe.clone())).cloned().collect();
-        for app in &apps {
-            let recording = self.recording_app().is_some_and(|r| r.exe == app.exe);
-            let always = self.config.always_record.contains(&app.exe);
-            let never = self.config.never_record.contains(&app.exe);
-            let note = match (app.is_game, never, always, recording) {
-                (_, _, _, true) => "recording now",
-                (true, true, _, _) => "game, left out",
-                (true, false, _, _) => "game",
-                (false, _, true, _) => "added",
-                (false, _, false, _) => "",
-            };
-            ui.horizontal(|ui| {
-                let (text, action) = match (app.is_game, never, always) {
-                    (true, true, _) => ("Record it", 0),
-                    (true, false, _) => ("Don't record", 1),
-                    (false, _, true) => ("Stop recording", 2),
-                    (false, _, false) => ("Record it", 3),
-                };
-                // The button keeps its place on the right; the name (a
-                // window title, possibly a browser tab's long one) gets the
-                // rest and is cut short if needed.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button(text).clicked() {
-                        match action {
-                            0 => self.config.never_record.retain(|exe| exe != &app.exe),
-                            1 => self.config.never_record.push(app.exe.clone()),
-                            2 => self.config.always_record.retain(|exe| exe != &app.exe),
-                            _ => self.config.always_record.push(app.exe.clone()),
-                        }
-                        changed = true;
+        ui.add(
+            egui::TextEdit::singleline(&mut self.game_search)
+                .hint_text("🔍 Search games and apps")
+                .desired_width(f32::INFINITY),
+        );
+        let search = self.game_search.trim().to_lowercase();
+        let matches = |name: &str, path: &str| {
+            search.is_empty() || name.to_lowercase().contains(&search) || path.contains(&search)
+        };
+        let entries: Vec<GameEntry> =
+            self.game_entries().into_iter().filter(|entry| matches(&entry.name, &entry.path)).collect();
+        let (counted, left_out): (Vec<&GameEntry>, Vec<&GameEntry>) = entries.iter().partition(|entry| !entry.left_out);
+        let mut action = None;
+
+        egui::ScrollArea::vertical().id_salt("games-list").max_height(260.0).auto_shrink([false, true]).show(ui, |ui| {
+            if counted.is_empty() {
+                ui.weak(match (search.is_empty(), self.library_scan.is_some()) {
+                    (false, _) => "Nothing matches.",
+                    (true, true) => "Looking for installed games…",
+                    (true, false) => "No games found. Add one below.",
+                });
+            }
+            for entry in &counted {
+                action = game_row(ui, entry, "Remove").or(action.take());
+            }
+        });
+        if !left_out.is_empty() {
+            egui::CollapsingHeader::new(format!("Left out ({})", left_out.len())).id_salt("games-left-out").show(
+                ui,
+                |ui| {
+                    for entry in &left_out {
+                        action = game_row(ui, entry, "Put back").or(action.take());
                     }
-                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                        ui.add(egui::Label::new(&app.title).truncate()).on_hover_text(&app.exe);
-                        if !note.is_empty() {
-                            let color = if recording { theme::accent() } else { theme::text_muted() };
-                            ui.label(egui::RichText::new(note).small().color(color));
+                },
+            );
+        }
+
+        ui.add_space(8.0);
+        ui.strong("Add a game or app");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Browse…").on_hover_text("Pick the program (.exe)").clicked() {
+                if let Some(path) = file_dialogs::pick_program() {
+                    action = Some(GameAction::Add(path.to_string_lossy().to_lowercase()));
+                }
+            }
+            ui.weak("or one that's open:");
+        });
+        let mut seen = HashSet::new();
+        for app in &self.apps {
+            let counted = app.is_game || self.config.always_record.iter().any(|choice| games::covers(choice, &app.path));
+            if counted || !seen.insert(app.exe.as_str()) || !matches(&app.title, &app.path) {
+                continue;
+            }
+            ui.push_id(&app.path, |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Add").clicked() {
+                            action = Some(GameAction::Add(app.path.clone()));
                         }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(egui::Label::new(&app.title).truncate()).on_hover_text(&app.path);
+                        });
                     });
                 });
             });
-            ui.separator();
         }
-        // Choices for apps that aren't open right now.
-        let open: Vec<&str> = apps.iter().map(|app| app.exe.as_str()).collect();
-        for (list, verb) in [(&mut self.config.always_record, "Recorded"), (&mut self.config.never_record, "Left out")] {
-            let closed: Vec<String> = list.iter().filter(|exe| !open.contains(&exe.as_str())).cloned().collect();
-            if closed.is_empty() {
-                continue;
-            }
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("{verb} when open:"));
-                for exe in closed {
-                    if ui.small_button(format!("{exe} ✕")).on_hover_text("Forget this choice").clicked() {
-                        list.retain(|e| e != &exe);
-                        changed = true;
-                    }
-                }
+        if let Some(note) = &self.games_note {
+            ui.label(egui::RichText::new(note).small().color(theme::text_muted()));
+        }
+        if let Some(action) = action {
+            self.apply_game_action(action);
+        }
+    }
+
+    /// The games list's rows: open ones first, then by name.
+    fn game_entries(&self) -> Vec<GameEntry> {
+        let (always, never) = (&self.config.always_record, &self.config.never_record);
+        let recording = self.recording_app().map(|app| app.path.as_str());
+        let open_paths = |choice: &str| -> Vec<String> {
+            self.apps.iter().filter(|app| games::covers(choice, &app.path)).map(|app| app.path.clone()).collect()
+        };
+        let mut entries = Vec::new();
+        for game in &self.library.games {
+            let choice = game.choice();
+            let paths = open_paths(&game.path);
+            let left_out = never.iter().any(|c| *c == choice || paths.iter().any(|path| games::covers(c, path)));
+            entries.push(GameEntry {
+                name: game.name.clone(),
+                source: game.source.to_string(),
+                path: game.path.clone(),
+                left_out,
+                open: !paths.is_empty(),
+                recording: recording.is_some_and(|path| games::covers(&game.path, path)),
+                action: if left_out { GameAction::PutBack { choice, paths } } else { GameAction::LeaveOut(choice) },
             });
         }
-        if changed {
-            self.persist();
-            self.last_game_check = None;
-            self.tick();
+        for choice in always {
+            let open = self.apps.iter().find(|app| games::covers(choice, &app.path));
+            let name = match open {
+                Some(app) => app.title.clone(),
+                None => capitalized(app_label(choice.trim_end_matches('\\').rsplit('\\').next().unwrap_or(choice))),
+            };
+            entries.push(GameEntry {
+                name,
+                source: "Added by you".into(),
+                path: choice.clone(),
+                left_out: false,
+                open: open.is_some(),
+                recording: recording.is_some_and(|path| games::covers(choice, path)),
+                action: GameAction::Remove(choice.clone()),
+            });
         }
+        // Games open now that no scan listed: found by their folder, or on
+        // Windows' list after the last scan.
+        let mut seen = HashSet::new();
+        for app in &self.apps {
+            let listed = self.library.games.iter().any(|game| games::covers(&game.path, &app.path))
+                || always.iter().any(|choice| games::covers(choice, &app.path));
+            if !app.is_game || listed || !seen.insert(app.exe.as_str()) {
+                continue;
+            }
+            let left_out = never.iter().any(|choice| games::covers(choice, &app.path));
+            entries.push(GameEntry {
+                name: app.title.clone(),
+                source: "Found while open".into(),
+                path: app.path.clone(),
+                left_out,
+                open: true,
+                recording: recording == Some(app.path.as_str()),
+                action: if left_out {
+                    GameAction::PutBack { choice: app.exe.clone(), paths: vec![app.path.clone()] }
+                } else {
+                    GameAction::LeaveOut(app.exe.clone())
+                },
+            });
+        }
+        entries.sort_by_cached_key(|entry| (!entry.recording, !entry.open, entry.name.to_lowercase()));
+        entries
+    }
+
+    fn apply_game_action(&mut self, action: GameAction) {
+        self.games_note = None;
+        let (always, never) = (&mut self.config.always_record, &mut self.config.never_record);
+        match action {
+            GameAction::LeaveOut(choice) => never.push(choice),
+            GameAction::PutBack { choice, paths } => {
+                never.retain(|c| *c != choice && !paths.iter().any(|path| games::covers(c, path)));
+            }
+            GameAction::Remove(choice) => always.retain(|c| *c != choice),
+            GameAction::Add(path) => {
+                let name = capitalized(app_label(games::exe_name(&path)));
+                if never.iter().any(|choice| games::covers(choice, &path)) {
+                    // A game you left out: put it back.
+                    never.retain(|choice| !games::covers(choice, &path));
+                } else if always.iter().any(|choice| games::covers(choice, &path)) {
+                    self.games_note = Some(format!("{name} is already in the list."));
+                } else if self.games.is_game(&path) {
+                    self.games_note = Some(format!("{name} is a game Sonora already finds."));
+                } else {
+                    always.push(games::exe_name(&path).to_string());
+                }
+            }
+        }
+        self.persist();
+        self.last_game_check = None;
+        self.tick();
     }
 
     /// Asks once what clips should record.
     fn record_mode_question(&mut self, ui: &mut egui::Ui) {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.strong("What should clips record?");
-            ui.label(
-                "The whole screen catches everything, including other apps and notifications. \
-                 Games only records just the game's window, automatically whenever a game is open.",
-            );
-            ui.horizontal(|ui| {
-                if ui.button("Whole screen").clicked() {
-                    self.set_record_mode(RecordMode::Screen);
-                }
-                if ui.button("Only games and apps I choose").clicked() {
-                    self.set_record_mode(RecordMode::Games);
-                    self.show_settings = true;
-                }
-            });
-            ui.weak("You can change this later in ⚙ settings.");
+            for (choice, label, meaning) in RECORD_MODES {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(label).clicked() {
+                        self.set_record_mode(choice);
+                        if choice != RecordMode::Screen {
+                            self.open_settings();
+                        }
+                    }
+                    ui.weak(meaning);
+                });
+            }
+            ui.label(egui::RichText::new(SCREEN_WARNING).small().color(theme::warning()));
+            ui.weak("Until you pick, clips record the whole screen while a game is open. You can change this later in ⚙ settings.");
         });
     }
 
@@ -630,7 +821,11 @@ impl Moments {
                     .add(egui::Button::new(egui::RichText::new("⚙").size(18.0)).selected(self.show_settings))
                     .on_hover_text("Clip settings");
                 if gear.clicked() {
-                    self.show_settings = !self.show_settings;
+                    if self.show_settings {
+                        self.show_settings = false;
+                    } else {
+                        self.open_settings();
+                    }
                 }
                 crate::guide::target(ui.ctx(), "clip-settings", gear.rect);
                 if ui.add_enabled(self.recorder.is_some(), egui::Button::new("Save clip")).clicked() {
@@ -644,11 +839,12 @@ impl Moments {
         let (status, is_error) = self.status();
         if is_error {
             ui.colored_label(theme::danger(), status);
-        } else if self.config.record == Some(RecordMode::Games) && self.recorder.is_some() {
+        } else if self.record_mode() != RecordMode::Screen && self.recorder.is_some() {
             ui.weak(match self.recording_app() {
                 Some(app) => format!(
-                    "Recording {} · press {} anywhere to save the last {}",
+                    "Recording {}{} · press {} anywhere to save the last {}",
                     app.title,
+                    if self.record_mode() == RecordMode::ScreenWhilePlaying { "'s screen" } else { "" },
                     hotkey::label(self.config.hotkey),
                     clips::format_duration(Duration::from_secs(self.config.buffer_secs as u64)),
                 ),
@@ -849,6 +1045,35 @@ fn clip_card(ui: &mut egui::Ui, clip: &ClipEntry, thumbnails: &mut Thumbnails, g
         clips::show_in_folder(&clip.path);
     }
     opened
+}
+
+/// One row of the games list: the name, where it's from and whether it's
+/// open, and a button (`button`) that does the row's action.
+fn game_row(ui: &mut egui::Ui, entry: &GameEntry, button: &str) -> Option<GameAction> {
+    let mut clicked = false;
+    // Rows move as games open and close, and egui matches a click to the
+    // previous frame's layout: ids that follow the game, not the row, keep
+    // a click on the game you aimed at.
+    ui.push_id((&entry.source, &entry.path), |ui| {
+        ui.horizontal(|ui| {
+            // The button keeps its place on the right; the name gets the
+            // rest and is cut short if needed.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                clicked = ui.small_button(button).clicked();
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.add(egui::Label::new(&entry.name).truncate()).on_hover_text(&entry.path);
+                    let (note, color) = match (entry.recording, entry.open) {
+                        (true, _) => (format!("{} · recording now", entry.source), theme::accent()),
+                        (false, true) => (format!("{} · open", entry.source), theme::text_muted()),
+                        (false, false) => (entry.source.clone(), theme::text_muted()),
+                    };
+                    ui.label(egui::RichText::new(note).small().color(color));
+                });
+            });
+        });
+    });
+    ui.separator();
+    clicked.then(|| entry.action.clone())
 }
 
 /// A folder name for a game's clips from its window title: characters

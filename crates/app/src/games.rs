@@ -1,17 +1,19 @@
-//! Finding which window to record when clips record "games and apps you
-//! choose": games are detected automatically, and you can add apps or
-//! leave out a detected game.
+//! Finding which window to record when clips record only while a game is
+//! open: games are detected automatically, and you can add apps or leave
+//! out a detected game.
 //!
 //! A program counts as a game if Windows itself recognizes it (the list
 //! Game Bar keeps under `HKCU\System\GameConfigStore`) or it's installed in
 //! a game launcher's library folder (Steam, Epic, Riot, EA, Ubisoft, GOG,
-//! Xbox).
+//! Xbox), unless the [`crate::game_library`] scan found it's a launcher app
+//! that isn't a game (Wallpaper Engine, say).
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use windows::core::{BOOL, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
+use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_READ, RRF_RT_REG_SZ,
 };
@@ -22,6 +24,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClientRect, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowTextW,
     GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WS_EX_TOOLWINDOW,
 };
+
+use crate::game_library::Library;
 
 /// Install folders of game launchers' libraries (lowercase path parts).
 const LAUNCHER_FOLDERS: &[&str] = &[
@@ -50,33 +54,76 @@ pub struct AppWindow {
     pub window: isize,
     /// Lowercase executable name, e.g. "deadlock.exe".
     pub exe: String,
+    /// Lowercase full path of the executable.
+    pub path: String,
     pub title: String,
     pub is_game: bool,
+}
+
+/// The file name in a lowercase full path ("deadlock.exe").
+pub fn exe_name(path: &str) -> &str {
+    path.rsplit('\\').next().unwrap_or(path)
+}
+
+/// Whether `choice` (an entry of `always_record` or `never_record`) covers
+/// the program at `path` (lowercase full path). A choice with a backslash
+/// is a folder ending in `\` (every program in it) or one program's path;
+/// otherwise it's a program's file name, wherever the program is.
+pub fn covers(choice: &str, path: &str) -> bool {
+    if choice.contains('\\') {
+        path.starts_with(choice)
+    } else {
+        exe_name(path) == choice
+    }
+}
+
+/// The monitor (a raw `HMONITOR`) showing most of `window`.
+pub fn monitor_of(window: isize) -> isize {
+    unsafe { MonitorFromWindow(HWND(window as _), MONITOR_DEFAULTTONEAREST) }.0 as isize
 }
 
 pub struct GameFinder {
     /// Full paths (lowercase) of programs Windows recognizes as games.
     known: HashSet<String>,
     loaded_at: Instant,
+    /// Install folders (lowercase, ending in `\`) of games found by the
+    /// last library scan, wherever their launcher put them.
+    game_folders: Vec<String>,
+    /// Install folders of launcher apps that aren't games.
+    tool_folders: Vec<String>,
 }
 
 impl GameFinder {
     pub fn new() -> Self {
-        Self { known: windows_known_games(), loaded_at: Instant::now() }
+        Self {
+            known: known_games_lowercase(),
+            loaded_at: Instant::now(),
+            game_folders: Vec::new(),
+            tool_folders: Vec::new(),
+        }
     }
 
-    fn is_game(&self, path: &str) -> bool {
-        let exe = path.rsplit('\\').next().unwrap_or(path);
-        if NOT_GAMES.iter().any(|part| exe.contains(part)) {
+    /// Uses what a library scan found, besides the launcher folders above.
+    pub fn set_library(&mut self, library: &Library) {
+        self.game_folders = library.games.iter().filter(|game| game.path.ends_with('\\')).map(|game| game.path.clone()).collect();
+        self.tool_folders = library.tools.clone();
+    }
+
+    /// Whether the program at `path` (lowercase full path) is a game.
+    pub fn is_game(&self, path: &str) -> bool {
+        let exe = exe_name(path);
+        if NOT_GAMES.iter().any(|part| exe.contains(part)) || self.tool_folders.iter().any(|folder| path.starts_with(folder)) {
             return false;
         }
-        self.known.contains(path) || LAUNCHER_FOLDERS.iter().any(|folder| path.contains(folder))
+        self.known.contains(path)
+            || LAUNCHER_FOLDERS.iter().any(|folder| path.contains(folder))
+            || self.game_folders.iter().any(|folder| path.starts_with(folder))
     }
 
     /// Every app with a window big enough to record, one per window.
     pub fn app_windows(&mut self) -> Vec<AppWindow> {
         if self.loaded_at.elapsed() >= KNOWN_GAMES_REFRESH {
-            self.known = windows_known_games();
+            self.known = known_games_lowercase();
             self.loaded_at = Instant::now();
         }
         let mut found: Vec<(isize, String, String)> = Vec::new();
@@ -87,8 +134,8 @@ impl GameFinder {
             .into_iter()
             .map(|(window, path, title)| {
                 let is_game = self.is_game(&path);
-                let exe = path.rsplit('\\').next().unwrap_or(&path).to_string();
-                AppWindow { window, exe, title, is_game }
+                let exe = exe_name(&path).to_string();
+                AppWindow { window, exe, path, title, is_game }
             })
             .collect()
     }
@@ -104,7 +151,8 @@ pub fn pick_window<'a>(
     current: Option<isize>,
 ) -> Option<&'a AppWindow> {
     let wanted = |app: &&AppWindow| {
-        always.contains(&app.exe) || (app.is_game && !never.contains(&app.exe))
+        let chosen = |list: &[String]| list.iter().any(|choice| covers(choice, &app.path));
+        chosen(always) || (app.is_game && !chosen(never))
     };
     let foreground = unsafe { GetForegroundWindow() }.0 as isize;
     let candidates: Vec<&AppWindow> = apps.iter().filter(wanted).collect();
@@ -158,10 +206,15 @@ fn process_path(pid: u32) -> Option<String> {
     }
 }
 
-/// The games Windows recognizes: each subkey of GameConfigStore\Children
-/// names the full path of a game's executable in `MatchedExeFullPath`.
-fn windows_known_games() -> HashSet<String> {
-    let mut games = HashSet::new();
+fn known_games_lowercase() -> HashSet<String> {
+    windows_known_games().into_iter().map(|path| path.to_lowercase()).collect()
+}
+
+/// The games Windows recognizes, as full paths: each subkey of
+/// GameConfigStore\Children names a game's executable in
+/// `MatchedExeFullPath`.
+pub fn windows_known_games() -> Vec<String> {
+    let mut games = Vec::new();
     unsafe {
         let mut children = HKEY::default();
         if RegOpenKeyExW(
@@ -196,7 +249,7 @@ fn windows_known_games() -> HashSet<String> {
             );
             if read.is_ok() {
                 let len = (size as usize / 2).saturating_sub(1);
-                games.insert(String::from_utf16_lossy(&path[..len]).to_lowercase());
+                games.push(String::from_utf16_lossy(&path[..len]));
             }
         }
         let _ = RegCloseKey(children);
@@ -207,9 +260,15 @@ fn windows_known_games() -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game_library::Game;
 
     fn finder(known: &[&str]) -> GameFinder {
-        GameFinder { known: known.iter().map(|k| k.to_string()).collect(), loaded_at: Instant::now() }
+        GameFinder {
+            known: known.iter().map(|k| k.to_string()).collect(),
+            loaded_at: Instant::now(),
+            game_folders: Vec::new(),
+            tool_folders: Vec::new(),
+        }
     }
 
     #[test]
@@ -228,8 +287,31 @@ mod tests {
         assert!(!finder.is_game("c:\\riot games\\riot client\\riotclientservices_launcher.exe"));
     }
 
+    #[test]
+    fn the_library_adds_game_folders_and_takes_out_tools() {
+        let mut finder = finder(&[]);
+        let wallpaper = "c:\\steam\\steamapps\\common\\wallpaper_engine\\";
+        finder.set_library(&Library {
+            games: vec![Game { name: "Hades".into(), source: "Epic Games", path: "d:\\games\\hades\\".into() }],
+            tools: vec![wallpaper.into()],
+        });
+        assert!(finder.is_game("d:\\games\\hades\\hades.exe"));
+        assert!(!finder.is_game(&format!("{wallpaper}wallpaper64.exe")));
+        assert!(finder.is_game("c:\\steam\\steamapps\\common\\peak\\peak.exe"));
+    }
+
+    #[test]
+    fn choices_are_program_names_or_folders() {
+        let path = "d:\\steamlibrary\\steamapps\\common\\deadlock\\game\\bin\\win64\\deadlock.exe";
+        assert!(covers("deadlock.exe", path));
+        assert!(covers("d:\\steamlibrary\\steamapps\\common\\deadlock\\", path));
+        assert!(covers(path, path));
+        assert!(!covers("lock.exe", path));
+        assert!(!covers("d:\\steamlibrary\\steamapps\\common\\dead\\", path));
+    }
+
     fn app(window: isize, exe: &str, is_game: bool) -> AppWindow {
-        AppWindow { window, exe: exe.into(), title: exe.into(), is_game }
+        AppWindow { window, exe: exe.into(), path: format!("c:\\games\\{exe}"), title: exe.into(), is_game }
     }
 
     #[test]
@@ -239,6 +321,7 @@ mod tests {
         // the current target is kept while it's still a candidate.
         assert_eq!(pick_window(&apps, &[], &[], Some(3)).map(|a| a.window), Some(3));
         assert_eq!(pick_window(&apps, &[], &["cs2.exe".into()], Some(3)).map(|a| a.window), Some(2));
+        assert_eq!(pick_window(&apps, &[], &["c:\\games\\".into()], Some(3)).map(|a| a.window), None);
         assert_eq!(pick_window(&apps[..1], &[], &[], None).map(|a| a.window), None);
         assert_eq!(pick_window(&apps[..1], &["firefox.exe".into()], &[], None).map(|a| a.window), Some(1));
     }

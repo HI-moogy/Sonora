@@ -278,11 +278,13 @@ pub struct MomentsConfig {
     pub track_volumes: HashMap<String, f32>,
     pub hotkey: Hotkey,
     /// What clips record; `None` until you pick (the Clips tab asks),
-    /// recording the whole screen meanwhile.
+    /// recording like [`RecordMode::ScreenWhilePlaying`] meanwhile.
     pub record: Option<RecordMode>,
-    /// Apps (lowercase executable names) recorded like games.
+    /// Apps recorded like games. Each is lowercase: a program's file name
+    /// ("cider.exe"), or a path with a backslash (a folder ending in `\`
+    /// covers every program in it).
     pub always_record: Vec<String>,
-    /// Detected games (lowercase executable names) never recorded.
+    /// Detected games never recorded, written like `always_record`.
     pub never_record: Vec<String>,
     /// How the Clips tab orders clips.
     pub clip_sort: ClipSort,
@@ -303,9 +305,18 @@ pub enum ClipSort {
 pub enum RecordMode {
     /// The whole primary monitor, always.
     Screen,
+    /// The whole monitor a running game (or an app you chose) is on, and
+    /// nothing while none is open.
+    ScreenWhilePlaying,
     /// Only the window of a running game (or an app you chose), and
     /// nothing while none is open.
     Games,
+}
+
+impl RecordMode {
+    /// What clips record until you pick: only while a game is open, since
+    /// recording the screen nonstop keeps the GPU's video encoder busy.
+    pub const UNTIL_PICKED: Self = Self::ScreenWhilePlaying;
 }
 
 impl Default for MomentsConfig {

@@ -110,8 +110,8 @@ const STEPS: &[Step] = &[
     Step {
         on: On::Windows,
         title: "Clip settings",
-        body: "The gear has what to record (the whole screen, or only games), how many seconds to keep, \
-               the hotkey, and where clips are saved.",
+        body: "The gear has what to record (the screen or just the game, while a game is open), which games \
+               and apps count, how many seconds to keep, the hotkey, and where clips are saved.",
         target: Some("clip-settings"),
         view: View::Clips,
     },

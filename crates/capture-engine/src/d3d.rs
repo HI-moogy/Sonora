@@ -5,7 +5,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
 };
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput5};
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIDevice, IDXGIFactory1, IDXGIOutput5};
 use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
 
 use crate::StartError;
@@ -37,6 +37,20 @@ pub(crate) fn open_primary_output() -> std::result::Result<PrimaryOutput, StartE
         adapter_index += 1;
     }
     Err(StartError::NoPrimaryOutput)
+}
+
+/// The output showing `monitor` (a raw `HMONITOR`), if `device`'s graphics
+/// card drives it: duplication needs the two on one card.
+pub(crate) fn output_for_monitor(device: &ID3D11Device, monitor: isize) -> Option<IDXGIOutput5> {
+    let adapter = unsafe { device.cast::<IDXGIDevice>().ok()?.GetAdapter().ok()? };
+    let mut index = 0;
+    while let Ok(output) = unsafe { adapter.EnumOutputs(index) } {
+        if unsafe { output.GetDesc() }.is_ok_and(|desc| desc.Monitor.0 as isize == monitor) {
+            return output.cast().ok();
+        }
+        index += 1;
+    }
+    None
 }
 
 fn create_device(

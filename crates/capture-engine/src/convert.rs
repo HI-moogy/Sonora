@@ -12,10 +12,13 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
     D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+    D3D11_VIDEO_PROCESSOR_CAPS, D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ROTATION, D3D11_VIDEO_PROCESSOR_ROTATION,
+    D3D11_VIDEO_PROCESSOR_ROTATION_180, D3D11_VIDEO_PROCESSOR_ROTATION_270, D3D11_VIDEO_PROCESSOR_ROTATION_90,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
-    DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_NV12, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
+    DXGI_MODE_ROTATION_ROTATE90, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 
 /// Converts the desktop image (BGRA, desktop resolution) into NV12 at the
@@ -34,11 +37,14 @@ pub(crate) struct Converter {
 const POOL_SIZE: usize = 8;
 
 impl Converter {
+    /// `rotation` is how the input was turned from upright (a monitor on its
+    /// side); the output is turned back if the video processor can.
     pub(crate) fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
         input: &ID3D11Texture2D,
         (in_width, in_height): (u32, u32),
+        rotation: DXGI_MODE_ROTATION,
         (out_width, out_height): (u32, u32),
         fps: u32,
     ) -> Result<Self> {
@@ -59,6 +65,15 @@ impl Converter {
         let enumerator: ID3D11VideoProcessorEnumerator =
             unsafe { video_device.CreateVideoProcessorEnumerator(&content)? };
         let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0)? };
+        let mut caps = D3D11_VIDEO_PROCESSOR_CAPS::default();
+        unsafe { enumerator.GetVideoProcessorCaps(&mut caps)? };
+        let can_rotate = caps.FeatureCaps & D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ROTATION.0 as u32 != 0;
+        let turn = upright_turn(rotation).filter(|_| can_rotate);
+        // The image as it'll look: turned upright, or as it came.
+        let shown = match turn {
+            Some(D3D11_VIDEO_PROCESSOR_ROTATION_90 | D3D11_VIDEO_PROCESSOR_ROTATION_270) => (in_height, in_width),
+            _ => (in_width, in_height),
+        };
 
         let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
             FourCC: 0,
@@ -97,8 +112,11 @@ impl Converter {
                 &processor,
                 0,
                 true,
-                Some(&fit_rect((in_width, in_height), (out_width, out_height))),
+                Some(&fit_rect(shown, (out_width, out_height))),
             );
+            if let Some(turn) = turn {
+                video_context.VideoProcessorSetStreamRotation(&processor, 0, true, turn);
+            }
             // Black bars when the image's aspect ratio differs from 16:9
             // (a window, or a non-16:9 monitor). Given as RGB: the AMD
             // driver read a YCbCr black as RGB and drew teal bars.
@@ -135,6 +153,18 @@ impl Converter {
         unsafe { ManuallyDrop::drop(&mut stream.pInputSurface) };
         result?;
         Ok(texture.clone())
+    }
+}
+
+/// The turn that stands up an image a monitor's `rotation` turned: the
+/// same angle (seen on a monitor rotated 270 degrees: a 90 degree turn
+/// came out upside down).
+fn upright_turn(rotation: DXGI_MODE_ROTATION) -> Option<D3D11_VIDEO_PROCESSOR_ROTATION> {
+    match rotation {
+        DXGI_MODE_ROTATION_ROTATE90 => Some(D3D11_VIDEO_PROCESSOR_ROTATION_90),
+        DXGI_MODE_ROTATION_ROTATE180 => Some(D3D11_VIDEO_PROCESSOR_ROTATION_180),
+        DXGI_MODE_ROTATION_ROTATE270 => Some(D3D11_VIDEO_PROCESSOR_ROTATION_270),
+        _ => None,
     }
 }
 

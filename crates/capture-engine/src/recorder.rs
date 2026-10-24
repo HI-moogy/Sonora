@@ -5,13 +5,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_ROTATION_IDENTITY;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
 use crate::audio::{self, AudioInput, AudioRings, AudioShared, DESKTOP_TRACK};
 use crate::com::MfThread;
 use crate::desktop;
 use crate::convert::Converter;
-use crate::d3d::open_primary_output;
+use crate::d3d::{open_primary_output, output_for_monitor};
 use crate::duplication::{Desktop, Poll};
 use crate::window_capture::WindowCapture;
 use crate::encoder::{EncoderConfig, H264Encoder};
@@ -35,6 +36,9 @@ enum Command {
 pub enum CaptureTarget {
     /// The whole primary monitor.
     Screen,
+    /// A whole monitor (a raw `HMONITOR`); the primary one if another
+    /// graphics card drives it.
+    Monitor(isize),
     /// One window (a raw `HWND`): only its own content, even while covered.
     Window(isize),
     /// Nothing: no video is recorded, and what was recorded ages out as the
@@ -234,6 +238,9 @@ enum Source {
 /// Everything the recording loop owns.
 struct Session {
     source: Source,
+    /// What the recorder was last told to capture (`source` is `Nothing`
+    /// if that failed or the window closed).
+    target: CaptureTarget,
     /// The primary monitor, to capture again after a window.
     output: windows::Win32::Graphics::Dxgi::IDXGIOutput5,
     /// `None` while there's no source.
@@ -258,6 +265,7 @@ impl Session {
             &primary.context,
             &desktop.latest,
             (desktop.width, desktop.height),
+            desktop.rotation,
             (width, height),
             settings.fps,
         )?;
@@ -267,6 +275,7 @@ impl Session {
         )?;
         Ok(Self {
             source: Source::Screen(desktop),
+            target: CaptureTarget::Screen,
             output: primary.output,
             converter: Some(converter),
             encoder,
@@ -355,20 +364,20 @@ impl Session {
     /// Changes what's captured. A window that can't be captured records
     /// nothing and says why in `status`.
     fn switch(&mut self, target: CaptureTarget, settings: &VideoSettings, status: &RecorderStatus) {
-        let current = match &self.source {
-            Source::Screen(_) => CaptureTarget::Screen,
-            Source::Window(window) => CaptureTarget::Window(window.window),
-            Source::Nothing => CaptureTarget::Nothing,
-        };
-        if current == target {
+        if self.target == target {
             return;
         }
+        self.target = target;
         // Release the old capture before starting the new one.
         self.source = Source::Nothing;
         self.converter = None;
         let source = match target {
             CaptureTarget::Screen => {
                 Desktop::new(self.device.clone(), self.context.clone(), self.output.clone()).map(Source::Screen)
+            }
+            CaptureTarget::Monitor(monitor) => {
+                let output = output_for_monitor(&self.device, monitor).unwrap_or_else(|| self.output.clone());
+                Desktop::new(self.device.clone(), self.context.clone(), output).map(Source::Screen)
             }
             CaptureTarget::Window(window) => {
                 WindowCapture::new(self.device.clone(), self.context.clone(), window).map(Source::Window)
@@ -391,12 +400,12 @@ impl Session {
 
     /// A converter from the current source's image to the encode size.
     fn converter_for_source(&self, settings: &VideoSettings) -> windows::core::Result<Converter> {
-        let (image, size) = match &self.source {
-            Source::Screen(desktop) => (&desktop.latest, (desktop.width, desktop.height)),
-            Source::Window(window) => (&window.latest, (window.width, window.height)),
+        let (image, size, rotation) = match &self.source {
+            Source::Screen(desktop) => (&desktop.latest, (desktop.width, desktop.height), desktop.rotation),
+            Source::Window(window) => (&window.latest, (window.width, window.height), DXGI_MODE_ROTATION_IDENTITY),
             Source::Nothing => unreachable!("no converter without a source"),
         };
-        Converter::new(&self.device, &self.context, image, size, settings.resolution.size(), settings.fps)
+        Converter::new(&self.device, &self.context, image, size, rotation, settings.resolution.size(), settings.fps)
     }
 
     fn collect_encoded(&mut self) -> windows::core::Result<()> {

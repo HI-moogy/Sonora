@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- **Record the whole screen only while a game is open**: a new choice in the ⚙ clip settings. It records the monitor the game is on, and nothing while no game is open.
+- **Your games list**: the clip settings list every game Sonora found (Steam and Epic games by name, other launchers' games, and the ones Windows knows) with a search box. Remove a game to leave it out, put it back, or add any program with **Browse…** or from the apps that are open.
+
+### Changed
+
+- **Whole screen, all the time** now warns that it keeps your graphics card's video encoder busy nonstop: Task Manager can show Sonora using half the GPU, even on an idle desktop.
+- Until you choose what clips record, they record the whole screen only while a game is open (it was the whole screen, all the time).
+- Wallpaper Engine, Lossless Scaling, Proton and other Steam apps that aren't games no longer start a recording.
+
+### Fixed
+
+- Recording a monitor turned on its side (portrait) gave black video; it's recorded upright now.
+
 ## 0.1.0-alpha.4 (2026-10-23)
 
 ### New
