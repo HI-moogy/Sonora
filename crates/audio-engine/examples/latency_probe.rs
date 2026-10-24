@@ -10,8 +10,12 @@
 //! steady tone instead, and gaps in it are counted as dropouts.
 //!
 //! In `capture` mode it times only Windows' per-app capture (no mixer).
+//! With `short`, the device's audio engine is held at its shortest cycle
+//! while measuring (as a low-latency app would). `periods` lists each
+//! output device's engine cycles.
 //!
-//! Usage: latency_probe <part of a device name> [priority: high|normal|low] [clicks|tone|capture]
+//! Usage: latency_probe <part of a device name> [priority: high|normal|low] [clicks|tone|capture] [short]
+//!        latency_probe periods
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -24,7 +28,7 @@ use audio_engine::{list_output_devices, ComGuard, Mixer};
 use common::Priority;
 use windows::core::PCWSTR;
 use windows::Win32::Media::Audio::{
-    IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
+    IAudioCaptureClient, IAudioClient, IAudioClient3, IMMDeviceEnumerator, MMDeviceEnumerator,
     AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
@@ -280,15 +284,18 @@ fn capture_stage(device_id: &str) -> windows::core::Result<()> {
     std::thread::sleep(Duration::from_millis(300));
     let client = activate_process_loopback_client(child.0.id())?;
     let (mut onsets, mut arrivals) = (Vec::new(), Vec::new());
+    // The capture buffer asked for, in ms (LATENCY_PROBE_CAPTURE_MS; 200 by default, as the mixer uses).
+    let buffer_ms: i64 = std::env::var("LATENCY_PROBE_CAPTURE_MS").ok().and_then(|ms| ms.parse().ok()).unwrap_or(200);
     unsafe {
         client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-            2_000_000,
+            buffer_ms * 10_000,
             0,
             &standard_format(),
             None,
         )?;
+        println!("capture buffer asked: {buffer_ms} ms, got {} frames", client.GetBufferSize()?);
         let service: IAudioCaptureClient = client.GetService()?;
         client.Start()?;
         let start = Instant::now();
@@ -338,11 +345,75 @@ fn capture_stage(device_id: &str) -> windows::core::Result<()> {
     Ok(())
 }
 
+fn audio_client3(device_id: &str) -> windows::core::Result<IAudioClient3> {
+    let wide: Vec<u16> = device_id.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        enumerator.GetDevice(PCWSTR(wide.as_ptr()))?.Activate(CLSCTX_ALL, None)
+    }
+}
+
+/// A device's engine cycles at its own format, in frames: (default,
+/// fundamental, min, max, current).
+fn engine_periods(device_id: &str) -> windows::core::Result<(u32, u32, u32, u32, u32, u32)> {
+    let client = audio_client3(device_id)?;
+    unsafe {
+        let format = client.GetMixFormat()?;
+        let (mut default, mut fundamental, mut min, mut max) = (0, 0, 0, 0);
+        let result = client.GetSharedModeEnginePeriod(format, &mut default, &mut fundamental, &mut min, &mut max);
+        let rate = (*format).nSamplesPerSec;
+        windows::Win32::System::Com::CoTaskMemFree(Some(format as *const _));
+        result?;
+        let (mut current_format, mut current) = (std::ptr::null_mut(), 0);
+        if client.GetCurrentSharedModeEnginePeriod(&mut current_format, &mut current).is_ok() {
+            windows::Win32::System::Com::CoTaskMemFree(Some(current_format as *const _));
+        }
+        Ok((default, fundamental, min, max, current, rate))
+    }
+}
+
+/// Holds `device_id`'s engine at its shortest cycle while alive: a started
+/// stream that asked for it (silent; nothing is written).
+fn hold_short_period(device_id: &str) -> windows::core::Result<IAudioClient3> {
+    let client = audio_client3(device_id)?;
+    unsafe {
+        let format = client.GetMixFormat()?;
+        let (mut default, mut fundamental, mut min, mut max) = (0, 0, 0, 0);
+        client.GetSharedModeEnginePeriod(format, &mut default, &mut fundamental, &mut min, &mut max)?;
+        let result = client.InitializeSharedAudioStream(0, min, format, None);
+        let rate = (*format).nSamplesPerSec as f64;
+        windows::Win32::System::Com::CoTaskMemFree(Some(format as *const _));
+        result?;
+        client.Start()?;
+        println!(
+            "holding the engine at {min} frames ({:.2} ms; default {:.2} ms)",
+            min as f64 / rate * 1000.0,
+            default as f64 / rate * 1000.0
+        );
+    }
+    Ok(client)
+}
+
 fn main() -> windows::core::Result<()> {
     let _com = ComGuard::init()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--play") {
         return play(&args[1], args[2] == "tone");
+    }
+    if args.first().map(String::as_str) == Some("periods") {
+        for device in list_output_devices()? {
+            match engine_periods(&device.id) {
+                Ok((default, fundamental, min, max, current, rate)) => {
+                    let ms = |frames: u32| frames as f64 / rate as f64 * 1000.0;
+                    println!(
+                        "{}: default {:.2} ms, min {:.2} ms, max {:.2} ms, step {:.2} ms, now {:.2} ms",
+                        device.name, ms(default), ms(min), ms(max), ms(fundamental), ms(current)
+                    );
+                }
+                Err(error) => println!("{}: {error}", device.name),
+            }
+        }
+        return Ok(());
     }
     let device = list_output_devices()?
         .into_iter()
@@ -356,6 +427,7 @@ fn main() -> windows::core::Result<()> {
         Some("low") => Priority::Low,
         _ => Priority::High,
     };
+    let _short = if args.iter().any(|arg| arg == "short") { Some(hold_short_period(&device.id)?) } else { None };
     if args.get(2).map(String::as_str) == Some("capture") {
         return capture_stage(&device.id);
     }
