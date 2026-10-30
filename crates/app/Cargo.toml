@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.1.0-alpha.7"
+version = "0.1.0-alpha.8"
 edition.workspace = true
 description = "A per-app audio mixer for Windows and Linux"
 license = "MIT"

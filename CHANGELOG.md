@@ -1,16 +1,16 @@
 # Changelog
 
-## Unreleased
-
-### Changed
-
-- **Virtual surround is hidden for now**: it isn't ready yet, so it's off, and its settings are out of the channel panel until it is.
+## 0.1.0-alpha.8 (2026-10-30)
 
 ### New
 
 - **A 10-band EQ like SteelSeries Sonar's** (#2): each channel's EQ is a curve with ten dots. Drag a dot to move its band (left and right for where, up and down for how much), scroll on it to make it wider or narrower, double-click it to flatten it, and right-click it to make it a shelf or a cut, turn it off, or reset it. The picked band's values can be typed in, like 440 or 2.6k. **Bigger** opens the EQ in a big window with the frequency ranges named, and **EQ on** switches it off and on without losing your bands. Your EQs and saved presets carry over and sound the same.
 - **Share to Discord**: right-click a clip and pick **Share to Discord…** for copies that fit Discord's upload limit: 20 MB for free accounts, or pick Nitro Basic's 50 MB, Nitro's 1 GB, or any size. A clip that fits keeps its picture as it is; one that doesn't is made smaller (down to 720p or 540p, at 30 fps), and split into equal parts when one file would look too poor. Each copy has one sound track with what you heard and your mic. **Copy** puts them on the clipboard to paste in a chat with Ctrl+V; they're kept in the clips folder's **For Discord** folder, which the clip list leaves out.
 - **Save clips with a key on its own**: the save-clip hotkey can be Home, End, Page Up/Down, Insert, Delete or an F-key by itself, not only a combination. A key on its own still does its usual thing in other apps (Home still jumps to the start of a line while you type), and it doesn't count while you hold Ctrl or Alt. Letters and numbers still need Ctrl or Alt, so typing doesn't save clips.
+
+### Changed
+
+- **Virtual surround is hidden for now**: it isn't ready yet, so it's off, and its settings are out of the channel panel until it is.
 
 ## 0.1.0-alpha.7 (2026-10-29)
 
