@@ -14,6 +14,8 @@ import subprocess
 import sys
 
 LICENSE_NAMES = ("LICENSE", "LICENCE", "COPYING", "NOTICE", "COPYRIGHT")
+# Data built into Sonora that isn't a library: what it is, and its notice.
+DATA = (("SADIE II head-related impulse responses (virtual surround)", "crates/audio-engine/src/surround/SADIE-II-NOTICE.txt"),)
 
 
 def main():
@@ -64,12 +66,19 @@ def main():
 
     out = sys.stdout
     out.reconfigure(encoding="utf-8")
-    out.write("Sonora includes the following open-source libraries.\n\n")
+    out.write("Sonora includes the following open-source libraries and data.\n\n")
     for package in libraries:
         out.write(f"- {package['name']} {package['version']}: {package.get('license') or 'unknown'}")
         if package.get("repository"):
             out.write(f" ({package['repository']})")
         out.write("\n")
+    for name, _ in DATA:
+        out.write(f"- {name}: Apache-2.0\n")
+    for name, notice in DATA:
+        out.write("\n" + "=" * 78 + "\n")
+        out.write(f"Applies to: {name}\n")
+        out.write("=" * 78 + "\n\n")
+        out.write((root / notice).read_text(encoding="utf-8").strip() + "\n")
     for text, labels in by_text.items():
         out.write("\n" + "=" * 78 + "\n")
         out.write("Applies to: " + ", ".join(sorted(set(labels))) + "\n")

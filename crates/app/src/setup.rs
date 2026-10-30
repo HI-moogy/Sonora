@@ -81,6 +81,7 @@ impl MixerPersistence {
                 mixer.set_bus_priority(name, priority);
             }
             mixer.set_bus_monitor(name, bus.monitor.unwrap_or(false));
+            mixer.set_bus_surround(name, bus.surround);
         }
         for (name, preset) in &presets.eq {
             mixer.ensure_bus(name);
@@ -256,6 +257,7 @@ impl MixerPersistence {
                     heard: Some(bus.heard),
                     priority: Some(bus.priority),
                     monitor: Some(bus.monitor),
+                    surround: bus.surround,
                     color: None,
                 };
                 (bus.name.clone(), saved)

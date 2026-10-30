@@ -3,6 +3,7 @@ pub mod denoise;
 pub mod eq;
 pub mod error;
 pub mod mixer;
+pub mod surround;
 
 #[cfg(windows)]
 mod app_capture;

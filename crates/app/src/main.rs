@@ -10,7 +10,7 @@ use audio_engine::{
     enumerate_sessions, list_input_devices, list_output_devices, AudioDevice, Mixer, EQ_BAND_COUNT,
     EQ_BAND_FREQUENCIES, EQ_GAIN_RANGE_DB,
 };
-use common::{NoiseSuppression, Priority};
+use common::{NoiseSuppression, Priority, Surround};
 use eframe::egui;
 
 mod appearance;
@@ -342,6 +342,12 @@ impl MixerApp {
         if selected == "Mic" {
             return;
         }
+        theme::section(ui, "Surround");
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            surround_controls(ui, &self.mixer, selected, bus.surround);
+        });
+
         theme::section(ui, "Apps in this channel");
         let mine: Vec<&audio_engine::SourceInfo> = sources.iter().filter(|s| s.bus == selected && s.pid.is_some()).collect();
         // A saved app with one copy already here (a second Discord, say)
@@ -528,19 +534,29 @@ impl MixerApp {
 /// device (no added delay) or through Sonora, and why.
 fn route_note(ui: &mut egui::Ui, bus: &audio_engine::BusInfo) {
     let eq_on = bus.eq_gains_db.iter().any(|gain| gain.abs() >= 0.01);
+    let surround_on = bus.surround.enabled;
     let (text, color) = if !audio_engine::per_app_capture_supported() {
         (
             "Your Windows can't record single apps (that needs Windows 11), so apps here play straight on the \
-             device at this channel's volume, with no added delay. The EQ and turning an app above 100% can't \
-             reach them, and an app that's already playing moves once it opens its sound again (restart it).",
+             device at this channel's volume, with no added delay. The EQ, surround and turning an app above \
+             100% can't reach them, and an app that's already playing moves once it opens its sound again \
+             (restart it)."
+                .to_string(),
             theme::warning(),
         )
     } else if bus.direct {
-        ("Apps here play straight on the device: no added delay.", theme::accent())
-    } else if eq_on {
+        ("Apps here play straight on the device: no added delay.".to_string(), theme::accent())
+    } else if eq_on || surround_on {
+        let why = match (eq_on, surround_on) {
+            (true, true) => "The EQ and surround are on",
+            (true, false) => "The EQ is on",
+            (false, _) => "Surround is on",
+        };
         (
-            "The EQ is on, so apps here play through Sonora, about 60 ms later. With a flat EQ they play \
-             straight on the device, with no added delay.",
+            format!(
+                "{why}, so apps here play through Sonora, about 60 ms later. With a flat EQ and surround \
+                 off they play straight on the device, with no added delay."
+            ),
             theme::text_muted(),
         )
     } else {
@@ -787,6 +803,32 @@ fn eq_controls(ui: &mut egui::Ui, mixer: &Mixer, bus_name: &str, gains_db: [f32;
             });
         }
     });
+}
+
+/// Virtual surround: on or off, and how far away its speakers are.
+fn surround_controls(ui: &mut egui::Ui, mixer: &Mixer, bus_name: &str, surround: Surround) {
+    let mut changed = surround;
+    ui.checkbox(&mut changed.enabled, "Virtual surround for headphones").on_hover_text(
+        "Plays this channel as if from speakers in a room around you, rather than inside your head. \
+         Turn off any other surround (Windows Sonic, your headset's own software) so it isn't done twice. \
+         Clips keep the normal sound.",
+    );
+    ui.add_enabled_ui(changed.enabled, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Speaker distance");
+            ui.add(
+                egui::Slider::new(&mut changed.distance_m, Surround::MIN_DISTANCE_M..=Surround::MAX_DISTANCE_M)
+                    .step_by(0.1)
+                    .fixed_decimals(1)
+                    .suffix(" m"),
+            )
+            .on_hover_text("Closer sounds drier and more direct; farther brings in more of the room.");
+        });
+    });
+    ui.weak("Apps send Sonora stereo, so their sound comes from two speakers in front of you.");
+    if changed != surround {
+        mixer.set_bus_surround(bus_name, changed);
+    }
 }
 
 /// `name` with its first letter in capitals ("discord" -> "Discord"), for
