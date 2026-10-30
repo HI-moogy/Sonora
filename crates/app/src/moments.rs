@@ -12,6 +12,7 @@ use common::{ClipSort, ClipTags, MomentsConfig, RecordMode};
 use eframe::egui;
 
 use crate::clips::editor::{ClipEditor, EditorAction, Neighbours};
+use crate::clips::game::{GameChoice, GameWindow};
 use crate::clips::share::ShareWindow;
 use crate::clips::tags::{self, TagCounts, TagUi};
 use crate::clips::{self, ClipEntry, ClipList, Thumbnails};
@@ -161,6 +162,8 @@ pub struct Moments {
     tags_error: Option<String>,
     /// The Share to Discord window, while it's open.
     sharing: Option<ShareWindow>,
+    /// The window for saying which game a clip is from, while it's open.
+    game_picker: Option<GameWindow>,
     ctx: egui::Context,
     games: GameFinder,
     /// Running apps' windows as of the last check.
@@ -199,6 +202,7 @@ impl Moments {
             tag_ui: TagUi::default(),
             tags_error: None,
             sharing: None,
+            game_picker: None,
             ctx: ctx.clone(),
             games: GameFinder::new(),
             apps: Vec::new(),
@@ -438,6 +442,8 @@ impl Moments {
                             for name in names {
                                 self.tags.set(&saved, &name, true);
                             }
+                            let game = self.tags.game_of(&source).map(str::to_string);
+                            self.tags.set_game(&saved, game.as_deref());
                             self.tags_error = save_tags(&self.tags);
                         }
                         self.last_scan = None;
@@ -462,6 +468,23 @@ impl Moments {
             }
             if !open {
                 self.sharing = None;
+            }
+        }
+        if let Some(window) = &mut self.game_picker {
+            let known = known_games(&self.clips.entries, &self.library);
+            match window.show(ui.ctx(), &known) {
+                GameChoice::Open => {}
+                GameChoice::Closed => self.game_picker = None,
+                GameChoice::Set(clip, game) => {
+                    self.tags.set_game(&clip, game.as_deref());
+                    self.tags_error = save_tags(&self.tags);
+                    self.game_picker = None;
+                    match game {
+                        Some(_) => apply_games(&mut self.clips.entries, &self.tags),
+                        // What the file and folder say comes back with a fresh look.
+                        None => self.last_scan = None,
+                    }
+                }
             }
         }
     }
@@ -864,7 +887,9 @@ impl Moments {
         let dir = self.clips_dir();
         let last_result = self.shared.last_result.lock().unwrap().clone();
         // A clip saved from the hotkey shows up right away, not on the next scan.
-        self.clips.poll();
+        if self.clips.poll() {
+            apply_games(&mut self.clips.entries, &self.tags);
+        }
         if let Some(Ok(path)) = &last_result {
             if !self.clips.scanning && !self.clips.entries.iter().any(|clip| &clip.path == path) {
                 self.last_scan = None;
@@ -1044,6 +1069,7 @@ impl Moments {
         let mut opened = None;
         let mut tagged = false;
         let mut sharing = None;
+        let mut game_picker = None;
         let by_game = self.config.clip_sort == ClipSort::ByGame;
         let thumbnails = &mut self.thumbnails;
         let (tags, tag_ui) = (&mut self.tags, &mut self.tag_ui);
@@ -1082,6 +1108,10 @@ impl Moments {
                         if card.share {
                             sharing = Some(ShareWindow::open(&clip.path, &clip.name));
                         }
+                        if card.change_game {
+                            let chosen = tags.game_of(&clip.path).is_some();
+                            game_picker = Some(GameWindow::open(&clip.path, &clip.name, &clip.game, chosen));
+                        }
                         tagged |= card.tagged;
                     }
                 });
@@ -1096,7 +1126,34 @@ impl Moments {
         if sharing.is_some() {
             self.sharing = sharing;
         }
+        if game_picker.is_some() {
+            self.game_picker = game_picker;
+        }
     }
+}
+
+/// Puts each clip under the game you said it's from, if you did; yours
+/// is spelled as you wrote it.
+fn apply_games(entries: &mut [ClipEntry], tags: &ClipTags) {
+    for clip in entries {
+        if let Some(game) = tags.game_of(&clip.path) {
+            clip.game = game.to_string();
+            clip.game_from_folder = true;
+        }
+    }
+}
+
+/// Games to suggest when saying which game a clip is from: the clip
+/// list's, then installed ones, each once, A to Z.
+fn known_games(entries: &[ClipEntry], library: &Library) -> Vec<String> {
+    let mut games: Vec<String> = Vec::new();
+    for name in entries.iter().map(|clip| clip.game.as_str()).chain(library.games.iter().map(|game| game.name.as_str())) {
+        if !games.iter().any(|known| clips::game_key(known) == clips::game_key(name)) {
+            games.push(name.to_string());
+        }
+    }
+    games.sort_by_key(|game| game.to_lowercase());
+    games
 }
 
 fn save_tags(tags: &ClipTags) -> Option<String> {
@@ -1138,6 +1195,8 @@ struct CardResponse {
     tagged: bool,
     /// Share to Discord was picked from its right-click menu.
     share: bool,
+    /// Change game was picked from its right-click menu.
+    change_game: bool,
 }
 
 /// One clip's card, with its tags on its thumbnail; right-click it to tag
@@ -1184,7 +1243,7 @@ fn clip_card(
     // while you tick tags.
     let response = card.response();
     let open = response.container_secondary_clicked().then_some(egui::SetOpenCommand::Bool(true));
-    let mut share = false;
+    let (mut share, mut change_game) = (false, false);
     let tagged = egui::Popup::menu(&response)
         .open_memory(open)
         .at_pointer_fixed()
@@ -1196,6 +1255,10 @@ fn clip_card(
                 share = true;
                 ui.close();
             }
+            if ui.button("Change game…").on_hover_text(format!("It's listed under {}", clip.game)).clicked() {
+                change_game = true;
+                ui.close();
+            }
             if ui.button("Show in folder").clicked() {
                 clips::show_in_folder(&clip.path);
                 ui.close();
@@ -1203,7 +1266,7 @@ fn clip_card(
             changed
         })
         .is_some_and(|menu| menu.inner);
-    CardResponse { opened, tagged, share }
+    CardResponse { opened, tagged, share, change_game }
 }
 
 /// One row of the games list: the name, where it's from and whether it's

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New
+
+- **Change a clip's game**: right-click a clip and pick **Change game…** to put it under the right game, like an "unknown" Radeon replay that's really Team Fortress 2. Pick from your games as you type, or type any name. The file stays where it is, and **Use what Sonora found** puts it back.
+
 ### Fixed
 
 - **Radeon clips wouldn't open** ("video uses frame reordering"), nor other recorders' clips made the same way: they now play, edit and save, with their sound where their recorder put it.

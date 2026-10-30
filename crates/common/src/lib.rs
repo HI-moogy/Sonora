@@ -583,6 +583,9 @@ pub struct ClipTags {
     pub tags: Vec<ClipTag>,
     /// Each tagged clip's tags (by name), by the clip's full path.
     pub clips: BTreeMap<PathBuf, Vec<String>>,
+    /// The game you said a clip is from, where its file and folder said
+    /// nothing or something wrong (Radeon's "unknown" replays), by path.
+    pub games: BTreeMap<PathBuf, String>,
 }
 
 /// One of your clip tags.
@@ -654,6 +657,20 @@ impl ClipTags {
         for saved in self.tags.iter_mut().filter(|saved| saved.name == tag) {
             saved.color = color;
         }
+    }
+
+    /// The game you said `clip` is from, if you did.
+    pub fn game_of(&self, clip: &Path) -> Option<&str> {
+        self.games.get(clip).map(String::as_str)
+    }
+
+    /// Says which game `clip` is from (trimmed); `None` or nothing typed
+    /// goes back to what its file and folder say.
+    pub fn set_game(&mut self, clip: &Path, game: Option<&str>) {
+        match game.map(str::trim).filter(|game| !game.is_empty()) {
+            Some(game) => self.games.insert(clip.to_path_buf(), game.to_string()),
+            None => self.games.remove(clip),
+        };
     }
 
     /// Deletes a tag, taking it off every clip.
@@ -1144,6 +1161,16 @@ mod tests {
         assert_eq!(tags.tags[0].color, RED);
         tags.set_color("Hilarious", BLUE);
         assert_eq!(tags.tags[0].color, BLUE);
+    }
+
+    #[test]
+    fn a_clip_can_be_said_to_be_from_a_game_and_back() {
+        let clip = Path::new("unknown_replay_2024.05.16-20.28.mp4");
+        let mut tags = ClipTags::default();
+        tags.set_game(clip, Some("  Team Fortress 2 "));
+        assert_eq!(tags.game_of(clip), Some("Team Fortress 2"));
+        tags.set_game(clip, Some("   "));
+        assert_eq!(tags.game_of(clip), None, "nothing typed goes back to what Sonora found");
     }
 
     #[test]

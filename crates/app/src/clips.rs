@@ -16,6 +16,7 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_THUMBNAILONLY};
 
 pub mod editor;
+pub mod game;
 pub mod share;
 pub mod tags;
 
