@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- **Save clips with a key on its own**: the save-clip hotkey can be Home, End, Page Up/Down, Insert, Delete or an F-key by itself, not only a combination. A key on its own still does its usual thing in other apps (Home still jumps to the start of a line while you type), and it doesn't count while you hold Ctrl or Alt. Letters and numbers still need Ctrl or Alt, so typing doesn't save clips.
+
 ## 0.1.0-alpha.7 (2026-10-29)
 
 Also brings everything in 0.1.0-alpha.5 and 0.1.0-alpha.6, which weren't released here on their own: recording only while a game is open, your games list, and no added delay for channels with a flat EQ (see [the changelog](https://github.com/HI-moogy/Sonora/blob/main/CHANGELOG.md)).

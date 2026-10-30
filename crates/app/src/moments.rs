@@ -549,7 +549,12 @@ impl Moments {
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             if self.capturing_hotkey {
-                ui.label("Press the new key combination… (Esc to cancel)");
+                ui.label("Press a key, or a combination… (Esc to cancel)");
+                ui.label(
+                    egui::RichText::new("Letters and numbers need Ctrl or Alt, so typing doesn't save clips.")
+                        .small()
+                        .color(theme::text_muted()),
+                );
                 let pressed = ui.input(|input| {
                     input.events.iter().find_map(|event| match event {
                         egui::Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
@@ -578,6 +583,16 @@ impl Moments {
                         self.capturing_hotkey = true;
                     }
                 });
+                if hotkey::passes_through(self.config.hotkey) {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} still does its usual thing in other apps too.",
+                            hotkey::label(self.config.hotkey)
+                        ))
+                        .small()
+                        .color(theme::text_muted()),
+                    );
+                }
             }
             if let Some(error) = &self.hotkey_error {
                 ui.colored_label(theme::danger(), error);
