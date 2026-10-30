@@ -95,7 +95,9 @@ impl MixerPersistence {
                 mixer.set_bus_priority(name, priority);
             }
             mixer.set_bus_monitor(name, bus.monitor.unwrap_or(false));
-            mixer.set_bus_surround(name, bus.surround);
+            if crate::SURROUND_SHOWN {
+                mixer.set_bus_surround(name, bus.surround);
+            }
         }
         for (name, preset) in &presets.eq {
             mixer.ensure_bus(name);

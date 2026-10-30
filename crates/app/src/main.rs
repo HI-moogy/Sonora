@@ -58,6 +58,9 @@ use tray::{Tray, TrayCommand};
 /// The five channels always shown as faders, matching SteelSeries Sonar's
 /// own channel naming plus a dedicated Mic channel.
 const FIXED_BUSES: &[&str] = &["Game", "Chat", "Aux", "Media", "Mic"];
+/// Virtual surround isn't ready: its controls are hidden, and surround
+/// saved by a version that showed them isn't turned on (it's saved off).
+const SURROUND_SHOWN: bool = false;
 const SESSION_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
 const DEVICE_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 /// How often to retry restoring apps a crashed run left turned down, for
@@ -346,11 +349,13 @@ impl MixerApp {
         if selected == "Mic" {
             return;
         }
-        theme::section(ui, "Surround");
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            surround_controls(ui, &self.mixer, selected, bus.surround);
-        });
+        if SURROUND_SHOWN {
+            theme::section(ui, "Surround");
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                surround_controls(ui, &self.mixer, selected, bus.surround);
+            });
+        }
 
         theme::section(ui, "Apps in this channel");
         let mine: Vec<&audio_engine::SourceInfo> = sources.iter().filter(|s| s.bus == selected && s.pid.is_some()).collect();
@@ -538,14 +543,16 @@ impl MixerApp {
 /// device (no added delay) or through Sonora, and why.
 fn route_note(ui: &mut egui::Ui, bus: &audio_engine::BusInfo) {
     let eq_on = bus.eq_enabled && bus.eq.iter().any(EqBand::shapes);
-    let surround_on = bus.surround.enabled;
+    let surround_on = SURROUND_SHOWN && bus.surround.enabled;
+    let processing =
+        if SURROUND_SHOWN { "The EQ, surround and turning an app above 100%" } else { "The EQ and turning an app above 100%" };
     let (text, color) = if !audio_engine::per_app_capture_supported() {
         (
-            "Your Windows can't record single apps (that needs Windows 11), so apps here play straight on the \
-             device at this channel's volume, with no added delay. The EQ, surround and turning an app above \
-             100% can't reach them, and an app that's already playing moves once it opens its sound again \
-             (restart it)."
-                .to_string(),
+            format!(
+                "Your Windows can't record single apps (that needs Windows 11), so apps here play straight on the \
+                 device at this channel's volume, with no added delay. {processing} can't reach them, and an app \
+                 that's already playing moves once it opens its sound again (restart it)."
+            ),
             theme::warning(),
         )
     } else if bus.direct {
@@ -556,11 +563,9 @@ fn route_note(ui: &mut egui::Ui, bus: &audio_engine::BusInfo) {
             (true, false) => "The EQ is on",
             (false, _) => "Surround is on",
         };
+        let fix = if SURROUND_SHOWN { "With a flat EQ and surround off" } else { "With a flat EQ" };
         (
-            format!(
-                "{why}, so apps here play through Sonora, about 60 ms later. With a flat EQ and surround \
-                 off they play straight on the device, with no added delay."
-            ),
+            format!("{why}, so apps here play through Sonora, about 60 ms later. {fix} they play straight on the device, with no added delay."),
             theme::text_muted(),
         )
     } else {

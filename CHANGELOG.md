@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **Virtual surround is hidden for now**: it isn't ready yet, so it's off, and its settings are out of the channel panel until it is.
+
 ### New
 
 - **A 10-band EQ like SteelSeries Sonar's** (#2): each channel's EQ is a curve with ten dots. Drag a dot to move its band (left and right for where, up and down for how much), scroll on it to make it wider or narrower, double-click it to flatten it, and right-click it to make it a shelf or a cut, turn it off, or reset it. The picked band's values can be typed in, like 440 or 2.6k. **Bigger** opens the EQ in a big window with the frequency ranges named, and **EQ on** switches it off and on without losing your bands. Your EQs and saved presets carry over and sound the same.
