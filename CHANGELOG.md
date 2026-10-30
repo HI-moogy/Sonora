@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New
+
+- **Clip tags**: right-click a clip to tag it. Make your own tags, each in a color you pick, then tick them on any clip; they show on its thumbnail. Pick a tag above the clips to see only those. Change a tag's color or delete it from the same menu, and rename tags in ⚙ settings. An edited copy of a clip keeps its tags.
+
 ### Fixed
 
 - **Windows 10**: adding an app failed with "Couldn't add that app: Catastrophic failure", then the app kept being offered again (#1). Windows 10 can't record single apps, which Sonora needs to process them. Now apps there play straight on their channel's device with the channel's volume and mute, and their meters come from Windows. The channel EQ and turning an app above 100% need Windows 11, and the channel's panel says so.

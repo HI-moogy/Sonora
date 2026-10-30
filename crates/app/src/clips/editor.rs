@@ -79,8 +79,9 @@ fn role(index: usize) -> Role {
 pub enum EditorAction {
     None,
     Close,
-    /// A clip was written; the clip list should pick it up.
-    Saved,
+    /// A clip was written (this one, or an edited copy at this path); the
+    /// clip list should pick it up.
+    Saved(PathBuf),
     /// Open the clip before or after this one in the clip list.
     Previous,
     Next,
@@ -402,8 +403,8 @@ impl ClipEditor {
             };
             if let Some(saved) = saved {
                 let overwrite = *overwrite;
-                if saved.is_ok() {
-                    action = EditorAction::Saved;
+                if let Ok(path) = &saved {
+                    action = EditorAction::Saved(path.clone());
                 }
                 if overwrite {
                     // Start over on the rewritten clip: its tracks now hold

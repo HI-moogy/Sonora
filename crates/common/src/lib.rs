@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -446,6 +446,159 @@ pub fn save_routed_apps(apps: &RoutedApps) -> std::io::Result<()> {
     std::fs::write(routed_apps_path(), json)
 }
 
+/// The tags you made for clips, and which clips have them
+/// (`clip-tags.json`, apart from the settings: it's about your clips).
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClipTags {
+    /// Your tags, in the order you made them.
+    pub tags: Vec<ClipTag>,
+    /// Each tagged clip's tags (by name), by the clip's full path.
+    pub clips: BTreeMap<PathBuf, Vec<String>>,
+}
+
+/// One of your clip tags.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClipTag {
+    pub name: String,
+    /// What it looks like on a clip.
+    pub color: Rgb,
+}
+
+/// Why a tag name wasn't taken.
+#[derive(Debug, PartialEq)]
+pub enum TagError {
+    Empty,
+    TooLong,
+    /// Another tag has that name already (it's given back, as spelled).
+    Exists(String),
+}
+
+impl ClipTags {
+    /// The longest a tag can be, so it fits on a clip's card.
+    pub const MAX_LEN: usize = 24;
+
+    /// `clip`'s tags, in your tags' order.
+    pub fn of(&self, clip: &Path) -> Vec<&ClipTag> {
+        let Some(on) = self.clips.get(clip) else { return Vec::new() };
+        self.tags.iter().filter(|tag| on.contains(&tag.name)).collect()
+    }
+
+    pub fn has(&self, clip: &Path, tag: &str) -> bool {
+        self.clips.get(clip).is_some_and(|on| on.iter().any(|t| t == tag))
+    }
+
+    /// Puts `tag` on `clip`, or takes it off.
+    pub fn set(&mut self, clip: &Path, tag: &str, on: bool) {
+        let tags = self.clips.entry(clip.to_path_buf()).or_default();
+        tags.retain(|t| t != tag);
+        if on {
+            tags.push(tag.to_string());
+        }
+        if tags.is_empty() {
+            self.clips.remove(clip);
+        }
+    }
+
+    /// Makes a tag (`name` trimmed); returns its name as saved.
+    pub fn add_tag(&mut self, name: &str, color: Rgb) -> Result<String, TagError> {
+        let name = self.free_name(name, None)?;
+        self.tags.push(ClipTag { name: name.clone(), color });
+        Ok(name)
+    }
+
+    /// Renames a tag, on every clip that has it; returns the new name as
+    /// saved.
+    pub fn rename_tag(&mut self, tag: &str, name: &str) -> Result<String, TagError> {
+        let name = self.free_name(name, Some(tag))?;
+        for saved in self.tags.iter_mut().filter(|saved| saved.name == tag) {
+            saved.name = name.clone();
+        }
+        for on in self.clips.values_mut() {
+            for saved in on.iter_mut().filter(|saved| *saved == tag) {
+                *saved = name.clone();
+            }
+        }
+        Ok(name)
+    }
+
+    pub fn set_color(&mut self, tag: &str, color: Rgb) {
+        for saved in self.tags.iter_mut().filter(|saved| saved.name == tag) {
+            saved.color = color;
+        }
+    }
+
+    /// Deletes a tag, taking it off every clip.
+    pub fn remove_tag(&mut self, tag: &str) {
+        self.tags.retain(|t| t.name != tag);
+        self.clips.retain(|_, tags| {
+            tags.retain(|t| t != tag);
+            !tags.is_empty()
+        });
+    }
+
+    /// `name` trimmed, if it can be a tag's: no other tag (but `renaming`)
+    /// has it, whatever the case.
+    fn free_name(&self, name: &str, renaming: Option<&str>) -> Result<String, TagError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(TagError::Empty);
+        }
+        if name.chars().count() > Self::MAX_LEN {
+            return Err(TagError::TooLong);
+        }
+        let taken = self.tags.iter().find(|tag| Some(tag.name.as_str()) != renaming && tag.name.to_lowercase() == name.to_lowercase());
+        match taken {
+            Some(tag) => Err(TagError::Exists(tag.name.clone())),
+            None => Ok(name.to_string()),
+        }
+    }
+}
+
+fn clip_tags_path() -> PathBuf {
+    config_dir().join("clip-tags.json")
+}
+
+/// Loads your clip tags. An unreadable file is set aside (kept, never
+/// overwritten) and the tags start over.
+pub fn load_clip_tags() -> ClipTags {
+    clip_tags_from(&clip_tags_path())
+}
+
+fn clip_tags_from(path: &Path) -> ClipTags {
+    // Not there yet, or can't be read right now (locked, say): left alone.
+    let Ok(text) = std::fs::read_to_string(path) else { return ClipTags::default() };
+    serde_json::from_str(&text).unwrap_or_else(|_| {
+        let _ = std::fs::rename(path, set_aside_path(path));
+        ClipTags::default()
+    })
+}
+
+pub fn save_clip_tags(tags: &ClipTags) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(tags).map_err(std::io::Error::other)?;
+    write_atomically(&clip_tags_path(), json.as_bytes())
+}
+
+/// Where an unreadable `file.json` is kept: `file.corrupt-<time>.json`.
+fn set_aside_path(path: &Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    path.with_extension(format!("corrupt-{stamp}.json"))
+}
+
+/// Writes to a temporary file and moves it into place, so a crash mid-write
+/// can't leave a half-written file.
+fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let partial = path.with_extension("json.tmp");
+    let mut file = std::fs::File::create(&partial)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&partial, path)
+}
+
 /// Problems found loading settings, for the UI to show once.
 static CONFIG_NOTICES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -501,10 +654,7 @@ fn load_from(path: &Path) -> (Presets, Vec<String>) {
 
     // Keep the unreadable file for the user, and out of the way so the next
     // save neither overwrites it nor backs it up over the good backup.
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let kept = path.with_extension(format!("corrupt-{stamp}.json"));
+    let kept = set_aside_path(path);
     let set_aside = std::fs::rename(path, &kept);
     let kept_note = match &set_aside {
         Ok(()) => format!("The unreadable file was kept as {}.", kept.display()),
@@ -577,19 +727,11 @@ fn parse_sections(text: &str) -> (Presets, Vec<String>) {
 /// can't leave a half-written settings file; the previous file is kept as
 /// `config.json.bak`.
 fn save_to(path: &Path, presets: &Presets) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_string_pretty(presets).map_err(std::io::Error::other)?;
-    let partial = path.with_extension("json.tmp");
-    let mut file = std::fs::File::create(&partial)?;
-    file.write_all(json.as_bytes())?;
-    file.sync_all()?;
-    drop(file);
     if path.exists() {
         let _ = std::fs::copy(path, backup_path(path));
     }
-    std::fs::rename(&partial, path)
+    write_atomically(path, json.as_bytes())
 }
 
 #[cfg(test)]
@@ -793,5 +935,86 @@ mod tests {
         assert_eq!(presets.moments.buffer_secs, 60);
         assert_eq!(presets.moments.fps, 60);
         assert_eq!(presets.moments.hotkey, Hotkey::default());
+    }
+
+    const RED: Rgb = Rgb::new(0xE5, 0x48, 0x4D);
+    const BLUE: Rgb = Rgb::new(0x9A, 0xD8, 0xF0);
+
+    fn funny_and_cool() -> ClipTags {
+        let mut tags = ClipTags::default();
+        tags.add_tag("Funny", RED).unwrap();
+        tags.add_tag("Cool", BLUE).unwrap();
+        tags
+    }
+
+    fn names<'a>(tags: impl IntoIterator<Item = &'a ClipTag>) -> Vec<&'a str> {
+        tags.into_iter().map(|tag| tag.name.as_str()).collect()
+    }
+
+    #[test]
+    fn there_are_no_tags_until_you_make_them() {
+        assert!(ClipTags::default().tags.is_empty());
+    }
+
+    #[test]
+    fn tags_go_on_and_off_a_clip_and_show_in_your_order() {
+        let clip = Path::new(r"E:\Clips\Deadlock\Sonora 2026-10-28 00-41-10.mp4");
+        let mut tags = funny_and_cool();
+        tags.set(clip, "Cool", true);
+        tags.set(clip, "Funny", true);
+        assert_eq!(names(tags.of(clip)), ["Funny", "Cool"]);
+        assert!(tags.has(clip, "Cool"));
+        tags.set(clip, "Cool", false);
+        tags.set(clip, "Funny", false);
+        assert!(tags.of(clip).is_empty());
+        assert!(tags.clips.is_empty(), "an untagged clip isn't kept");
+    }
+
+    #[test]
+    fn a_tag_is_made_once_whatever_its_case() {
+        let mut tags = funny_and_cool();
+        assert_eq!(tags.add_tag("  Clutch ", RED), Ok("Clutch".to_string()));
+        assert_eq!(tags.add_tag("funny", BLUE), Err(TagError::Exists("Funny".into())));
+        assert_eq!(tags.add_tag("   ", RED), Err(TagError::Empty));
+        assert_eq!(tags.add_tag(&"x".repeat(ClipTags::MAX_LEN + 1), RED), Err(TagError::TooLong));
+        assert_eq!(names(&tags.tags), ["Funny", "Cool", "Clutch"]);
+        assert_eq!(tags.tags[2].color, RED);
+    }
+
+    #[test]
+    fn a_renamed_tag_stays_on_its_clips() {
+        let clip = Path::new("one.mp4");
+        let mut tags = funny_and_cool();
+        tags.set(clip, "Funny", true);
+        assert_eq!(tags.rename_tag("Funny", "Cool"), Err(TagError::Exists("Cool".into())));
+        assert_eq!(tags.rename_tag("Funny", " funny "), Ok("funny".to_string()), "a new case is fine");
+        assert_eq!(tags.rename_tag("funny", "Hilarious"), Ok("Hilarious".to_string()));
+        assert_eq!(names(tags.of(clip)), ["Hilarious"]);
+        assert_eq!(tags.tags[0].color, RED);
+        tags.set_color("Hilarious", BLUE);
+        assert_eq!(tags.tags[0].color, BLUE);
+    }
+
+    #[test]
+    fn deleting_a_tag_takes_it_off_every_clip() {
+        let (one, two) = (Path::new("one.mp4"), Path::new("two.mp4"));
+        let mut tags = funny_and_cool();
+        tags.set(one, "Funny", true);
+        tags.set(two, "Funny", true);
+        tags.set(two, "Cool", true);
+        tags.remove_tag("Funny");
+        assert_eq!(names(&tags.tags), ["Cool"]);
+        assert!(!tags.clips.contains_key(one));
+        assert_eq!(names(tags.of(two)), ["Cool"]);
+    }
+
+    #[test]
+    fn an_unreadable_tags_file_is_kept_and_tags_start_over() {
+        let dir = test_dir("tags");
+        let path = dir.join("clip-tags.json");
+        assert_eq!(clip_tags_from(&path), ClipTags::default());
+        std::fs::write(&path, "{ truncated").unwrap();
+        assert_eq!(clip_tags_from(&path), ClipTags::default());
+        assert!(files_in(&dir).iter().any(|f| f.contains("corrupt")));
     }
 }

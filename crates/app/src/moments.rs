@@ -8,10 +8,11 @@ use audio_engine::{BusTap, Mixer};
 use capture_engine::{
     default_clips_dir, AudioInput, CaptureTarget, ClipSaver, Recorder, Resolution, VideoSettings, DESKTOP_TRACK,
 };
-use common::{ClipSort, MomentsConfig, RecordMode};
+use common::{ClipSort, ClipTags, MomentsConfig, RecordMode};
 use eframe::egui;
 
 use crate::clips::editor::{ClipEditor, EditorAction, Neighbours};
+use crate::clips::tags::{self, TagCounts, TagUi};
 use crate::clips::{self, ClipEntry, ClipList, Thumbnails};
 use crate::game_library::{self, Library};
 use crate::games::{self, AppWindow, GameFinder};
@@ -152,6 +153,11 @@ pub struct Moments {
     editor: Option<ClipEditor>,
     /// Show only this game's clips (a [`clips::game_key`]).
     game_filter: Option<String>,
+    /// Your clip tags, and which clips have them.
+    tags: ClipTags,
+    tag_ui: TagUi,
+    /// Why your tags couldn't be saved.
+    tags_error: Option<String>,
     ctx: egui::Context,
     games: GameFinder,
     /// Running apps' windows as of the last check.
@@ -186,6 +192,9 @@ impl Moments {
             show_settings: false,
             editor: None,
             game_filter: None,
+            tags: common::load_clip_tags(),
+            tag_ui: TagUi::default(),
+            tags_error: None,
             ctx: ctx.clone(),
             games: GameFinder::new(),
             apps: Vec::new(),
@@ -331,6 +340,7 @@ impl Moments {
         let _ = common::update_presets(|presets| presets.moments = moments);
     }
 
+
     /// One-line status: what's buffered, or why nothing is.
     fn status(&self) -> (String, bool) {
         if !self.config.enabled {
@@ -405,7 +415,9 @@ impl Moments {
             .show(ui, |ui| match &mut self.editor {
             Some(editor) => {
                 // The previous and next clips, as the clip list shows them.
-                let shown = shown_clips(&self.clips.entries, self.game_filter.as_deref(), self.config.clip_sort);
+                let filter = ClipFilter { game: self.game_filter.as_deref(), tag: self.tag_ui.filter.as_deref(), tags: &self.tags };
+                let shown = shown_clips(&self.clips.entries, &filter, self.config.clip_sort);
+                let source = editor.path().to_path_buf();
                 let at = shown.iter().position(|clip| clip.path == editor.path());
                 let neighbour = |step: isize| at.and_then(|at| at.checked_add_signed(step)).and_then(|i| shown.get(i).copied());
                 let neighbours = Neighbours { previous: neighbour(-1).is_some(), next: neighbour(1).is_some() };
@@ -415,7 +427,15 @@ impl Moments {
                         self.editor = None;
                         None
                     }
-                    EditorAction::Saved => {
+                    EditorAction::Saved(saved) => {
+                        // An edited copy keeps the clip's tags.
+                        if saved != source {
+                            let names: Vec<String> = self.tags.of(&source).into_iter().map(|tag| tag.name.clone()).collect();
+                            for name in names {
+                                self.tags.set(&saved, &name, true);
+                            }
+                            self.tags_error = save_tags(&self.tags);
+                        }
                         self.last_scan = None;
                         None
                     }
@@ -561,6 +581,20 @@ impl Moments {
             }
             if let Some(error) = &self.hotkey_error {
                 ui.colored_label(theme::danger(), error);
+            }
+        });
+
+        theme::section(ui, "Tags");
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                egui::RichText::new("Right-click a clip to tag it or make a tag, and pick a tag above the clips to see only those.")
+                    .small()
+                    .color(theme::text_muted()),
+            );
+            let counts = tags::counts(&self.tags, self.clips.entries.iter().map(|clip| clip.path.as_path()));
+            if self.tag_ui.settings(ui, &mut self.tags, &counts) {
+                self.tags_error = save_tags(&self.tags);
             }
         });
 
@@ -901,6 +935,7 @@ impl Moments {
         }
 
         // Each game with how many clips it has, for the filter.
+        let counts = tags::counts(&self.tags, self.clips.entries.iter().map(|clip| clip.path.as_path()));
         let mut games: Vec<(String, String, usize)> = Vec::new();
         for clip in &self.clips.entries {
             let key = clips::game_key(&clip.game);
@@ -952,14 +987,34 @@ impl Moments {
                     }
                 }
             });
+            if !self.tags.tags.is_empty() {
+                ui.add_space(8.0);
+                ui.label("Tag");
+                self.tag_ui.filter(ui, &self.tags, &counts);
+            }
         });
+        if let Some(error) = &self.tags_error {
+            ui.colored_label(theme::danger(), error);
+        }
 
-        let shown = shown_clips(&self.clips.entries, self.game_filter.as_deref(), self.config.clip_sort);
+        let filter = ClipFilter { game: self.game_filter.as_deref(), tag: self.tag_ui.filter.as_deref(), tags: &self.tags };
+        let shown = shown_clips(&self.clips.entries, &filter, self.config.clip_sort);
+        if shown.is_empty() {
+            if let Some(tag) = &self.tag_ui.filter {
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(format!("No clips tagged {tag} yet. Right-click a clip to tag it."))
+                        .color(theme::text_muted()),
+                );
+            }
+        }
 
         let ctx = ui.ctx().clone();
         let mut opened = None;
+        let mut tagged = false;
         let by_game = self.config.clip_sort == ClipSort::ByGame;
         let thumbnails = &mut self.thumbnails;
+        let (tags, tag_ui) = (&mut self.tags, &mut self.tag_ui);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             // One run of cards per game when grouping, else one run of all.
             let mut rest = &shown[..];
@@ -988,9 +1043,11 @@ impl Moments {
                         // The same spelling of the game as the filter shows.
                         let key = clips::game_key(&clip.game);
                         let game = games.iter().find(|(k, ..)| *k == key).map_or(clip.game.as_str(), |(_, name, _)| name.as_str());
-                        if clip_card(ui, clip, thumbnails, (!by_game).then_some(game)) {
+                        let card = clip_card(ui, clip, thumbnails, (!by_game).then_some(game), tags, tag_ui, &counts);
+                        if card.opened {
                             opened = Some(ClipEditor::open(&ctx, clip));
                         }
+                        tagged |= card.tagged;
                     }
                 });
             }
@@ -998,14 +1055,34 @@ impl Moments {
         if opened.is_some() {
             self.editor = opened;
         }
+        if tagged {
+            self.tags_error = save_tags(&self.tags);
+        }
     }
 }
 
-/// The clips the clip list shows, in its order: only `game`'s (a
-/// [`clips::game_key`]) if set, sorted by `sort`. The editor's previous and
-/// next clip follow this too.
-fn shown_clips<'a>(entries: &'a [ClipEntry], game: Option<&str>, sort: ClipSort) -> Vec<&'a ClipEntry> {
-    let mut shown: Vec<&ClipEntry> = entries.iter().filter(|clip| game.is_none_or(|key| clips::game_key(&clip.game) == key)).collect();
+fn save_tags(tags: &ClipTags) -> Option<String> {
+    common::save_clip_tags(tags).err().map(|error| format!("Couldn't save your tags: {error}"))
+}
+
+/// Which clips the clip list shows.
+struct ClipFilter<'a> {
+    /// Only this game's (a [`clips::game_key`]).
+    game: Option<&'a str>,
+    /// Only those with this tag.
+    tag: Option<&'a str>,
+    tags: &'a ClipTags,
+}
+
+/// The clips the clip list shows, in its order: those `filter` lets
+/// through, sorted by `sort`. The editor's previous and next clip follow
+/// this too.
+fn shown_clips<'a>(entries: &'a [ClipEntry], filter: &ClipFilter, sort: ClipSort) -> Vec<&'a ClipEntry> {
+    let mut shown: Vec<&ClipEntry> = entries
+        .iter()
+        .filter(|clip| filter.game.is_none_or(|key| clips::game_key(&clip.game) == key))
+        .filter(|clip| filter.tag.is_none_or(|tag| filter.tags.has(&clip.path, tag)))
+        .collect();
     match sort {
         ClipSort::NewestFirst => shown.sort_by_key(|clip| std::cmp::Reverse(clip.recorded)),
         ClipSort::OldestFirst => shown.sort_by_key(|clip| clip.recorded),
@@ -1014,14 +1091,31 @@ fn shown_clips<'a>(entries: &'a [ClipEntry], game: Option<&str>, sort: ClipSort)
     shown
 }
 
-/// One clip's card. Cards off screen only take their space: their
-/// thumbnail and length are loaded once they're scrolled into view.
-/// Returns whether the clip was clicked to open.
-fn clip_card(ui: &mut egui::Ui, clip: &ClipEntry, thumbnails: &mut Thumbnails, game: Option<&str>) -> bool {
+/// What happened on a clip's card.
+#[derive(Default)]
+struct CardResponse {
+    /// It was clicked to open.
+    opened: bool,
+    /// Its tags changed (from its right-click menu).
+    tagged: bool,
+}
+
+/// One clip's card, with its tags on its thumbnail; right-click it to tag
+/// it. Cards off screen only take their space: their thumbnail and length
+/// are loaded once they're scrolled into view.
+fn clip_card(
+    ui: &mut egui::Ui,
+    clip: &ClipEntry,
+    thumbnails: &mut Thumbnails,
+    game: Option<&str>,
+    tags: &mut ClipTags,
+    tag_ui: &mut TagUi,
+    counts: &TagCounts,
+) -> CardResponse {
     let size = egui::vec2(CARD_THUMBNAIL.x, CARD_THUMBNAIL.y + 62.0);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
-        return false;
+        return CardResponse::default();
     }
     let (texture, duration) = thumbnails.get(clip);
     let mut card = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
@@ -1032,7 +1126,9 @@ fn clip_card(ui: &mut egui::Ui, clip: &ClipEntry, thumbnails: &mut Thumbnails, g
         ),
         None => card.add_sized(CARD_THUMBNAIL, egui::Button::new("▶").corner_radius(6.0)),
     };
-    let opened = thumbnail.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open").clicked();
+    let thumbnail = thumbnail.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open · right-click to tag");
+    let opened = thumbnail.clicked();
+    tags::chips(&card, thumbnail.rect, &tags.of(&clip.path));
     card.add(egui::Label::new(clips::display_name(&clip.name)).truncate());
     card.horizontal(|ui| {
         let mut details = vec![duration.map(clips::format_duration).unwrap_or_else(|| "…".into()), clips::format_size(clip.size)];
@@ -1044,7 +1140,25 @@ fn clip_card(ui: &mut egui::Ui, clip: &ClipEntry, thumbnails: &mut Thumbnails, g
     if card.small_button("Show in folder").clicked() {
         clips::show_in_folder(&clip.path);
     }
-    opened
+    // Right-clicking anywhere on the card, the thumbnail too. It stays open
+    // while you tick tags.
+    let response = card.response();
+    let open = response.container_secondary_clicked().then_some(egui::SetOpenCommand::Bool(true));
+    let tagged = egui::Popup::menu(&response)
+        .open_memory(open)
+        .at_pointer_fixed()
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            let changed = tag_ui.menu(ui, &clip.path, tags, counts);
+            ui.separator();
+            if ui.button("Show in folder").clicked() {
+                clips::show_in_folder(&clip.path);
+                ui.close();
+            }
+            changed
+        })
+        .is_some_and(|menu| menu.inner);
+    CardResponse { opened, tagged }
 }
 
 /// One row of the games list: the name, where it's from and whether it's

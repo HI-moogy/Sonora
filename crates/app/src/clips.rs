@@ -16,6 +16,7 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_THUMBNAILONLY};
 
 pub mod editor;
+pub mod tags;
 
 /// Thumbnails are requested at this size; clips are always 16:9.
 pub const THUMBNAIL_SIZE: [i32; 2] = [320, 180];
