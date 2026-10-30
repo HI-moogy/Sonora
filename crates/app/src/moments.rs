@@ -12,6 +12,7 @@ use common::{ClipSort, ClipTags, MomentsConfig, RecordMode};
 use eframe::egui;
 
 use crate::clips::editor::{ClipEditor, EditorAction, Neighbours};
+use crate::clips::share::ShareWindow;
 use crate::clips::tags::{self, TagCounts, TagUi};
 use crate::clips::{self, ClipEntry, ClipList, Thumbnails};
 use crate::game_library::{self, Library};
@@ -158,6 +159,8 @@ pub struct Moments {
     tag_ui: TagUi,
     /// Why your tags couldn't be saved.
     tags_error: Option<String>,
+    /// The Share to Discord window, while it's open.
+    sharing: Option<ShareWindow>,
     ctx: egui::Context,
     games: GameFinder,
     /// Running apps' windows as of the last check.
@@ -195,6 +198,7 @@ impl Moments {
             tags: common::load_clip_tags(),
             tag_ui: TagUi::default(),
             tags_error: None,
+            sharing: None,
             ctx: ctx.clone(),
             games: GameFinder::new(),
             apps: Vec::new(),
@@ -448,6 +452,18 @@ impl Moments {
             }
             None => self.clips_ui(ui),
         });
+        let clips_dir = self.clips_dir();
+        if let Some(window) = &mut self.sharing {
+            let mut limit = self.config.share_limit_mb;
+            let (open, settled) = window.show(ui.ctx(), &mut limit, &clips_dir);
+            self.config.share_limit_mb = limit;
+            if settled {
+                self.persist();
+            }
+            if !open {
+                self.sharing = None;
+            }
+        }
     }
 
     /// Clip settings, in stacked sections that fit the panel's width
@@ -1027,6 +1043,7 @@ impl Moments {
         let ctx = ui.ctx().clone();
         let mut opened = None;
         let mut tagged = false;
+        let mut sharing = None;
         let by_game = self.config.clip_sort == ClipSort::ByGame;
         let thumbnails = &mut self.thumbnails;
         let (tags, tag_ui) = (&mut self.tags, &mut self.tag_ui);
@@ -1062,6 +1079,9 @@ impl Moments {
                         if card.opened {
                             opened = Some(ClipEditor::open(&ctx, clip));
                         }
+                        if card.share {
+                            sharing = Some(ShareWindow::open(&clip.path, &clip.name));
+                        }
                         tagged |= card.tagged;
                     }
                 });
@@ -1072,6 +1092,9 @@ impl Moments {
         }
         if tagged {
             self.tags_error = save_tags(&self.tags);
+        }
+        if sharing.is_some() {
+            self.sharing = sharing;
         }
     }
 }
@@ -1113,6 +1136,8 @@ struct CardResponse {
     opened: bool,
     /// Its tags changed (from its right-click menu).
     tagged: bool,
+    /// Share to Discord was picked from its right-click menu.
+    share: bool,
 }
 
 /// One clip's card, with its tags on its thumbnail; right-click it to tag
@@ -1159,6 +1184,7 @@ fn clip_card(
     // while you tick tags.
     let response = card.response();
     let open = response.container_secondary_clicked().then_some(egui::SetOpenCommand::Bool(true));
+    let mut share = false;
     let tagged = egui::Popup::menu(&response)
         .open_memory(open)
         .at_pointer_fixed()
@@ -1166,6 +1192,10 @@ fn clip_card(
         .show(|ui| {
             let changed = tag_ui.menu(ui, &clip.path, tags, counts);
             ui.separator();
+            if ui.button("Share to Discord…").clicked() {
+                share = true;
+                ui.close();
+            }
             if ui.button("Show in folder").clicked() {
                 clips::show_in_folder(&clip.path);
                 ui.close();
@@ -1173,7 +1203,7 @@ fn clip_card(
             changed
         })
         .is_some_and(|menu| menu.inner);
-    CardResponse { opened, tagged }
+    CardResponse { opened, tagged, share }
 }
 
 /// One row of the games list: the name, where it's from and whether it's

@@ -16,6 +16,7 @@ mod mux;
 mod preview;
 mod recorder;
 mod ring;
+mod share;
 mod window_capture;
 
 use std::path::PathBuf;
@@ -27,6 +28,7 @@ pub use audio::{AudioInput, DESKTOP_TRACK};
 pub use edit::{decode_clip_audio, save_edited_clip, ClipAudio, ClipEdit, ClipTimeline, EditError, KeptPart, TrackAudio};
 pub use preview::{PreviewFrame, VideoPreview};
 pub use recorder::{CaptureTarget, ClipSaver, Recorder, RecorderStatus};
+pub use share::{plan_share, share_clip, EncodePlan, ShareError, SharePlan, ShareSource};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {

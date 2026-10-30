@@ -16,6 +16,7 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_THUMBNAILONLY};
 
 pub mod editor;
+pub mod share;
 pub mod tags;
 
 /// Thumbnails are requested at this size; clips are always 16:9.
@@ -101,10 +102,11 @@ impl ClipList {
 /// How deep into subfolders clips are looked for (Clips\Game\Session\x.mp4).
 const MAX_DEPTH: usize = 4;
 
-/// Folders of other recorders' caches and thumbnails, not clips.
+/// Folders of other recorders' caches and thumbnails, and Sonora's copies
+/// for Discord: not clips.
 fn is_cache_folder(name: &str) -> bool {
     let lower = name.to_lowercase();
-    name.starts_with('.') || lower.contains("cache") || lower.contains("thumb")
+    name.starts_with('.') || lower.contains("cache") || lower.contains("thumb") || name == share::FOLDER
 }
 
 fn scan(root: &Path, dir: &Path, depth: usize, found: &mut Vec<ClipEntry>) {

@@ -323,6 +323,9 @@ pub struct MomentsConfig {
     pub never_record: Vec<String>,
     /// How the Clips tab orders clips.
     pub clip_sort: ClipSort,
+    /// The size each copy for Discord stays under, in MB (Discord's upload
+    /// limit for your account).
+    pub share_limit_mb: u32,
 }
 
 /// How the Clips tab orders clips.
@@ -368,6 +371,7 @@ impl Default for MomentsConfig {
             always_record: Vec::new(),
             never_record: Vec::new(),
             clip_sort: ClipSort::NewestFirst,
+            share_limit_mb: 20,
         }
     }
 }
