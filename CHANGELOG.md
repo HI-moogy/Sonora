@@ -1,9 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.7 (2026-10-29)
+
+Also brings everything in 0.1.0-alpha.5 and 0.1.0-alpha.6, which weren't released here on their own: recording only while a game is open, your games list, and no added delay for channels with a flat EQ (see [the changelog](https://github.com/HI-moogy/Sonora/blob/main/CHANGELOG.md)).
 
 ### New
 
+- **Virtual surround for headphones**: turn on Surround for a channel to hear it from two speakers in a room in front of you, instead of inside your head, and set how far away they are. Only what you hear changes: meters and clips keep the channel's own sound, and the Mic channel never gets it. Like the EQ, it plays the channel through Sonora, so its apps don't play direct (and on Windows 10 it can't reach them).
 - **Clip tags**: right-click a clip to tag it. Make your own tags, each in a color you pick, then tick them on any clip; they show on its thumbnail. Pick a tag above the clips to see only those. Change a tag's color or delete it from the same menu, and rename tags in ⚙ settings. An edited copy of a clip keeps its tags.
 
 ### Fixed
