@@ -138,7 +138,7 @@ mod tests {
         // With the channel's EQ on, it's played through the mixer from a
         // sink of its own.
         mixer.ensure_bus("Game");
-        mixer.set_bus_eq_band("Game", 2, 3.0);
+        mixer.set_bus_eq_band("Game", 2, crate::EqBand { gain_db: 3.0, ..crate::DEFAULT_EQ_BANDS[2] });
         let id = mixer.add_source(pid, "Tone", "Game").unwrap();
         let routed = format!("{APP_SINK_PREFIX}{}_{pid}", std::process::id());
         wait_for("the tone to move to its own sink", || sink_of(&mut connection, pid).as_deref() == Some(routed.as_str()));
@@ -156,7 +156,7 @@ mod tests {
 
         // With the EQ flat, it plays straight on the channel's output (the
         // default one), still on the meter.
-        mixer.set_bus_eq_band("Game", 2, 0.0);
+        mixer.set_bus_eq_band("Game", 2, crate::EqBand { gain_db: 0.0, ..crate::DEFAULT_EQ_BANDS[2] });
         wait_for("the tone to play direct", || mixer.sources().iter().any(|source| source.id == id && source.direct));
         assert_eq!(sink_of(&mut connection, pid).as_deref(), Some(default.as_str()));
         let peak = game_peak(&mixer);
@@ -293,7 +293,7 @@ mod tests {
             mixer.set_bus_device("Game", Some(TIMING_SINK.into()));
             mixer.set_bus_priority("Game", common::Priority::High);
             if eq {
-                mixer.set_bus_eq_band("Game", 2, 3.0);
+                mixer.set_bus_eq_band("Game", 2, crate::EqBand { gain_db: 3.0, ..crate::DEFAULT_EQ_BANDS[2] });
             }
             let id = mixer.add_source(pid, "Clicks", "Game").unwrap();
             mixer.set_source_gain(id, gain);
