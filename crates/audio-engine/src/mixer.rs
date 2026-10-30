@@ -78,6 +78,10 @@ pub(crate) struct RoutePlan {
 pub(crate) struct SourceInner {
     /// `None` for the microphone source, which has no owning process.
     pub(crate) pid: Option<u32>,
+    /// The app's program as apps are saved: its lowercase executable name
+    /// ("deadlock.exe"), read when it was added. `None` for the microphone,
+    /// or if it couldn't be read.
+    program: Option<String>,
     pub(crate) name: String,
     bus: Mutex<String>,
     gain: AtomicF32,
@@ -94,6 +98,9 @@ pub(crate) struct SourceInner {
     /// channel's device: its captured audio (at the app's own volume) is
     /// then only metered and recorded, not played again.
     pub(crate) direct: AtomicBool,
+    /// Set by the capture thread once the app has exited: it captures
+    /// nothing more, and has given the app's processes back their output.
+    pub(crate) exited: AtomicBool,
     /// The app's audio processes currently turned down. Held while turning
     /// them down or restoring them, so removal can't race with the capture
     /// thread turning them down again.
@@ -148,6 +155,7 @@ impl SourceInner {
     fn new(pid: Option<u32>, name: String, bus: String, input_device: Option<String>, gain: f32, muted: bool) -> Self {
         Self {
             pid,
+            program: None,
             name,
             bus: Mutex::new(bus),
             gain: AtomicF32::new(gain),
@@ -158,6 +166,7 @@ impl SourceInner {
             stop: Arc::new(AtomicBool::new(false)),
             plan: Mutex::default(),
             direct: AtomicBool::new(false),
+            exited: AtomicBool::new(false),
             #[cfg(windows)]
             routed: Mutex::default(),
             #[cfg(not(windows))]
@@ -235,6 +244,9 @@ type SharedTap = Arc<Mutex<Option<Arc<dyn BusTap>>>>;
 pub struct SourceInfo {
     pub id: u64,
     pub pid: Option<u32>,
+    /// The app's lowercase executable name ("deadlock.exe"), read when it
+    /// was added; `None` for the microphone, or if it couldn't be read.
+    pub program: Option<String>,
     pub name: String,
     pub bus: String,
     pub gain: f32,
@@ -247,6 +259,10 @@ pub struct SourceInfo {
     /// Whether the app plays straight on its channel's device, with no
     /// delay added (see [`BusInfo::direct`]).
     pub direct: bool,
+    /// The app has closed: nothing more is captured, and it already has its
+    /// own output back. Remove it; the app, started again, is a new process
+    /// to add.
+    pub exited: bool,
 }
 
 /// A snapshot of one bus's current state for UI display.
@@ -387,7 +403,10 @@ impl Mixer {
         let bus_name = bus.into();
         self.ensure_bus(&bus_name);
 
-        let inner = Arc::new(SourceInner::new(Some(pid), name.into(), bus_name, None, 1.0, false));
+        let inner = Arc::new(SourceInner {
+            program: crate::process_executable_name(pid).map(|name| name.to_lowercase()),
+            ..SourceInner::new(Some(pid), name.into(), bus_name, None, 1.0, false)
+        });
 
         let (ready_tx, ready_rx) = mpsc::channel();
         let thread_source = inner.clone();
@@ -638,6 +657,7 @@ impl Mixer {
             .map(|(&id, s)| SourceInfo {
                 id,
                 pid: s.pid,
+                program: s.program.clone(),
                 name: s.name.clone(),
                 bus: s.bus.lock().unwrap().clone(),
                 gain: s.gain.load(),
@@ -645,6 +665,7 @@ impl Mixer {
                 level: if take_levels { s.level.take() } else { s.level.load() },
                 input_device: s.input_device.clone(),
                 direct: s.direct.load(Ordering::Relaxed),
+                exited: s.exited.load(Ordering::Relaxed),
             })
             .collect()
     }

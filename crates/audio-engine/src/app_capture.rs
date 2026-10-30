@@ -24,6 +24,7 @@ use crate::devices::default_output_device_id;
 use crate::loopback::{activate_process_loopback_client, per_app_capture_supported, standard_format};
 use crate::mixer::{SourceInner, CHANNELS, MAX_BUFFERED_SAMPLES};
 use crate::process_tree::ProcessTree;
+use crate::process_watch::ProcessWatch;
 use crate::session_volume::{self, OwnedSession, ROUTED_BOOST, ROUTED_VOLUME};
 
 const CAPTURE_BUFFER_DURATION_100NS: i64 = 2_000_000;
@@ -167,7 +168,8 @@ fn plays_on(sessions: &[OwnedSession], device: Option<&str>, direct: bool) -> bo
 /// apartment, starts capturing app `pid`'s audio, reports the outcome over
 /// `ready_tx`, then (on success) captures until `source.stop` is set. COM
 /// interface pointers are never moved across threads — each thread that
-/// uses them creates and owns them itself.
+/// uses them creates and owns them itself. Stops early, marking the source
+/// exited, once the app closes.
 pub(crate) fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: mpsc::Sender<Result<()>>) {
     let _com = match ComGuard::init() {
         Ok(com) => com,
@@ -193,6 +195,7 @@ pub(crate) fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: m
         None
     };
     let _ = ready_tx.send(Ok(()));
+    let watch = ProcessWatch::open(pid);
     let mut found = Some(app);
     let mut sessions = Vec::new();
     let mut last_scan = Instant::now();
@@ -244,8 +247,16 @@ pub(crate) fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: m
             last_routed = Instant::now() - ROUTE_ENFORCE_INTERVAL;
         }
         if last_routed.elapsed() >= ROUTE_ENFORCE_INTERVAL {
-            let routed = source.routed.lock().unwrap();
+            let mut routed = source.routed.lock().unwrap();
             if source.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if watch.as_ref().is_some_and(ProcessWatch::exited) {
+                // Closed. Helper processes can outlive it: they get their
+                // own output back.
+                session_volume::unroute(&routed);
+                routed.clear();
+                source.exited.store(true, Ordering::Relaxed);
                 break;
             }
             let plan = source.plan.lock().unwrap().clone();

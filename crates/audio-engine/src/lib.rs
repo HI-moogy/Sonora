@@ -24,6 +24,8 @@ pub mod passthrough;
 #[cfg(windows)]
 pub mod process_tree;
 #[cfg(windows)]
+mod process_watch;
+#[cfg(windows)]
 pub mod render;
 #[cfg(windows)]
 pub mod session_volume;

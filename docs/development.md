@@ -28,6 +28,7 @@ Each system provides the rest, chosen in `lib.rs`'s `platform` module:
 | | Windows (`*.rs` at the top) | Linux (`pulse/`) |
 | --- | --- | --- |
 | Capturing an app | Process loopback of the app and its helper processes; the app's own sessions are turned down (`session_volume.rs`) so only the mixer's copy is heard. When nothing needs the mixer (flat EQ, no boost), the app is pointed at its channel's device with Windows' per-app output setting (`app_output.rs`) and, once it plays there, plays direct: its sessions get the channel's volume and the capture only feeds meters and clips. The render loop decides (`RoutePlan`), the capture thread carries it out. | The app's streams move to a silent sink of its own, whose monitor is recorded. Nothing is turned down. Direct (same rule as Windows), its streams move straight to the channel's sink at the channel's volume, and each is recorded there only for the meters (`pulse/capture.rs`). |
+| An app closing | Noticed through a handle to its process (`process_watch.rs`); the source is marked exited, and the app waits in its channel to be routed again when it next plays (`app/setup.rs`). | Noticed by its process's start time (`pulse/procs.rs`); the same. |
 | Capturing the mic | WASAPI capture (`mic.rs`). | A record stream (`pulse/mic.rs`). |
 | Playing | WASAPI shared-mode client per device (`output.rs`). | A playback stream per device (`pulse/output.rs`). |
 | Voice to Discord | A virtual cable you install (VB-Cable). | Sonora's own virtual microphone, set up while it runs (`pulse/setup.rs`). |

@@ -61,6 +61,36 @@ pub(crate) fn exists(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
+/// A process watched for exiting, by when it started: once it's gone, its
+/// pid can belong to another process.
+pub(crate) struct ProcessWatch {
+    pid: u32,
+    started: u64,
+}
+
+impl ProcessWatch {
+    /// Starts watching `pid`; `None` if it can't be seen (a sandboxed app
+    /// reports its own numbering), and then whether it exits stays unknown.
+    pub(crate) fn open(pid: u32) -> Option<Self> {
+        let (_, started) = run_state(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)?;
+        Some(Self { pid, started })
+    }
+
+    /// Whether the process has exited (a zombie has, too).
+    pub(crate) fn exited(&self) -> bool {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)).unwrap_or_default();
+        run_state(&stat) != Some((true, self.started))
+    }
+}
+
+/// From a `/proc/<pid>/stat` line: whether it's still running (not a
+/// zombie), and when it started (clock ticks since boot).
+fn run_state(stat: &str) -> Option<(bool, u64)> {
+    let fields: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
+    let running = !matches!(*fields.first()?, "Z" | "X" | "x");
+    Some((running, fields.get(19)?.parse().ok()?))
+}
+
 /// The program's file name ("firefox", "Discord"), or its short name if
 /// its executable can't be read.
 pub(crate) fn executable_name(pid: u32) -> Option<String> {
@@ -95,6 +125,24 @@ mod tests {
         assert_eq!(root_with(10, parent, program), 10);
         // A process whose program can't be read is its own app.
         assert_eq!(root_with(40, parent, |_| None), 40);
+    }
+
+    #[test]
+    fn a_process_runs_until_it_is_a_zombie_or_gone() {
+        let stat = |state: &str| format!("1234 (Web Content (1)) {state} 999 1234 1234 0 -1 4194560 1 0 0 0 5 2 0 0 20 0 3 0 81234 0");
+        assert_eq!(run_state(&stat("S")), Some((true, 81234)));
+        assert_eq!(run_state(&stat("Z")), Some((false, 81234)));
+        assert_eq!(run_state("garbage"), None);
+    }
+
+    #[test]
+    fn notices_a_process_exit() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let watch = ProcessWatch::open(child.id()).unwrap();
+        assert!(!watch.exited());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(watch.exited());
     }
 
     #[test]

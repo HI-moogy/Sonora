@@ -5,6 +5,7 @@
 ### Fixed
 
 - **Windows 10**: adding an app failed with "Couldn't add that app: Catastrophic failure", then the app kept being offered again (#1). Windows 10 can't record single apps, which Sonora needs to process them. Now apps there play straight on their channel's device with the channel's volume and mute, and their meters come from Windows. The channel EQ and turning an app above 100% need Windows 11, and the channel's panel says so.
+- **An app closed and started again** (a game, say) stayed out of its channel: its meter stayed dark and its clip track silent. Sonora kept the closed app and never routed the new one. Now an app that closes goes back to "joins when it starts" in its channel, keeping its volume and mute, and rejoins as soon as it plays again.
 
 ## 0.1.0-alpha.6 (2026-10-24)
 

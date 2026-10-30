@@ -26,6 +26,7 @@ const RESCAN_INTERVAL: Duration = Duration::from_millis(500);
 /// Runs on its own thread: routes app `pid` to its own sink and records
 /// it, reports whether that worked over `ready_tx`, then records into
 /// `source.samples` until `source.stop` is set, following the route plan.
+/// Stops early, marking the source exited, once the app closes.
 pub(crate) fn run_app_capture(pid: u32, source: Arc<SourceInner>, ready_tx: mpsc::Sender<Result<()>>) {
     let _finish = FinishOnDrop(source.clone());
     let mut route = match AppRoute::start(pid, &source.name) {
@@ -38,6 +39,8 @@ pub(crate) fn run_app_capture(pid: u32, source: Arc<SourceInner>, ready_tx: mpsc
             return;
         }
     };
+    let watch = procs::ProcessWatch::open(pid);
+    let mut exited = false;
     let mut samples = Vec::new();
     let mut last_scan = Instant::now();
     let mut plan = RoutePlan::default();
@@ -59,6 +62,10 @@ pub(crate) fn run_app_capture(pid: u32, source: Arc<SourceInner>, ready_tx: mpsc
         let latest = source.plan.lock().unwrap().clone();
         let replanned = latest != plan;
         if replanned || last_scan.elapsed() >= RESCAN_INTERVAL {
+            if watch.as_ref().is_some_and(procs::ProcessWatch::exited) {
+                exited = true;
+                break;
+            }
             plan = latest;
             let was_direct = route.direct.is_some();
             route.follow(&plan);
@@ -70,7 +77,11 @@ pub(crate) fn run_app_capture(pid: u32, source: Arc<SourceInner>, ready_tx: mpsc
             last_scan = Instant::now();
         }
     }
-    // Dropping `route` gives the app back its output.
+    // Gives the app back its output (helper processes can outlive it).
+    drop(route);
+    if exited {
+        source.exited.store(true, Ordering::Relaxed);
+    }
 }
 
 /// An app routed to its own sink, with the recording of that sink; or

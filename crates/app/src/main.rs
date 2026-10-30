@@ -352,11 +352,11 @@ impl MixerApp {
         let mine: Vec<&audio_engine::SourceInfo> = sources.iter().filter(|s| s.bus == selected && s.pid.is_some()).collect();
         // A saved app with one copy already here (a second Discord, say)
         // isn't listed again as waiting.
-        let here: Vec<String> = mine.iter().filter_map(|s| self.persistence.app_of(s.id)).map(str::to_string).collect();
+        let here: Vec<&str> = mine.iter().filter_map(|s| s.program.as_deref()).collect();
         let waiting: Vec<String> = self
             .persistence
             .waiting_apps(selected)
-            .filter(|app| !here.iter().any(|exe| exe == app))
+            .filter(|app| !here.contains(app))
             .map(str::to_string)
             .collect();
         if mine.is_empty() && waiting.is_empty() {
