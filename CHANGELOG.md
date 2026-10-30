@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.9 (2026-10-30)
+
+Also brings everything in 0.1.0-alpha.8, which wasn't published on its own: the 10-band EQ like SteelSeries Sonar's, Share to Discord, and saving clips with a key on its own (see [the changelog](https://github.com/HI-moogy/Sonora/blob/main/CHANGELOG.md)).
 
 ### New
 
