@@ -40,7 +40,10 @@ pub use error::{Error, Result};
 pub use mixer::{BusInfo, BusTap, Mixer, SourceInfo};
 #[cfg(windows)]
 pub use passthrough::run_passthrough;
-pub use platform::{enumerate_sessions, list_input_devices, list_output_devices, process_executable_name, AudioDevice, AudioSession};
+pub use platform::{
+    enumerate_sessions, list_input_devices, list_output_devices, per_app_capture_supported, process_executable_name, AudioDevice,
+    AudioSession,
+};
 
 /// What each platform provides the shared mixer: capturing an app and a
 /// microphone, playing to a device, and what the mixer keeps set up while
@@ -49,6 +52,7 @@ pub use platform::{enumerate_sessions, list_input_devices, list_output_devices, 
 mod platform {
     pub(crate) use crate::app_capture::run_capture_thread as run_app_capture;
     pub use crate::devices::{list_input_devices, list_output_devices, AudioDevice};
+    pub use crate::loopback::per_app_capture_supported;
     pub(crate) use crate::mic::run_mic_capture_thread as run_mic_capture;
     pub(crate) use crate::output::DeviceOutput;
     pub use crate::sessions::{enumerate_sessions, process_executable_name, AudioSession};
@@ -84,6 +88,11 @@ mod platform {
     pub(crate) use crate::pulse::setup::MixerSetup;
 
     use crate::error::Result;
+
+    /// The sound server can always record one app (its own sink).
+    pub fn per_app_capture_supported() -> bool {
+        true
+    }
 
     /// Nothing to set up per thread: the sound server keeps time.
     pub(crate) fn audio_thread() -> Result<()> {

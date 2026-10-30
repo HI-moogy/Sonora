@@ -164,6 +164,12 @@ impl SourceInner {
         }
     }
 
+    /// For an app the mixer doesn't capture: its level, as Windows meters it.
+    #[cfg(windows)]
+    pub(crate) fn report_level(&self, peak: f32) {
+        self.level.raise_to(peak);
+    }
+
     /// Stops capturing and, for an app, gives it back its own output (on
     /// Linux its capture thread does, as it stops: see [`Self::wait_restored`]).
     fn stop_and_restore(&self) {
@@ -737,13 +743,15 @@ struct BusSnapshot {
 /// capture thread to carry out. Its bus can play direct when nothing needs
 /// the mixer: a flat EQ, a bus you hear on its own device (not a send, and
 /// not falling back to the default because its device is gone). An app
-/// turned above 100% overall still needs the mixer to boost it.
-fn update_route_plans(bus_snapshot: &[BusSnapshot], master_gain: f32) {
+/// turned above 100% overall still needs the mixer to boost it. Where the
+/// mixer can't capture apps (`can_process` false: Windows 10), direct is
+/// all there is: the EQ and boosts don't reach them.
+fn update_route_plans(bus_snapshot: &[BusSnapshot], master_gain: f32, can_process: bool) {
     for snapshot in bus_snapshot {
         let bus = &snapshot.bus;
         let flat = bus.eq.lock().unwrap().gains().iter().all(|gain| gain.abs() < 0.01);
         let bus_direct = snapshot.device_ok
-            && flat
+            && (flat || !can_process)
             && !snapshot.send
             && bus.heard.load(Ordering::Relaxed);
         bus.direct.store(bus_direct, Ordering::Relaxed);
@@ -751,7 +759,7 @@ fn update_route_plans(bus_snapshot: &[BusSnapshot], master_gain: f32) {
         for source in snapshot.members.iter().filter(|source| source.pid.is_some()) {
             let volume = if source.muted.load(Ordering::Relaxed) { 0.0 } else { source.gain.load() * bus_volume };
             let plan = RoutePlan {
-                direct: bus_direct && volume <= 1.0 + 1e-3,
+                direct: bus_direct && (volume <= 1.0 + 1e-3 || !can_process),
                 device: snapshot.device_id.clone(),
                 volume: volume.min(1.0),
             };
@@ -888,7 +896,7 @@ fn run_render_loop(
             }
         }
         let master_gain_value = master_gain.load();
-        update_route_plans(&bus_snapshot, master_gain_value);
+        update_route_plans(&bus_snapshot, master_gain_value, platform::per_app_capture_supported());
         let monitoring = bus_snapshot.iter().any(|s| s.monitor && s.device_id.is_some());
         if monitoring {
             ensure_open(&None);
@@ -1142,10 +1150,16 @@ fn run_render_loop(
         }
         // Levels accumulate until the UI takes them, so it sees every
         // block's peak however often it looks.
+        let captured = platform::per_app_capture_supported();
         for (bus_idx, BusSnapshot { bus, members, .. }) in bus_snapshot.iter().enumerate() {
             bus.level.raise_to(bus_peaks[bus_idx]);
             for (src_idx, source) in members.iter().enumerate() {
                 source.level.raise_to(source_peaks[bus_idx][src_idx]);
+                // Apps the mixer can't capture are metered by Windows; their
+                // bus shows the loudest.
+                if !captured && source.pid.is_some() {
+                    bus.level.raise_to(source.level.load());
+                }
             }
         }
         master_level.raise_to(master_peak);
@@ -1198,8 +1212,12 @@ mod tests {
     }
 
     /// The plan for one app on `bus` after a tick (`device_ok`: whether the
-    /// bus's own device opened).
+    /// bus's own device opened), where apps can be captured.
     fn plan_for(bus: &Arc<BusInner>, app: &Arc<SourceInner>, device_ok: bool, master: f32) -> RoutePlan {
+        plan_where(bus, app, device_ok, master, true)
+    }
+
+    fn plan_where(bus: &Arc<BusInner>, app: &Arc<SourceInner>, device_ok: bool, master: f32, can_process: bool) -> RoutePlan {
         let snapshot = BusSnapshot {
             name: "Game".into(),
             bus: bus.clone(),
@@ -1211,7 +1229,7 @@ mod tests {
             send: bus.send.load(Ordering::Relaxed),
             monitor: false,
         };
-        update_route_plans(&[snapshot], master);
+        update_route_plans(&[snapshot], master, can_process);
         app.plan.lock().unwrap().clone()
     }
 
@@ -1243,6 +1261,18 @@ mod tests {
 
         // So does a bus whose own device is gone (it's on its fallback).
         assert!(!plan_for(&game, &app, false, 1.0).direct);
+    }
+
+    #[test]
+    fn without_app_capture_apps_always_play_direct() {
+        let (game, app) = (bus(), source(Some(100), "Game"));
+        game.eq.lock().unwrap().set_band(2, 3.0);
+        app.gain.store(2.0);
+        // The EQ and the boost can't reach it, but its volume is capped.
+        let plan = plan_where(&game, &app, true, 1.0, false);
+        assert_eq!(plan, RoutePlan { direct: true, device: Some("headset".into()), volume: 1.0 });
+        // A bus without its device still can't play it.
+        assert!(!plan_where(&game, &app, false, 1.0, false).direct);
     }
 
     #[test]

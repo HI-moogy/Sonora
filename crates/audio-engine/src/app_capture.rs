@@ -21,7 +21,7 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::com::{ComGuard, ProAudioThread};
 use crate::devices::default_output_device_id;
-use crate::loopback::{activate_process_loopback_client, standard_format};
+use crate::loopback::{activate_process_loopback_client, per_app_capture_supported, standard_format};
 use crate::mixer::{SourceInner, CHANNELS, MAX_BUFFERED_SAMPLES};
 use crate::process_tree::ProcessTree;
 use crate::session_volume::{self, OwnedSession, ROUTED_BOOST, ROUTED_VOLUME};
@@ -48,6 +48,9 @@ const ROUTED_HEADROOM: f32 = 2.0;
 /// reading back as turned down (audio we can't reach, e.g. a child process),
 /// don't boost again for this long.
 const BOOST_BLOCK: Duration = Duration::from_secs(2);
+/// How often an app Sonora can't capture is metered from Windows' own
+/// meter.
+const UNCAPTURED_METER_INTERVAL: Duration = Duration::from_millis(20);
 /// How often an app pointed at its channel's device is looked up again
 /// while it hasn't moved there yet: its new session there is how Sonora
 /// sees that it has.
@@ -176,16 +179,20 @@ pub(crate) fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: m
     let _pro_audio = ProAudioThread::join();
 
     let app = app_audio(pid);
-    let mut capture = match LoopbackCapture::start(app.target) {
-        Ok(capture) => {
-            let _ = ready_tx.send(Ok(()));
-            capture
+    // Without per-app capture (Windows 10) the app can only play direct:
+    // nothing is captured, and it's never turned down.
+    let mut capture = if per_app_capture_supported() {
+        match LoopbackCapture::start(app.target) {
+            Ok(capture) => Some(capture),
+            Err(error) => {
+                let _ = ready_tx.send(Err(error));
+                return;
+            }
         }
-        Err(error) => {
-            let _ = ready_tx.send(Err(error));
-            return;
-        }
+    } else {
+        None
     };
+    let _ = ready_tx.send(Ok(()));
     let mut found = Some(app);
     let mut sessions = Vec::new();
     let mut last_scan = Instant::now();
@@ -211,9 +218,9 @@ pub(crate) fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: m
         }
         if let Some(app) = found.take() {
             // Keep the old capture if the new one can't start.
-            if app.target != capture.pid {
+            if capture.as_ref().is_some_and(|capture| app.target != capture.pid) {
                 if let Ok(new_capture) = LoopbackCapture::start(app.target) {
-                    capture = new_capture;
+                    capture = Some(new_capture);
                 }
             }
             let mut routed = source.routed.lock().unwrap();
@@ -248,18 +255,25 @@ pub(crate) fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: m
                 session_volume::point(&routed, wanted.as_deref());
                 pointed = Some(wanted);
             }
-            let now_direct = plan.direct && plays_on(&sessions, plan.device.as_deref(), direct);
+            // Uncaptured, it's under the channel's volume wherever it plays:
+            // it moves when it opens its audio again.
+            let now_direct =
+                plan.direct && (capture.is_none() || plays_on(&sessions, plan.device.as_deref(), direct));
             if now_direct != direct {
                 direct = now_direct;
                 session_volume::mark_direct(&sessions, direct);
                 // What's queued was captured the other way.
                 source.samples.lock().unwrap().clear();
                 source.direct.store(direct, Ordering::Relaxed);
+                if !direct && capture.is_none() {
+                    // Nothing could play it turned down: give it back its own.
+                    session_volume::unroute(&routed);
+                }
             }
             if direct {
                 session_volume::set_volume(&sessions, plan.volume);
                 all_routed = false;
-            } else {
+            } else if capture.is_some() {
                 all_routed = session_volume::enforce(&sessions);
                 if plan.direct {
                     // Pointed there: look for it playing there sooner.
@@ -269,6 +283,14 @@ pub(crate) fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: m
             last_routed = Instant::now();
         }
 
+        let Some(capture) = capture.as_ref() else {
+            // Nothing captured: Windows' own meter shows it playing.
+            std::thread::sleep(UNCAPTURED_METER_INTERVAL);
+            if direct {
+                source.report_level(sessions.iter().map(OwnedSession::peak).fold(0.0, f32::max));
+            }
+            continue;
+        };
         let wait_result = unsafe { WaitForSingleObject(capture.event, 100) };
         if wait_result != WAIT_OBJECT_0 {
             continue;

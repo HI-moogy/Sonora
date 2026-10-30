@@ -328,6 +328,13 @@ impl MixerApp {
         theme::section(ui, "EQ");
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
+            if selected != "Mic" && !audio_engine::per_app_capture_supported() {
+                ui.label(
+                    egui::RichText::new("On your Windows the EQ can't reach apps: it needs Windows 11.")
+                        .small()
+                        .color(theme::warning()),
+                );
+            }
             eq_preset_controls(ui, &self.mixer, selected, bus.eq_gains_db, &mut self.eq_presets);
             eq_controls(ui, &self.mixer, selected, bus.eq_gains_db);
         });
@@ -521,7 +528,14 @@ impl MixerApp {
 /// device (no added delay) or through Sonora, and why.
 fn route_note(ui: &mut egui::Ui, bus: &audio_engine::BusInfo) {
     let eq_on = bus.eq_gains_db.iter().any(|gain| gain.abs() >= 0.01);
-    let (text, color) = if bus.direct {
+    let (text, color) = if !audio_engine::per_app_capture_supported() {
+        (
+            "Your Windows can't record single apps (that needs Windows 11), so apps here play straight on the \
+             device at this channel's volume, with no added delay. The EQ and turning an app above 100% can't \
+             reach them, and an app that's already playing moves once it opens its sound again (restart it).",
+            theme::warning(),
+        )
+    } else if bus.direct {
         ("Apps here play straight on the device: no added delay.", theme::accent())
     } else if eq_on {
         (

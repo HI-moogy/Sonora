@@ -20,6 +20,7 @@ use std::sync::Mutex;
 
 use common::RoutedApps;
 use windows::core::{Interface, Result};
+use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
 use windows::Win32::Media::Audio::{AudioSessionStateActive, IAudioSessionControl2, ISimpleAudioVolume};
 
 use crate::app_output;
@@ -59,6 +60,7 @@ pub struct OwnedSession {
     pub device: String,
     control: IAudioSessionControl2,
     volume: ISimpleAudioVolume,
+    meter: Option<IAudioMeterInformation>,
 }
 
 impl OwnedSession {
@@ -66,6 +68,12 @@ impl OwnedSession {
     /// like the one on a device they've moved from).
     pub fn is_playing(&self) -> bool {
         unsafe { self.control.GetState() }.is_ok_and(|state| state == AudioSessionStateActive)
+    }
+
+    /// The loudest it has played since last asked, as Windows meters it
+    /// (for apps Sonora can't capture).
+    pub fn peak(&self) -> f32 {
+        self.meter.as_ref().and_then(|meter| unsafe { meter.GetPeakValue() }.ok()).unwrap_or(0.0)
     }
 
     fn volume(&self) -> Option<f32> {
@@ -92,7 +100,8 @@ fn sessions(pids: Option<&HashSet<u32>>) -> Result<Vec<OwnedSession>> {
         };
         if pid != 0 && pids.is_none_or(|pids| pids.contains(&pid)) {
             if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
-                found.push(OwnedSession { pid, device: device.to_string(), control: control.clone(), volume });
+                let meter = control.cast::<IAudioMeterInformation>().ok();
+                found.push(OwnedSession { pid, device: device.to_string(), control: control.clone(), volume, meter });
             }
         }
     })?;

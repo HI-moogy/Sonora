@@ -6,17 +6,27 @@
 //!
 //! The interface is undocumented: Windows' Settings app (and EarTrumpet)
 //! use it, through `Windows.Media.Internal.AudioPolicyConfig` (Windows 10
-//! 21H2 and later). Windows keeps the choice per app, but only takes it
-//! for a process that has an audio session, and an app's audio already
-//! playing moves only when the app opens it again.
+//! 1803 and later; its id changed in build 21390). Windows keeps the
+//! choice per app, but only takes it for a process that has an audio
+//! session, and an app's audio already playing moves only when the app
+//! opens it again.
+//!
+//! On Windows without per-app capture (Windows 10), this is the only way
+//! Sonora routes an app.
 
-use windows::core::{HRESULT, HSTRING};
+use windows::core::{Error, IUnknown, Interface, GUID, HRESULT, HSTRING};
+use windows::Win32::Foundation::E_NOINTERFACE;
 use windows::Win32::Media::Audio::{eConsole, eMultimedia, eRender, EDataFlow, ERole};
 use windows::Win32::System::WinRT::RoGetActivationFactory;
 
 /// How the policy names an output: by its device interface path.
 const PATH_PREFIX: &str = "\\\\?\\SWD#MMDEVAPI#";
 const RENDER_INTERFACE: &str = "#{e6327cad-dcec-4949-ae8a-991e976a79d2}";
+
+/// The policy's id from build 21390 on (Windows 11).
+const CURRENT_ID: GUID = GUID::from_u128(0xab3d4648_e242_459f_b02f_541c70306324);
+/// Its id before that (Windows 10), with the same methods in the same order.
+const OLDER_ID: GUID = GUID::from_u128(0x2a59116d_6c4f_45e0_a74f_707e3fef9258);
 
 /// The policy's activation factory. A WinRT interface: its first three
 /// slots are IInspectable's, and only the last three methods are used.
@@ -62,7 +72,15 @@ unsafe trait IAudioPolicyConfigFactory: windows_core::IUnknown {
 }
 
 fn policy() -> windows::core::Result<IAudioPolicyConfigFactory> {
-    unsafe { RoGetActivationFactory(&HSTRING::from("Windows.Media.Internal.AudioPolicyConfig")) }
+    let factory: IUnknown = unsafe { RoGetActivationFactory(&HSTRING::from("Windows.Media.Internal.AudioPolicyConfig"))? };
+    for id in [CURRENT_ID, OLDER_ID] {
+        let mut raw = std::ptr::null_mut();
+        if unsafe { factory.query(&id, &mut raw) }.is_ok() {
+            // Either id has the same methods in the same order.
+            return Ok(unsafe { IAudioPolicyConfigFactory::from_raw(raw) });
+        }
+    }
+    Err(Error::from(E_NOINTERFACE))
 }
 
 /// Points process `pid` (one with an audio session) at output `device_id`

@@ -22,7 +22,7 @@ Get the latest build from the [Releases](../../releases) page:
 
 | System | File |
 | --- | --- |
-| Windows 11, 64-bit | `Sonora.exe` |
+| Windows 11 (or 10), 64-bit | `Sonora.exe` |
 | Linux, 64-bit (PipeWire or PulseAudio) | `sonora-<version>-linux-x86_64.tar.gz` |
 
 ## Install
@@ -38,10 +38,11 @@ To update, quit Sonora (tray icon > **Quit**) and replace the file with the
 new `Sonora.exe`; **Start with Windows** keeps working. Settings live in
 `%APPDATA%\sonora`.
 
-You need Windows 11 (sending apps to channels relies on a Windows feature
-most Windows 10 versions lack). For clips, a graphics card that can encode
-H.264 video: almost any NVIDIA, AMD or Intel graphics from the last several
-years.
+Windows 11 is best. Windows 10 works too, but it can't record single apps,
+so there channels send apps straight to their device with the channel's
+volume, and the channel EQ and boosting an app above 100% don't reach them.
+For clips, a graphics card that can encode H.264 video: almost any NVIDIA,
+AMD or Intel graphics from the last several years.
 
 ### Linux
 

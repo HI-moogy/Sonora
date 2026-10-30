@@ -255,6 +255,13 @@ fn run_mixer(device_id: &str) -> windows::core::Result<()> {
     );
     let _ = dues.try_iter().count();
     report(device_id, &dues)?;
+    let app_meter = mixer.sources().iter().map(|source| source.level).fold(0.0f32, f32::max);
+    let channel_meter = mixer.buses().iter().find(|bus| bus.name == "Game").map_or(0.0, |bus| bus.level);
+    println!(
+        "  meters: app {:.0}%, channel {:.0}% of the click's level",
+        app_meter / AMPLITUDE * 100.0,
+        channel_meter / AMPLITUDE * 100.0
+    );
     // Its fader and its channel's still set its volume.
     mixer.set_source_gain(id, 0.5);
     std::thread::sleep(Duration::from_millis(300));

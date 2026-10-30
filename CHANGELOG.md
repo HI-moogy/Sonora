@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Windows 10**: adding an app failed with "Couldn't add that app: Catastrophic failure", then the app kept being offered again (#1). Windows 10 can't record single apps, which Sonora needs to process them. Now apps there play straight on their channel's device with the channel's volume and mute, and their meters come from Windows. The channel EQ and turning an app above 100% need Windows 11, and the channel's panel says so.
+
 ## 0.1.0-alpha.6 (2026-10-24)
 
 ### New

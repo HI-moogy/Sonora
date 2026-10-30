@@ -27,6 +27,44 @@ use windows::Win32::System::Variant::VT_BLOB;
 /// otherwise exposed as a named constant by the `windows` crate.
 const VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK: windows::core::PCWSTR = w!("VAD\\Process_Loopback");
 
+/// The first Windows build with per-app (process loopback) capture: 20348,
+/// so Windows 11. Windows 10 22H2 is build 19045.
+const FIRST_BUILD_WITH_APP_CAPTURE: u32 = 20348;
+
+/// Whether Windows can capture one app's audio, which the mixer needs to
+/// process an app (EQ, boosting it). Without it, apps can only play
+/// straight on their channel's device. `SONORA_NO_APP_CAPTURE` set makes
+/// Sonora act as if it couldn't, to try that on a newer Windows.
+pub fn per_app_capture_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        std::env::var_os("SONORA_NO_APP_CAPTURE").is_none()
+            && windows_build().is_none_or(|build| build >= FIRST_BUILD_WITH_APP_CAPTURE)
+    })
+}
+
+/// Windows' build number, as it reports it in the registry.
+fn windows_build() -> Option<u32> {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+    let mut buffer = [0u16; 32];
+    let mut size = (buffer.len() * 2) as u32;
+    unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"),
+            w!("CurrentBuildNumber"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buffer.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    }
+    .ok()
+    .ok()?;
+    let len = (size as usize / 2).saturating_sub(1);
+    String::from_utf16_lossy(&buffer[..len]).trim().parse().ok()
+}
+
 /// The format every capture/render stream in this engine is standardized
 /// on, so sources can be mixed without per-source resampling.
 pub fn standard_format() -> WAVEFORMATEX {
