@@ -5,8 +5,12 @@ use bytes::Bytes;
 /// One encoded video frame ready for MP4 (length-prefixed NAL units).
 #[derive(Clone)]
 pub(crate) struct VideoSample {
-    /// Presentation time in 100 ns units since the recorder started.
+    /// When it's decoded, in 100 ns units since the recorder started (or
+    /// the clip's start); also when it's shown, unless `shown_after`.
     pub pts: i64,
+    /// How much later than `pts` it's shown (frame reordering, as other
+    /// recorders' clips use; never in Sonora's own video).
+    pub shown_after: i64,
     pub keyframe: bool,
     pub data: Bytes,
 }
@@ -96,7 +100,7 @@ mod tests {
     use super::*;
 
     fn frame(pts: i64, keyframe: bool) -> VideoSample {
-        VideoSample { pts, keyframe, data: Bytes::from(vec![0u8; 10]) }
+        VideoSample { pts, shown_after: 0, keyframe, data: Bytes::from(vec![0u8; 10]) }
     }
 
     /// Frames every 10 time units, a keyframe every 4th frame.

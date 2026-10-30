@@ -420,7 +420,7 @@ impl Session {
             if unit.pps.is_some() {
                 *pps = unit.pps;
             }
-            ring.push(VideoSample { pts: frame.pts, keyframe: unit.keyframe, data: unit.avcc.into() });
+            ring.push(VideoSample { pts: frame.pts, shown_after: 0, keyframe: unit.keyframe, data: unit.avcc.into() });
         })
     }
 

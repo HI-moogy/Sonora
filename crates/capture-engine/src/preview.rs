@@ -9,6 +9,8 @@
 //! on the GPU would take ~4x less CPU, but its decoder surfaces cost
 //! ~100 MB.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::BufReader;
 use std::mem::ManuallyDrop;
@@ -29,7 +31,7 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 
 use crate::com::MfThread;
-use crate::edit::{open_mp4, read_layout, ticks_to_hns, EditError};
+use crate::edit::{open_mp4, read_layout, track_shifts, EditError, FrameTimes};
 use crate::h264::append_annex_b;
 
 /// Decoded frames kept ready beyond the one on screen.
@@ -126,6 +128,10 @@ struct Position {
     /// Frames before this are decoded but not shown (seeking starts at the
     /// keyframe before the target).
     skip_before: i64,
+    /// When each frame sent and not yet decoded shows. Pictures come out in
+    /// the order they show, so each is the earliest of these; the decoder's
+    /// own times can't be trusted (it gives the last one drained none).
+    sent: BinaryHeap<Reverse<i64>>,
     draining: bool,
     ended: bool,
 }
@@ -134,7 +140,14 @@ impl Position {
     fn start(clip: &ClipVideo, decoder: &H264Decoder, to: i64, seek: u64) -> windows::core::Result<Self> {
         decoder.flush()?;
         let target = clip.frame_at(to);
-        Ok(Self { seek, next: clip.keyframe_at_or_before(target), skip_before: clip.times[target], draining: false, ended: false })
+        Ok(Self {
+            seek,
+            next: clip.keyframe_at_or_before(target),
+            skip_before: clip.shown[target],
+            sent: BinaryHeap::new(),
+            draining: false,
+            ended: false,
+        })
     }
 }
 
@@ -147,7 +160,7 @@ fn decode(
 ) -> Result<(), EditError> {
     let mut clip = ClipVideo::open(path)?;
     let _mf = MfThread::init()?;
-    let mut decoder = H264Decoder::new(clip.width, clip.height)?;
+    let mut decoder = H264Decoder::new(clip.width, clip.height, !clip.reordered)?;
     let scaler = Scaler::new(clip.width as usize, clip.height as usize, max_width as usize);
     let mut annex_b = Vec::new();
     let mut at = Position::start(&clip, &decoder, 0, 0)?;
@@ -169,10 +182,11 @@ fn decode(
             None => {}
         }
 
-        let Some(pts) = decoder.receive()? else {
+        let Some(pts) = decoder.receive()?.and_then(|_| at.sent.pop()).map(|Reverse(shown)| shown) else {
             if at.next < clip.len() {
                 clip.read(at.next, &mut annex_b)?;
-                decoder.send(&annex_b, clip.times[at.next], clip.times[at.next + 1] - clip.times[at.next])?;
+                decoder.send(&annex_b, clip.shown[at.next], clip.durations[at.next])?;
+                at.sent.push(Reverse(clip.shown[at.next]));
                 at.next += 1;
             } else if !at.draining {
                 decoder.drain()?;
@@ -220,8 +234,15 @@ struct ClipVideo {
     /// SPS and PPS in Annex B, sent ahead of every keyframe so decoding can
     /// start at any of them.
     parameter_sets: Vec<u8>,
-    /// Each sample's start, then the end of the last, in 100 ns units.
-    times: Vec<i64>,
+    /// When each sample (in decode order) shows in the clip, in 100 ns units.
+    shown: Vec<i64>,
+    /// How long each sample shows.
+    durations: Vec<i64>,
+    /// The samples in the order they show.
+    by_shown: Vec<usize>,
+    /// Whether samples show in another order than they decode (B-frames,
+    /// as other recorders use).
+    reordered: bool,
     /// Indices of keyframes, ascending.
     keyframes: Vec<usize>,
 }
@@ -236,35 +257,34 @@ impl ClipVideo {
             parameter_sets.extend_from_slice(&[0, 0, 0, 1]);
             parameter_sets.extend_from_slice(nal);
         }
-        let timescale = track.timescale() as i64;
         let stbl = &track.trak.mdia.minf.stbl;
-        let mut times = vec![0];
-        let mut ticks = 0i64;
-        for entry in &stbl.stts.entries {
-            for _ in 0..entry.sample_count {
-                ticks += entry.sample_delta as i64;
-                times.push(ticks_to_hns(ticks, timescale));
-            }
-        }
-        let count = times.len() - 1;
+        let times = FrameTimes::of_track(track);
+        let count = times.decode.len();
         if count == 0 || count != track.sample_count() as usize {
             return Err(EditError::Unsupported("video sample times don't match its samples"));
         }
+        let shift = track_shifts(&mp4, &read_layout(&mp4)?).video;
+        let shown: Vec<i64> = times.decode.iter().zip(&times.shown_after).map(|(decode, after)| decode + after + shift).collect();
+        let durations: Vec<i64> = (0..count).map(|i| times.decode.get(i + 1).copied().unwrap_or(times.end) - times.decode[i]).collect();
+        let mut by_shown: Vec<usize> = (0..count).collect();
+        by_shown.sort_by_key(|&index| shown[index]);
+        let reordered = times.shown_after.iter().any(|&after| after != times.shown_after[0]);
         let keyframes = match &stbl.stss {
             Some(stss) => stss.entries.iter().map(|&id| id as usize - 1).filter(|&index| index < count).collect(),
             None => (0..count).collect(),
         };
         let (width, height) = (track.width() as u32, track.height() as u32);
-        Ok(Self { track: track_id, width, height, parameter_sets, times, keyframes, mp4 })
+        Ok(Self { track: track_id, width, height, parameter_sets, shown, durations, by_shown, reordered, keyframes, mp4 })
     }
 
     fn len(&self) -> usize {
-        self.times.len() - 1
+        self.shown.len()
     }
 
-    /// The frame showing at `pts` (the first or last outside the clip).
+    /// The sample showing at `pts` (the first or last outside the clip).
     fn frame_at(&self, pts: i64) -> usize {
-        self.times[..self.len()].partition_point(|&start| start <= pts).saturating_sub(1)
+        let showing = self.by_shown.partition_point(|&index| self.shown[index] <= pts).saturating_sub(1);
+        self.by_shown[showing]
     }
 
     fn keyframe_at_or_before(&self, index: usize) -> usize {
@@ -275,9 +295,6 @@ impl ClipVideo {
     /// Reads sample `index` into `annex_b`, ready to decode.
     fn read(&mut self, index: usize, annex_b: &mut Vec<u8>) -> Result<(), EditError> {
         let sample = self.mp4.read_sample(self.track, index as u32 + 1)?.ok_or(EditError::Unsupported("missing video sample"))?;
-        if sample.rendering_offset != 0 {
-            return Err(EditError::Unsupported("video uses frame reordering"));
-        }
         annex_b.clear();
         if self.keyframes.binary_search(&index).is_ok() {
             annex_b.extend_from_slice(&self.parameter_sets);
@@ -297,12 +314,16 @@ struct H264Decoder {
 }
 
 impl H264Decoder {
-    fn new(width: u32, height: u32) -> windows::core::Result<Self> {
+    /// `low_latency` suits video whose frames aren't reordered (Sonora's):
+    /// reordered video needs the decoder to hold frames back to sort them.
+    fn new(width: u32, height: u32, low_latency: bool) -> windows::core::Result<Self> {
         let transform: IMFTransform = unsafe { CoCreateInstance(&CLSID_H264_DECODER, None, CLSCTX_INPROC_SERVER)? };
         // Low latency (no frame threading) has to be chosen before the media
         // types are set: otherwise the decoder keeps a set of frame buffers
         // per core, ~110 MB for 1080p.
-        unsafe { transform.GetAttributes()?.SetUINT32(&MF_LOW_LATENCY, 1)? };
+        if low_latency {
+            unsafe { transform.GetAttributes()?.SetUINT32(&MF_LOW_LATENCY, 1)? };
+        }
         let input = unsafe { MFCreateMediaType()? };
         unsafe {
             input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -359,7 +380,7 @@ impl H264Decoder {
     }
 
     /// Decodes the next picture into the output sample and returns its
-    /// time, or `None` if the decoder needs more input.
+    /// time (as the decoder gives it), or `None` if it needs more input.
     fn receive(&mut self) -> windows::core::Result<Option<i64>> {
         loop {
             let mut output = [MFT_OUTPUT_DATA_BUFFER {

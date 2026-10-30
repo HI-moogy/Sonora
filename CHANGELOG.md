@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- **Radeon clips wouldn't open** ("video uses frame reordering"), nor other recorders' clips made the same way: they now play, edit and save, with their sound where their recorder put it.
 - **Discord streams of a game had no sound** when the game's channel had its EQ on: Sonora turns a game's own sound down while it plays its copy through the EQ, and a stream of the game's window records the game's own sound. Pick an output you never listen to in **Menu > Discord streams…** and apps play their own sound there at full volume instead, so streams hear them while you hear Sonora's copy. A game that's already playing keeps its sound (without the EQ) until it opens its sound again.
 
 ## 0.1.0-alpha.8 (2026-10-30)

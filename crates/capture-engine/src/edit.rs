@@ -119,20 +119,19 @@ impl ClipTimeline {
     pub fn read(path: &Path) -> Result<Self, EditError> {
         let mp4 = open_mp4(path)?;
         let layout = read_layout(&mp4)?;
-        Ok(Self::of_track(&mp4.tracks()[&layout.video]))
+        let shifts = track_shifts(&mp4, &layout);
+        Ok(Self::of_track(&mp4.tracks()[&layout.video], shifts.video))
     }
 
-    fn of_track(track: &mp4::Mp4Track) -> Self {
+    /// The frames in decode order, at when they show in the clip (`shift`:
+    /// where the video's own time 0 plays). With frame reordering, frames
+    /// between keyframes are placed as decoded, a frame or two from when
+    /// they show; keyframes, where cuts go, show exactly when placed.
+    fn of_track(track: &mp4::Mp4Track, shift: i64) -> Self {
         let stbl = &track.trak.mdia.minf.stbl;
-        let timescale = track.timescale() as i64;
-        let mut frame_times = Vec::new();
-        let mut ticks = 0i64;
-        for entry in &stbl.stts.entries {
-            for _ in 0..entry.sample_count {
-                frame_times.push(ticks_to_hns(ticks, timescale));
-                ticks += entry.sample_delta as i64;
-            }
-        }
+        let times = FrameTimes::of_track(track);
+        let delay = times.shown_after.first().copied().unwrap_or(0) + shift;
+        let frame_times: Vec<i64> = times.decode.iter().map(|decode| decode + delay).collect();
         // No sync sample table means every frame is a keyframe.
         let keyframes = match &stbl.stss {
             Some(stss) => {
@@ -146,7 +145,7 @@ impl ClipTimeline {
             }
             None => vec![true; frame_times.len()],
         };
-        Self { frame_times, keyframes, end: ticks_to_hns(ticks, timescale) }
+        Self { frame_times, keyframes, end: times.end + delay }
     }
 
     /// What a save keeps of the parts `wanted` (`(start, end)` in 100 ns
@@ -208,9 +207,80 @@ fn cut_audio(audio: &ClipAudio, parts: &[KeptPart]) -> ClipAudio {
     ClipAudio { tracks, frames }
 }
 
-/// Where a clip's tracks are, from its MP4 header. Only the layout
-/// Sonora writes is accepted: one H.264 track without frame reordering,
-/// and 48 kHz stereo AAC tracks.
+/// A video track's frames in decode order, from the MP4's index alone:
+/// when each is decoded, and how much later it's shown (frame reordering,
+/// as other recorders use; Sonora's own video has none), in 100 ns units.
+pub(crate) struct FrameTimes {
+    pub decode: Vec<i64>,
+    pub shown_after: Vec<i64>,
+    /// When the last frame's decode slot ends.
+    pub end: i64,
+}
+
+impl FrameTimes {
+    pub(crate) fn of_track(track: &mp4::Mp4Track) -> Self {
+        let stbl = &track.trak.mdia.minf.stbl;
+        let timescale = (track.timescale() as i64).max(1);
+        let mut decode = Vec::new();
+        let mut ticks = 0i64;
+        for entry in &stbl.stts.entries {
+            for _ in 0..entry.sample_count {
+                decode.push(ticks_to_hns(ticks, timescale));
+                ticks += entry.sample_delta as i64;
+            }
+        }
+        let mut shown_after: Vec<i64> = match &stbl.ctts {
+            Some(ctts) => ctts
+                .entries
+                .iter()
+                .flat_map(|entry| std::iter::repeat_n(entry.sample_offset as i64, entry.sample_count as usize))
+                .map(|offset| offset.signum() * ticks_to_hns(offset.abs(), timescale))
+                .collect(),
+            None => Vec::new(),
+        };
+        shown_after.resize(decode.len(), 0);
+        Self { decode, shown_after, end: ticks_to_hns(ticks, timescale) }
+    }
+}
+
+/// Where each track's own time 0 plays in the clip, in 100 ns units: by
+/// the edit lists players follow (other recorders write them; Sonora's
+/// clips have none), shifted so the earliest track starts at 0.
+pub(crate) struct TrackShifts {
+    pub video: i64,
+    /// In layout order.
+    pub audio: Vec<i64>,
+}
+
+pub(crate) fn track_shifts<R: Read + Seek>(mp4: &Mp4Reader<R>, layout: &Layout) -> TrackShifts {
+    let video = &mp4.tracks()[&layout.video];
+    let times = FrameTimes::of_track(video);
+    let first_shown = times.decode.iter().zip(&times.shown_after).map(|(decode, after)| decode + after).min().unwrap_or(0);
+    let video_shift = edit_shift(mp4, video);
+    let audio: Vec<i64> = layout.audio.iter().map(|id| edit_shift(mp4, &mp4.tracks()[id])).collect();
+    let origin = audio.iter().copied().chain([video_shift + first_shown]).min().unwrap_or(0);
+    TrackShifts { video: video_shift - origin, audio: audio.into_iter().map(|shift| shift - origin).collect() }
+}
+
+/// Where `track`'s own time 0 plays in the movie, by its edit list: after
+/// any empty edits, less the media time its first real edit starts at.
+fn edit_shift<R: Read + Seek>(mp4: &Mp4Reader<R>, track: &mp4::Mp4Track) -> i64 {
+    let Some(elst) = track.trak.edts.as_ref().and_then(|edts| edts.elst.as_ref()) else { return 0 };
+    let movie_scale = i64::from(mp4.moov.mvhd.timescale.max(1));
+    let mut lead = 0;
+    for entry in &elst.entries {
+        // An empty edit plays nothing for its duration (media time -1).
+        if entry.media_time != u64::from(u32::MAX) && entry.media_time != u64::MAX {
+            return lead - ticks_to_hns(entry.media_time as i64, (track.timescale() as i64).max(1));
+        }
+        lead += ticks_to_hns(entry.segment_duration as i64, movie_scale);
+    }
+    lead
+}
+
+/// Where a clip's tracks are, from its MP4 header. Only clips like Sonora's
+/// are accepted: one H.264 track (frames may be reordered), and 48 kHz
+/// stereo AAC tracks.
 pub(crate) struct Layout {
     pub video: u32,
     pub audio: Vec<u32>,
@@ -254,22 +324,27 @@ pub(crate) fn open_mp4(path: &Path) -> Result<Mp4Reader<BufReader<File>>, EditEr
 pub fn decode_clip_audio(path: &Path) -> Result<ClipAudio, EditError> {
     let mut mp4 = open_mp4(path)?;
     let layout = read_layout(&mp4)?;
+    let shifts = track_shifts(&mp4, &layout);
     let _mf = MfThread::init()?;
     let mut tracks = Vec::with_capacity(layout.audio.len());
     let mut frames = 0;
-    for &track_id in &layout.audio {
+    for (&track_id, &shift) in layout.audio.iter().zip(&shifts.audio) {
         let mut decoder = AacDecoder::new()?;
         let mut samples: Vec<i16> = Vec::new();
         let mut loudest = 0i16;
         // Players place decoded audio by timestamp, so do the same: that
-        // keeps any decoder delay exactly as a player would hear it.
+        // keeps any decoder delay exactly as a player would hear it. Where
+        // the track starts in the clip moves it all.
         let mut place = |time: i64, pcm: Bytes| {
-            let at = (time * SAMPLE_RATE as i64 + HNS_PER_SECOND / 2).div_euclid(HNS_PER_SECOND).max(0) as usize * CHANNELS;
+            let at = ((time + shift) * SAMPLE_RATE as i64 + HNS_PER_SECOND / 2).div_euclid(HNS_PER_SECOND) * CHANNELS as i64;
             let pcm: Vec<i16> = pcm.as_chunks::<2>().0.iter().map(|&bytes| i16::from_le_bytes(bytes)).collect();
+            // What plays before the clip starts is cut.
+            let skip = (-at).clamp(0, pcm.len() as i64) as usize;
+            let (at, pcm) = ((at.max(0)) as usize, &pcm[skip..]);
             if samples.len() < at + pcm.len() {
                 samples.resize(at + pcm.len(), 0);
             }
-            samples[at..at + pcm.len()].copy_from_slice(&pcm);
+            samples[at..at + pcm.len()].copy_from_slice(pcm);
             loudest = pcm.iter().fold(loudest, |loudest, s| loudest.max(s.saturating_abs()));
         };
         for id in 1..=mp4.sample_count(track_id)? {
@@ -300,16 +375,19 @@ pub fn save_edited_clip(source: &Path, destination: &Path, audio: &ClipAudio, ed
     let (width, height) = (video.width(), video.height());
     let (sps, pps) = (video.sequence_parameter_set()?.to_vec(), video.picture_parameter_set()?.to_vec());
     let timescale = video.timescale() as i64;
-    let timeline = ClipTimeline::of_track(video);
+    let shifts = track_shifts(&mp4, &layout);
+    let timeline = ClipTimeline::of_track(video, shifts.video);
+    let times = FrameTimes::of_track(video);
     let mut frames = Vec::new();
     let mut last_duration = 0;
     for id in 1..=mp4.sample_count(layout.video)? {
         let sample = mp4.read_sample(layout.video, id)?.ok_or(EditError::Unsupported("missing video sample"))?;
-        if sample.rendering_offset != 0 {
-            return Err(EditError::Unsupported("video uses frame reordering"));
-        }
+        let index = id as usize - 1;
+        // Reordered frames keep their order; the copy has no edit list, so
+        // its first frame shows as late as it's reordered (a frame or two).
         frames.push(VideoSample {
-            pts: ticks_to_hns(sample.start_time as i64, timescale),
+            pts: timeline.frame_times.get(index).copied().unwrap_or_default(),
+            shown_after: times.shown_after.get(index).copied().unwrap_or_default(),
             keyframe: sample.is_sync,
             data: sample.bytes,
         });
@@ -329,7 +407,7 @@ pub fn save_edited_clip(source: &Path, destination: &Path, audio: &ClipAudio, ed
             let mut offset = 0;
             for part in &parts {
                 for frame in &frames[part.first_frame..part.end_frame] {
-                    kept.push(VideoSample { pts: frame.pts - part.start + offset, keyframe: frame.keyframe, data: frame.data.clone() });
+                    kept.push(VideoSample { pts: frame.pts - part.start + offset, ..frame.clone() });
                 }
                 offset += part.end - part.start;
             }
@@ -360,7 +438,9 @@ pub fn save_edited_clip(source: &Path, destination: &Path, audio: &ClipAudio, ed
         }
         let Some(volume) = edit.keep[index] else { continue };
         let original_frames = mp4.sample_count(track_id)? as usize;
-        tracks.push(if volume == 1.0 || audio.tracks[index].is_silent() {
+        // Copied only when it starts with the clip (the copy has no edit
+        // list to move it).
+        tracks.push(if (volume == 1.0 && shifts.audio[index] == 0) || audio.tracks[index].is_silent() {
             (1..=original_frames as u32)
                 .map(|id| {
                     let sample = mp4.read_sample(track_id, id)?.ok_or(EditError::Unsupported("missing audio sample"))?;
@@ -370,12 +450,14 @@ pub fn save_edited_clip(source: &Path, destination: &Path, audio: &ClipAudio, ed
         } else {
             let mut weights = vec![0.0; audio.tracks.len()];
             weights[index] = volume;
-            encode_mix(audio, &weights, original_frames)?
+            // Moved later in the clip, it runs that much longer.
+            encode_mix(audio, &weights, original_frames.max(audio.frames.div_ceil(BLOCK_FRAMES as usize)))?
         });
     }
     if cut.is_none() {
         let longest = layout.audio.iter().map(|&id| mp4.sample_count(id)).collect::<Result<Vec<_>, _>>()?.into_iter().max().unwrap_or(0);
-        tracks.push(encode_mix(audio, &edit.mix, longest as usize)?);
+        let blocks = (longest as usize).max(audio.frames.div_ceil(BLOCK_FRAMES as usize));
+        tracks.push(encode_mix(audio, &edit.mix, blocks)?);
     }
 
     let clip = Clip {

@@ -28,7 +28,7 @@ fn main() {
     report(&audio);
 
     let started = Instant::now();
-    save_edited_clip(Path::new(source), Path::new(destination), &audio, &ClipEdit { keep: keep.clone(), mix })
+    save_edited_clip(Path::new(source), Path::new(destination), &audio, &ClipEdit { keep: keep.clone(), mix, parts: None })
         .expect("save edited clip");
     println!("saved in {:?}", started.elapsed());
 

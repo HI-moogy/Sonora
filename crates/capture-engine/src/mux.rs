@@ -76,7 +76,7 @@ pub(crate) fn write_clip(path: &Path, video: &Clip) -> Result<(), SaveError> {
             &Mp4Sample {
                 start_time: start,
                 duration: end.saturating_sub(start).max(1) as u32,
-                rendering_offset: 0,
+                rendering_offset: to_ticks(frame.shown_after.max(0)) as i32,
                 is_sync: frame.keyframe,
                 bytes: frame.data.clone(),
             },

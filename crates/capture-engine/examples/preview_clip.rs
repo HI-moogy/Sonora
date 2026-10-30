@@ -17,6 +17,8 @@ fn main() {
     let started = Instant::now();
     let mut preview = VideoPreview::open(Path::new(&path), max_width, || {});
     let (mut frames, mut last_pts, mut size) = (0, 0, (0, 0));
+    // Frames should come in the order they show.
+    let mut out_of_order = 0;
     let mut first_at = None;
     let mut idle = Instant::now();
     while idle.elapsed() < Duration::from_secs(1) {
@@ -24,6 +26,9 @@ fn main() {
             Some(Ok(frame)) => {
                 first_at.get_or_insert(started.elapsed());
                 frames += 1;
+                if frames > 1 && frame.pts <= last_pts {
+                    out_of_order += 1;
+                }
                 last_pts = frame.pts;
                 size = (frame.width, frame.height);
                 idle = Instant::now();
@@ -34,7 +39,7 @@ fn main() {
     }
     let elapsed = started.elapsed() - Duration::from_secs(1);
     println!(
-        "{frames} frames at {}x{}, last at {:.3}s; first after {:?}, all in {elapsed:?} ({:.0} fps)",
+        "{frames} frames at {}x{} ({out_of_order} out of order), last at {:.3}s; first after {:?}, all in {elapsed:?} ({:.0} fps)",
         size.0,
         size.1,
         last_pts as f64 / 1e7,
