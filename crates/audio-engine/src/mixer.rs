@@ -73,6 +73,11 @@ pub(crate) struct RoutePlan {
     /// The app's own volume while direct: its fader times its channel's
     /// and the master (0 when either is muted).
     pub(crate) volume: f32,
+    /// Not direct, an app is turned down, and other apps recording it (a
+    /// Discord stream of its window) hear nothing. Given an output nobody
+    /// listens to (see [`Mixer::set_silent_output`]), it plays there at
+    /// full volume instead (Windows).
+    pub(crate) park: Option<String>,
 }
 
 pub(crate) struct SourceInner {
@@ -313,6 +318,8 @@ pub struct Mixer {
     render_stop: Arc<AtomicBool>,
     bus_tap: SharedTap,
     mic_cleanup: Arc<MicCleanup>,
+    /// See [`Self::set_silent_output`].
+    silent_output: Arc<Mutex<Option<String>>>,
     /// What the platform set up for the mixer (on Linux, the virtual mic);
     /// taken down with it.
     _platform: platform::MixerSetup,
@@ -330,6 +337,7 @@ impl Mixer {
         let master_level = Arc::new(AtomicF32::new(0.0));
         let render_stop = Arc::new(AtomicBool::new(false));
         let bus_tap: SharedTap = Arc::new(Mutex::new(None));
+        let silent_output = Arc::new(Mutex::new(None));
 
         {
             let sources = sources.clone();
@@ -338,6 +346,7 @@ impl Mixer {
             let master_level = master_level.clone();
             let render_stop = render_stop.clone();
             let bus_tap = bus_tap.clone();
+            let silent_output = silent_output.clone();
             std::thread::Builder::new()
                 .name("mixer-render".into())
                 .spawn(move || {
@@ -348,6 +357,7 @@ impl Mixer {
                         master_level,
                         render_stop,
                         bus_tap,
+                        silent_output,
                     ) {
                         eprintln!("mixer render thread exited with error: {error:?}");
                     }
@@ -364,8 +374,23 @@ impl Mixer {
             render_stop,
             bus_tap,
             mic_cleanup: Arc::default(),
+            silent_output,
             _platform: platform_setup,
         })
+    }
+
+    /// An output nobody listens to (a monitor's unused speakers, say), or
+    /// `None`. Apps the mixer plays (with the EQ on, say) are normally
+    /// turned down, so only its copy is heard; other apps recording them,
+    /// like a Discord stream of a game's window, then record silence. Given
+    /// this output, they play their own sound there at full volume instead,
+    /// once they open their sound again (Windows' per-app output setting).
+    pub fn set_silent_output(&self, device_id: Option<String>) {
+        *self.silent_output.lock().unwrap() = device_id;
+    }
+
+    pub fn silent_output(&self) -> Option<String> {
+        self.silent_output.lock().unwrap().clone()
     }
 
     /// The microphone's noise removal settings and before/after test.
@@ -800,7 +825,7 @@ struct BusSnapshot {
 /// An app turned above 100% overall still needs the mixer to boost it. Where
 /// the mixer can't capture apps (`can_process` false: Windows 10), direct is
 /// all there is: the EQ, surround and boosts don't reach them.
-fn update_route_plans(bus_snapshot: &[BusSnapshot], master_gain: f32, can_process: bool) {
+fn update_route_plans(bus_snapshot: &[BusSnapshot], master_gain: f32, can_process: bool, silent_output: Option<&str>) {
     for snapshot in bus_snapshot {
         let bus = &snapshot.bus;
         let flat = bus.eq.lock().unwrap().is_flat();
@@ -813,11 +838,12 @@ fn update_route_plans(bus_snapshot: &[BusSnapshot], master_gain: f32, can_proces
         let bus_volume = if bus.muted.load(Ordering::Relaxed) { 0.0 } else { bus.gain.load() * master_gain };
         for source in snapshot.members.iter().filter(|source| source.pid.is_some()) {
             let volume = if source.muted.load(Ordering::Relaxed) { 0.0 } else { source.gain.load() * bus_volume };
-            let plan = RoutePlan {
-                direct: bus_direct && (volume <= 1.0 + 1e-3 || !can_process),
-                device: snapshot.device_id.clone(),
-                volume: volume.min(1.0),
-            };
+            let direct = bus_direct && (volume <= 1.0 + 1e-3 || !can_process);
+            // Never on the very device the channel plays on: it'd be heard twice.
+            let park = silent_output
+                .filter(|silent| !direct && can_process && snapshot.device_id.as_deref() != Some(*silent))
+                .map(str::to_string);
+            let plan = RoutePlan { direct, device: snapshot.device_id.clone(), volume: volume.min(1.0), park };
             let mut current = source.plan.lock().unwrap();
             if *current != plan {
                 *current = plan;
@@ -865,6 +891,7 @@ fn run_render_loop(
     master_level: Arc<AtomicF32>,
     stop: Arc<AtomicBool>,
     bus_tap: SharedTap,
+    silent_output: Arc<Mutex<Option<String>>>,
 ) -> Result<()> {
     let _thread = platform::audio_thread()?;
     let mut device_outputs: HashMap<Option<String>, DeviceOutput> = HashMap::new();
@@ -951,7 +978,6 @@ fn run_render_loop(
             }
         }
         let master_gain_value = master_gain.load();
-        update_route_plans(&bus_snapshot, master_gain_value, platform::per_app_capture_supported());
         let monitoring = bus_snapshot.iter().any(|s| s.monitor && s.device_id.is_some());
         if monitoring {
             ensure_open(&None);
@@ -961,6 +987,10 @@ fn run_render_loop(
         device_outputs.retain(|device_id, _| {
             bus_snapshot.iter().any(|s| s.device_id == *device_id) || (device_id.is_none() && monitoring)
         });
+        // Never the default output: that's heard.
+        let default_id = device_outputs.get(&None).and_then(|default| default.endpoint_id()).map(str::to_string);
+        let silent = silent_output.lock().unwrap().clone().filter(|silent| Some(silent) != default_id.as_ref());
+        update_route_plans(&bus_snapshot, master_gain_value, platform::per_app_capture_supported(), silent.as_deref());
         // A monitor copy plays on the default device. When that's the very
         // device the bus plays on (Windows' default output set to the
         // virtual cable), the copy would land there too, a few ms after the
@@ -1309,8 +1339,37 @@ mod tests {
             send: bus.send.load(Ordering::Relaxed),
             monitor: false,
         };
-        update_route_plans(&[snapshot], master, can_process);
+        update_route_plans(&[snapshot], master, can_process, None);
         app.plan.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn apps_through_the_mixer_play_on_the_silent_output_given_one() {
+        let (game, app) = (bus(), source(Some(100), "Game"));
+        *game.device_id.lock().unwrap() = Some("headset".into());
+        game.eq.lock().unwrap().set_band(2, raised(3.0));
+        let plan_with = |silent: &str, can_process: bool| {
+            let snapshot = BusSnapshot {
+                name: "Game".into(),
+                bus: game.clone(),
+                members: vec![app.clone()],
+                members_direct: vec![false],
+                device_id: game.device_id.lock().unwrap().clone(),
+                device_ok: true,
+                priority: Priority::High,
+                send: false,
+                monitor: false,
+            };
+            update_route_plans(&[snapshot], 1.0, can_process, Some(silent));
+            app.plan.lock().unwrap().clone()
+        };
+        assert_eq!(plan_with("unused-hdmi", true).park.as_deref(), Some("unused-hdmi"));
+        assert_eq!(plan_with("headset", true).park, None, "not where the channel itself plays");
+        assert_eq!(plan_with("unused-hdmi", false).park, None, "Windows 10 apps play direct anyway");
+        game.eq.lock().unwrap().set_band(2, raised(0.0));
+        let direct = plan_with("unused-hdmi", true);
+        assert!(direct.direct);
+        assert_eq!(direct.park, None, "a direct app plays on its channel's device");
     }
 
     #[test]
@@ -1319,12 +1378,12 @@ mod tests {
         game.gain.store(0.5);
         app.gain.store(0.8);
         let plan = plan_for(&game, &app, true, 1.0);
-        assert_eq!(plan, RoutePlan { direct: true, device: Some("headset".into()), volume: 0.4 });
+        assert_eq!(plan, RoutePlan { direct: true, device: Some("headset".into()), volume: 0.4, park: None });
         assert!(game.direct.load(Ordering::Relaxed));
 
         // Muted, it still plays direct, at no volume.
         game.muted.store(true, Ordering::Relaxed);
-        assert_eq!(plan_for(&game, &app, true, 1.0), RoutePlan { direct: true, device: Some("headset".into()), volume: 0.0 });
+        assert_eq!(plan_for(&game, &app, true, 1.0), RoutePlan { direct: true, device: Some("headset".into()), volume: 0.0, park: None });
         game.muted.store(false, Ordering::Relaxed);
 
         // Above 100% overall, only the mixer can boost it.
@@ -1357,7 +1416,7 @@ mod tests {
         app.gain.store(2.0);
         // The EQ and the boost can't reach it, but its volume is capped.
         let plan = plan_where(&game, &app, true, 1.0, false);
-        assert_eq!(plan, RoutePlan { direct: true, device: Some("headset".into()), volume: 1.0 });
+        assert_eq!(plan, RoutePlan { direct: true, device: Some("headset".into()), volume: 1.0, park: None });
         // A bus without its device still can't play it.
         assert!(!plan_where(&game, &app, false, 1.0, false).direct);
     }

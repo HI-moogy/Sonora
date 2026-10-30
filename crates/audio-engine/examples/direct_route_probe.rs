@@ -10,15 +10,20 @@
 //! The clicks are at -80 dB, inaudible on the default device the child
 //! starts on, and still found in the captured output.
 //!
-//! Usage: direct_route_probe <part of a device name> [mixer | recover <pid>]
+//! `park` routes the child through the mixer with the EQ on, the device
+//! named set as the silent output: once the child reopens its audio it
+//! should play there at full volume, and a recording of the child (as a
+//! Discord stream of its window makes) should hear it at full volume too.
+//!
+//! Usage: direct_route_probe <part of a device name> [mixer | park | recover <pid>]
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use audio_engine::loopback::standard_format;
-use audio_engine::{app_output, list_output_devices, ComGuard, Mixer};
+use audio_engine::loopback::{activate_process_loopback_client, standard_format};
+use audio_engine::{app_output, list_output_devices, ComGuard, EqBand, Mixer, DEFAULT_EQ_BANDS};
 use common::Priority;
 use windows::core::PCWSTR;
 use windows::Win32::Media::Audio::{
@@ -276,6 +281,69 @@ fn run_mixer(device_id: &str) -> windows::core::Result<()> {
     Ok(())
 }
 
+/// The loudest the child's own sound gets over `seconds`, recorded as
+/// another app recording it would (Windows' per-app capture), relative to
+/// its click.
+fn heard_by_a_recording(pid: u32, seconds: f64) -> windows::core::Result<f32> {
+    use windows::Win32::Media::Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    let client = activate_process_loopback_client(pid)?;
+    let mut peak = 0.0f32;
+    unsafe {
+        let event = CreateEventW(None, false, false, None)?;
+        client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+            2_000_000,
+            0,
+            &standard_format(),
+            None,
+        )?;
+        client.SetEventHandle(event)?;
+        let service: IAudioCaptureClient = client.GetService()?;
+        client.Start()?;
+        let start = Instant::now();
+        while start.elapsed().as_secs_f64() < seconds {
+            WaitForSingleObject(event, 100);
+            while service.GetNextPacketSize()? > 0 {
+                let (mut data, mut frames, mut flags) = (std::ptr::null_mut(), 0u32, 0u32);
+                service.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
+                let samples = std::slice::from_raw_parts(data as *const f32, frames as usize * 2);
+                peak = samples.iter().fold(peak, |peak, s| peak.max(s.abs()));
+                service.ReleaseBuffer(frames)?;
+            }
+        }
+        client.Stop()?;
+    }
+    Ok(peak / AMPLITUDE)
+}
+
+/// Through the mixer with the EQ on and `device_id` as the silent output.
+fn run_park(device_id: &str) -> windows::core::Result<()> {
+    let (child, mut control, dues) = start_player();
+    let pid = child.0.id();
+    std::thread::sleep(Duration::from_secs(1));
+    let mixer = Mixer::start()?;
+    mixer.ensure_bus("Game");
+    mixer.set_bus_eq_band("Game", 5, EqBand { gain_db: 3.0, ..DEFAULT_EQ_BANDS[5] });
+    mixer.set_silent_output(Some(device_id.to_string()));
+    mixer.add_source(pid, "probe", "Game")?;
+    std::thread::sleep(Duration::from_millis(1500));
+    println!("  routed with the EQ on; Windows has it on {:?}", app_output::get(pid)?);
+    println!("  a recording of it hears {:.1}% of the click (playing as it is until it reopens its audio)", heard_by_a_recording(pid, 2.0)? * 100.0);
+    writeln!(control, "reopen").unwrap();
+    std::thread::sleep(Duration::from_millis(2500));
+    let _ = dues.try_iter().count();
+    println!("  reopened its audio:");
+    report(device_id, &dues)?;
+    println!("  a recording of it hears {:.1}% of the click", heard_by_a_recording(pid, 2.0)? * 100.0);
+    let channel_meter = mixer.buses().iter().find(|bus| bus.name == "Game").map_or(0.0, |bus| bus.level);
+    println!("  channel meter: {:.0}% of the click (through the mixer, at its own volume)", channel_meter / AMPLITUDE * 100.0);
+    drop(mixer);
+    println!("  removed: Windows has it back on {:?}", app_output::get(pid)?);
+    Ok(())
+}
+
 fn main() -> windows::core::Result<()> {
     let _com = ComGuard::init()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -298,6 +366,10 @@ fn main() -> windows::core::Result<()> {
         drop(Mixer::start()?);
         println!("after starting the mixer: {:?}", app_output::get(pid));
         return Ok(());
+    }
+    if args.iter().any(|arg| arg == "park") {
+        println!("routed through the mixer, the silent output set to it:");
+        return run_park(&device.id);
     }
     if args.iter().any(|arg| arg == "mixer") {
         println!("routed through the mixer to it:");

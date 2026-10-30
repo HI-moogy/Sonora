@@ -160,6 +160,23 @@ pub fn enforce(sessions: &[OwnedSession]) -> bool {
     all_routed
 }
 
+/// For an app parked on `device` (an output nobody listens to, see
+/// [`crate::Mixer::set_silent_output`]) and playing there: its sessions
+/// there get full volume, so other apps recording it hear it; the rest, on
+/// outputs you hear, are turned down. Returns whether every session reads
+/// back as it should.
+pub fn park(sessions: &[OwnedSession], device: &str) -> bool {
+    let mut settled = !sessions.is_empty();
+    for session in sessions {
+        let wanted = if session.device == device { 1.0 } else { ROUTED_VOLUME };
+        if session.volume().is_none_or(|volume| (volume - wanted).abs() > wanted * 0.01) {
+            session.set_volume(wanted);
+        }
+        settled &= session.volume().is_some_and(|volume| (volume - wanted).abs() <= wanted * 0.01);
+    }
+    settled
+}
+
 /// Sets every session in `sessions` to `volume`, for an app playing
 /// straight on its channel's device (cheap: only sessions not already
 /// there are changed).

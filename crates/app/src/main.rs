@@ -42,6 +42,8 @@ mod single_instance;
 #[cfg(windows)]
 mod sounds;
 mod strip;
+#[cfg(windows)]
+mod streams;
 mod support;
 mod theme;
 #[cfg_attr(target_os = "linux", path = "tray_linux.rs")]
@@ -123,6 +125,8 @@ struct MixerApp {
     /// was created with.
     start_hidden_frames: u32,
     colors_window: appearance::ColorsWindow,
+    #[cfg(windows)]
+    streams_window: streams::StreamsWindow,
     about_window: support::AboutWindow,
     guide: guide::Guide,
 }
@@ -193,6 +197,8 @@ impl MixerApp {
             add_by_name: AddByName::default(),
             start_hidden_frames: if start_hidden { START_HIDDEN_FRAMES } else { 0 },
             colors_window: appearance::ColorsWindow::default(),
+            #[cfg(windows)]
+            streams_window: streams::StreamsWindow::default(),
             about_window: support::AboutWindow::default(),
             guide: {
                 // The tour shows once, the first time Sonora opens.
@@ -406,6 +412,16 @@ impl MixerApp {
                         "Plays through Sonora until it opens its sound again. Restart it for no added delay."
                     };
                     ui.label(egui::RichText::new(why).small().color(theme::text_muted()));
+                } else if !bus.direct && source.direct {
+                    // Waiting to move to the silent output (Discord streams).
+                    ui.label(
+                        egui::RichText::new(
+                            "Plays without this channel's EQ until it opens its sound again, so streams of it keep \
+                             their sound. Restart it to hear the EQ.",
+                        )
+                        .small()
+                        .color(theme::text_muted()),
+                    );
                 }
             });
         }
@@ -948,6 +964,8 @@ impl eframe::App for MixerApp {
             None => {}
         }
         self.colors_window.show(ui.ctx());
+        #[cfg(windows)]
+        self.streams_window.show(ui.ctx(), &self.mixer, &self.output_devices, &self.mixer.buses());
         self.about_window.show(ui.ctx(), &self.mixer);
         if let Some(guide::Outcome::Done) = self.guide.show(ui.ctx(), &self.clip_hotkey()) {
             self.tab = Tab::Mixer;
@@ -988,6 +1006,11 @@ impl eframe::App for MixerApp {
                     let menu = ui.menu_button(egui::RichText::new("Menu").size(14.5).color(theme::text_muted()), |ui| {
                         if ui.button("Colors…").clicked() {
                             self.colors_window.open();
+                            ui.close();
+                        }
+                        #[cfg(windows)]
+                        if ui.button("Discord streams…").clicked() {
+                            self.streams_window.open();
                             ui.close();
                         }
                         if ui.button("Getting started guide").clicked() {

@@ -82,6 +82,7 @@ impl MixerPersistence {
         let presets = common::load_presets();
         let setup = presets.mixer;
         mixer.set_master_gain(setup.master_gain);
+        mixer.set_silent_output(setup.silent_output.clone());
         for (name, bus) in &setup.buses {
             mixer.ensure_bus(name);
             mixer.set_bus_gain(name, bus.gain);
@@ -222,7 +223,7 @@ impl MixerPersistence {
     fn save_if_changed(&mut self, mixer: &Mixer, buses: &[BusInfo], sources: &[SourceInfo]) {
         let cleanup = mixer.mic_cleanup();
         let mic = MicConfig { noise_suppression: cleanup.mode(), quiet_far_voices: cleanup.quiet_far_voices() };
-        let snapshot = self.snapshot(mixer.master_gain(), buses, sources, mic);
+        let snapshot = self.snapshot(mixer.master_gain(), mixer.silent_output(), buses, sources, mic);
         if self.saved.as_ref() == Some(&snapshot) {
             return;
         }
@@ -238,7 +239,14 @@ impl MixerPersistence {
         }
     }
 
-    fn snapshot(&self, master_gain: f32, buses: &[BusInfo], sources: &[SourceInfo], mic: MicConfig) -> Snapshot {
+    fn snapshot(
+        &self,
+        master_gain: f32,
+        silent_output: Option<String>,
+        buses: &[BusInfo],
+        sources: &[SourceInfo],
+        mic: MicConfig,
+    ) -> Snapshot {
         let mut saved_sources: Vec<SavedSource> =
             sources.iter().filter_map(saved_route).chain(self.pending.iter().cloned()).collect();
         saved_sources.sort_by(|a, b| (&a.bus, &a.app).cmp(&(&b.bus, &b.app)));
@@ -262,7 +270,7 @@ impl MixerPersistence {
             .collect();
         let eq = buses.iter().map(|bus| (bus.name.clone(), EqPreset { enabled: bus.eq_enabled, bands: bus.eq })).collect();
         Snapshot {
-            mixer: MixerSetup { master_gain, buses: buses_saved, sources: saved_sources },
+            mixer: MixerSetup { master_gain, buses: buses_saved, sources: saved_sources, silent_output },
             eq,
             mic,
         }
@@ -321,7 +329,7 @@ mod tests {
         assert_eq!(saved.waiting_apps("Game").collect::<Vec<_>>(), [app.as_str()]);
 
         // Saved like any routed app, and removable again.
-        let snapshot = saved.snapshot(1.0, &[], &[], MicConfig::default());
+        let snapshot = saved.snapshot(1.0, None, &[], &[], MicConfig::default());
         assert_eq!(snapshot.mixer.sources, [waiting(&app, "Game")]);
         saved.forget_waiting_app("Game", &app);
         assert_eq!(saved.waiting_apps("Game").count(), 0);

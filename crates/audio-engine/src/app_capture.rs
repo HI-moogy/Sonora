@@ -207,6 +207,8 @@ pub(crate) fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: m
     // would make it 10,000x too loud.
     let mut last_routed = Instant::now() - ROUTE_ENFORCE_INTERVAL;
     let mut all_routed = false;
+    // Playing on the silent output, at full volume (see `RoutePlan::park`).
+    let mut parked = false;
     let mut boost_blocked_until = Instant::now();
     let mut boosted = Vec::new();
     // The device Sonora last pointed the app's processes at (`Some(None)`:
@@ -260,16 +262,23 @@ pub(crate) fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: m
                 break;
             }
             let plan = source.plan.lock().unwrap().clone();
-            // Point the app at its channel's device, or give it back its own.
-            let wanted = if plan.direct { plan.device.clone() } else { None };
+            // Point the app at its channel's device, or at the silent
+            // output, or give it back its own.
+            let wanted = if plan.direct { plan.device.clone() } else { plan.park.clone() };
             if pointed.as_ref() != Some(&wanted) {
                 session_volume::point(&routed, wanted.as_deref());
                 pointed = Some(wanted);
             }
             // Uncaptured, it's under the channel's volume wherever it plays:
-            // it moves when it opens its audio again.
-            let now_direct =
-                plan.direct && (capture.is_none() || plays_on(&sessions, plan.device.as_deref(), direct));
+            // it moves when it opens its audio again. Parked on the silent
+            // output, it plays as it is, where it is, at the channel's
+            // volume, until it plays there: turned down meanwhile, its
+            // capture would need a boost that a stream newly at full volume
+            // would get too.
+            let now_direct = match plan.park.as_deref() {
+                Some(silent) if capture.is_some() => !sessions.iter().any(|s| s.device == silent && s.is_playing()),
+                _ => plan.direct && (capture.is_none() || plays_on(&sessions, plan.device.as_deref(), direct)),
+            };
             if now_direct != direct {
                 direct = now_direct;
                 session_volume::mark_direct(&sessions, direct);
@@ -281,15 +290,19 @@ pub(crate) fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: m
                     session_volume::unroute(&routed);
                 }
             }
+            parked = plan.park.is_some() && !direct;
             if direct {
                 session_volume::set_volume(&sessions, plan.volume);
                 all_routed = false;
             } else if capture.is_some() {
-                all_routed = session_volume::enforce(&sessions);
-                if plan.direct {
-                    // Pointed there: look for it playing there sooner.
-                    next_scan = next_scan.min(last_scan + MOVE_RESCAN_INTERVAL);
-                }
+                all_routed = match plan.park.as_deref() {
+                    Some(silent) => session_volume::park(&sessions, silent),
+                    None => session_volume::enforce(&sessions),
+                };
+            }
+            if plan.direct || (plan.park.is_some() && direct) {
+                // Pointed somewhere: look for it playing there sooner.
+                next_scan = next_scan.min(last_scan + MOVE_RESCAN_INTERVAL);
             }
             last_routed = Instant::now();
         }
@@ -336,8 +349,9 @@ pub(crate) fn run_capture_thread(pid: u32, source: Arc<SourceInner>, ready_tx: m
                         num_frames as usize * CHANNELS,
                     )
                 };
-                // A direct app's audio is at its own volume: nothing to boost.
-                let gain = if direct {
+                // A direct app's audio is at its own volume, and a parked
+                // one's at full volume: nothing to boost.
+                let gain = if direct || parked {
                     1.0
                 } else {
                     let raw_peak = samples.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));

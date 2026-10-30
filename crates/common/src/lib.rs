@@ -318,11 +318,14 @@ pub struct MixerSetup {
     /// Per bus name.
     pub buses: HashMap<String, SavedBus>,
     pub sources: Vec<SavedSource>,
+    /// The output nobody listens to that apps the mixer plays put their own
+    /// sound on, so streams of them have it; `None` turns them down.
+    pub silent_output: Option<String>,
 }
 
 impl Default for MixerSetup {
     fn default() -> Self {
-        Self { master_gain: 1.0, buses: HashMap::new(), sources: Vec::new() }
+        Self { master_gain: 1.0, buses: HashMap::new(), sources: Vec::new(), silent_output: None }
     }
 }
 
