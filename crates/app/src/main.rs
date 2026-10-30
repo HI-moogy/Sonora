@@ -7,8 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use audio_engine::{
-    enumerate_sessions, list_input_devices, list_output_devices, AudioDevice, Mixer, EQ_BAND_COUNT,
-    EQ_BAND_FREQUENCIES, EQ_GAIN_RANGE_DB,
+    enumerate_sessions, list_input_devices, list_output_devices, AudioDevice, EqBand, Mixer, EQ_BANDS,
 };
 use common::{NoiseSuppression, Priority, Surround};
 use eframe::egui;
@@ -18,6 +17,7 @@ mod appearance;
 mod autostart;
 #[cfg(windows)]
 mod clips;
+mod eq_editor;
 mod eq_presets;
 #[cfg(windows)]
 mod file_dialogs;
@@ -47,6 +47,7 @@ mod theme;
 #[cfg_attr(target_os = "linux", path = "tray_linux.rs")]
 mod tray;
 
+use eq_editor::EqEditor;
 use meter::level_meter;
 #[cfg(windows)]
 use moments::Moments;
@@ -112,6 +113,7 @@ struct MixerApp {
     /// Whether this run already said it keeps running in the tray.
     tray_hint_shown: bool,
     eq_presets: EqPresetState,
+    eq_editor: EqEditor,
     add_by_name: AddByName,
     /// Started at sign-in: frames left during which to keep the window
     /// hidden, since eframe shows it once after its first frame whatever it
@@ -184,6 +186,7 @@ impl MixerApp {
             quitting,
             tray_hint_shown: false,
             eq_presets: EqPresetState::load(),
+            eq_editor: EqEditor::default(),
             add_by_name: AddByName::default(),
             start_hidden_frames: if start_hidden { START_HIDDEN_FRAMES } else { 0 },
             colors_window: appearance::ColorsWindow::default(),
@@ -335,8 +338,9 @@ impl MixerApp {
                         .color(theme::warning()),
                 );
             }
-            eq_preset_controls(ui, &self.mixer, selected, bus.eq_gains_db, &mut self.eq_presets);
-            eq_controls(ui, &self.mixer, selected, bus.eq_gains_db);
+            eq_switch(ui, &self.mixer, selected, bus.eq_enabled, Some(&mut self.eq_editor.big));
+            eq_preset_controls(ui, &self.mixer, selected, bus.eq, &mut self.eq_presets);
+            self.eq_editor.ui(ui, &self.mixer, bus, 170.0, false);
         });
 
         if selected == "Mic" {
@@ -533,7 +537,7 @@ impl MixerApp {
 /// Under an app channel's priority: whether its apps play straight on its
 /// device (no added delay) or through Sonora, and why.
 fn route_note(ui: &mut egui::Ui, bus: &audio_engine::BusInfo) {
-    let eq_on = bus.eq_gains_db.iter().any(|gain| gain.abs() >= 0.01);
+    let eq_on = bus.eq_enabled && bus.eq.iter().any(EqBand::shapes);
     let surround_on = bus.surround.enabled;
     let (text, color) = if !audio_engine::per_app_capture_supported() {
         (
@@ -701,10 +705,10 @@ fn eq_preset_controls(
     ui: &mut egui::Ui,
     mixer: &Mixer,
     bus_name: &str,
-    gains_db: [f32; EQ_BAND_COUNT],
+    bands: [EqBand; EQ_BANDS],
     presets: &mut EqPresetState,
 ) {
-    let current = eq_presets::matching(&gains_db, &presets.saved).map(str::to_string);
+    let current = eq_presets::matching(&bands, &presets.saved).map(str::to_string);
     let mut picked = None;
     ui.horizontal(|ui| {
         ui.label("Preset");
@@ -712,24 +716,24 @@ fn eq_preset_controls(
             .selected_text(current.as_deref().unwrap_or("Custom"))
             .height(480.0)
             .show_ui(ui, |ui| {
-                let mut item = |ui: &mut egui::Ui, name: &str, gains: [f32; EQ_BAND_COUNT]| {
+                let mut item = |ui: &mut egui::Ui, name: &str, bands: [EqBand; EQ_BANDS]| {
                     if ui.selectable_label(current.as_deref() == Some(name), name).clicked() {
-                        picked = Some(gains);
+                        picked = Some(bands);
                     }
                 };
-                item(ui, eq_presets::FLAT.name, eq_presets::FLAT.gains_db);
+                item(ui, eq_presets::FLAT.name, eq_presets::FLAT.bands());
                 for category in eq_presets::categories_for(bus_name) {
                     ui.separator();
                     ui.weak(category.name);
                     for preset in category.presets {
-                        item(ui, preset.name, preset.gains_db);
+                        item(ui, preset.name, preset.bands());
                     }
                 }
                 if !presets.saved.is_empty() {
                     ui.separator();
                     ui.weak("Yours");
                     for preset in &presets.saved {
-                        item(ui, &preset.name, preset.gains_db);
+                        item(ui, &preset.name, preset.bands);
                     }
                 }
             });
@@ -745,10 +749,11 @@ fn eq_preset_controls(
             }
         }
     });
-    if let Some(gains) = picked {
-        for (band, gain) in gains.into_iter().enumerate() {
-            mixer.set_bus_eq_band(bus_name, band, gain);
+    if let Some(picked) = picked {
+        for (index, band) in picked.into_iter().enumerate() {
+            mixer.set_bus_eq_band(bus_name, index, band);
         }
+        mixer.set_bus_eq_enabled(bus_name, true);
     }
     if let Some(mut typed) = presets.naming.take() {
         let mut done = false;
@@ -762,7 +767,7 @@ fn eq_preset_controls(
             if (ui.add_enabled(!name.is_empty(), egui::Button::new("Save")).clicked() || entered) && !name.is_empty() {
                 // Saving under an existing name replaces that preset.
                 presets.saved.retain(|p| p.name != name);
-                presets.saved.push(common::NamedEq { name, gains_db });
+                presets.saved.push(common::NamedEq { name, bands });
                 presets.store();
                 done = true;
             }
@@ -779,26 +784,17 @@ fn eq_preset_controls(
     }
 }
 
-fn eq_controls(ui: &mut egui::Ui, mixer: &Mixer, bus_name: &str, gains_db: [f32; EQ_BAND_COUNT]) {
+/// The EQ's on/off switch and, given `big`, the button for the big window.
+fn eq_switch(ui: &mut egui::Ui, mixer: &Mixer, bus_name: &str, enabled: bool, big: Option<&mut bool>) {
     ui.horizontal(|ui| {
-        for band in 0..EQ_BAND_COUNT {
-            ui.vertical(|ui| {
-                let freq = EQ_BAND_FREQUENCIES[band];
-                let label = if freq >= 1000.0 {
-                    format!("{:.1}k", freq / 1000.0)
-                } else {
-                    format!("{freq:.0}")
-                };
-                let mut gain = gains_db[band];
-                let changed = ui
-                    .add(
-                        egui::Slider::new(&mut gain, -EQ_GAIN_RANGE_DB..=EQ_GAIN_RANGE_DB)
-                            .vertical()
-                            .text(label),
-                    )
-                    .changed();
-                if changed {
-                    mixer.set_bus_eq_band(bus_name, band, gain);
+        let mut on = enabled;
+        if ui.checkbox(&mut on, "EQ on").on_hover_text("Off, the EQ changes nothing but keeps its bands").changed() {
+            mixer.set_bus_eq_enabled(bus_name, on);
+        }
+        if let Some(big) = big {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Bigger").on_hover_text("The EQ in a big window").clicked() {
+                    *big = true;
                 }
             });
         }
@@ -1067,6 +1063,22 @@ impl eframe::App for MixerApp {
                     });
                 });
             guide::target(ui.ctx(), "channel-panel", panel.response.rect);
+            if self.eq_editor.big {
+                if let Some(bus) = buses.iter().find(|b| b.name == selected) {
+                    let mut open = true;
+                    egui::Window::new(format!("{selected} EQ"))
+                        .open(&mut open)
+                        .default_size([920.0, 460.0])
+                        .resizable(true)
+                        .show(ui.ctx(), |ui| {
+                            eq_switch(ui, &self.mixer, &selected, bus.eq_enabled, None);
+                            eq_preset_controls(ui, &self.mixer, &selected, bus.eq, &mut self.eq_presets);
+                            let height = (ui.available_height() - 40.0).max(260.0);
+                            self.eq_editor.ui(ui, &self.mixer, bus, height, true);
+                        });
+                    self.eq_editor.big = open;
+                }
+            }
             if self.selected_bus.is_none() {
                 ui.ctx().request_repaint();
             }

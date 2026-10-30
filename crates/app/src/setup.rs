@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use audio_engine::{process_executable_name, BusInfo, Mixer, SourceInfo, EQ_BAND_COUNT};
+use audio_engine::{process_executable_name, BusInfo, Mixer, SourceInfo};
 use common::{EqPreset, MicConfig, MixerSetup, SavedBus, SavedSource};
 
 use crate::AvailableSession;
@@ -99,8 +99,9 @@ impl MixerPersistence {
         }
         for (name, preset) in &presets.eq {
             mixer.ensure_bus(name);
-            for (band, &gain_db) in preset.gains_db.iter().enumerate().take(EQ_BAND_COUNT) {
-                mixer.set_bus_eq_band(name, band, gain_db);
+            mixer.set_bus_eq_enabled(name, preset.enabled);
+            for (index, band) in preset.bands.into_iter().enumerate() {
+                mixer.set_bus_eq_band(name, index, band);
             }
         }
         mixer.mic_cleanup().set_mode(presets.mic.noise_suppression);
@@ -257,7 +258,7 @@ impl MixerPersistence {
                 (bus.name.clone(), saved)
             })
             .collect();
-        let eq = buses.iter().map(|bus| (bus.name.clone(), EqPreset { gains_db: bus.eq_gains_db })).collect();
+        let eq = buses.iter().map(|bus| (bus.name.clone(), EqPreset { enabled: bus.eq_enabled, bands: bus.eq })).collect();
         Snapshot {
             mixer: MixerSetup { master_gain, buses: buses_saved, sources: saved_sources },
             eq,

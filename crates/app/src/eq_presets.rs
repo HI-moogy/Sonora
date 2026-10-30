@@ -3,21 +3,28 @@
 //! save yourself. Every channel can use any of them; its own group is
 //! listed first.
 //!
-//! Gains are for the five bands at 100 Hz, 350 Hz, 1 kHz, 3.5 kHz and
-//! 10 kHz. The built-ins are starting points in the spirit of common curves
+//! The built-ins are written as gains for five bands at 100 Hz, 350 Hz,
+//! 1 kHz, 3.5 kHz and 10 kHz, and set as the ten bands that sound the same
+//! (see [`common::bands_from_five`]). They are starting points in the spirit of common curves
 //! (presence around 3.5 kHz for footsteps and speech, less low end for
 //! boomy mics, fuller lows for explosions and hip-hop), kept to boosts of
 //! 6 dB or less so loud audio doesn't clip.
 
-use audio_engine::EQ_BAND_COUNT;
+use audio_engine::{EqBand, EQ_BANDS};
 use common::NamedEq;
 
 pub struct BuiltIn {
     pub name: &'static str,
-    pub gains_db: [f32; EQ_BAND_COUNT],
+    gains_db: [f32; 5],
 }
 
-const fn preset(name: &'static str, gains_db: [f32; EQ_BAND_COUNT]) -> BuiltIn {
+impl BuiltIn {
+    pub fn bands(&self) -> [EqBand; EQ_BANDS] {
+        common::bands_from_five(self.gains_db)
+    }
+}
+
+const fn preset(name: &'static str, gains_db: [f32; 5]) -> BuiltIn {
     BuiltIn { name, gains_db }
 }
 
@@ -27,7 +34,7 @@ pub struct Category {
     pub presets: &'static [BuiltIn],
 }
 
-pub const FLAT: BuiltIn = preset("Flat", [0.0; EQ_BAND_COUNT]);
+pub const FLAT: BuiltIn = preset("Flat", [0.0; 5]);
 
 pub const GAMING: Category = Category {
     name: "Gaming",
@@ -129,19 +136,28 @@ pub fn categories_for(bus: &str) -> Vec<&'static Category> {
     first.iter().copied().chain(ALL.into_iter().filter(|c| !first.iter().any(|f| f.name == c.name))).collect()
 }
 
-fn same(a: &[f32; EQ_BAND_COUNT], b: &[f32; EQ_BAND_COUNT]) -> bool {
-    a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.05)
+/// Whether two EQs sound the same: every band that shapes the sound is in
+/// both, alike.
+fn same(a: &[EqBand; EQ_BANDS], b: &[EqBand; EQ_BANDS]) -> bool {
+    let shaping = |bands: &[EqBand; EQ_BANDS]| bands.iter().filter(|band| band.shapes()).copied().collect::<Vec<_>>();
+    let (a, b) = (shaping(a), shaping(b));
+    a.len() == b.len()
+        && a.iter().all(|x| {
+            b.iter().any(|y| {
+                x.kind == y.kind
+                    && (x.freq / y.freq - 1.0).abs() < 0.005
+                    && (x.gain_db - y.gain_db).abs() < 0.05
+                    && (x.q - y.q).abs() < 0.01
+            })
+        })
 }
 
-/// The name of the preset `gains_db` matches (yours first), if any.
-pub fn matching<'a>(gains_db: &[f32; EQ_BAND_COUNT], custom: &'a [NamedEq]) -> Option<&'a str> {
-    if let Some(preset) = custom.iter().find(|p| same(&p.gains_db, gains_db)) {
+/// The name of the preset `bands` matches (yours first), if any.
+pub fn matching<'a>(bands: &[EqBand; EQ_BANDS], custom: &'a [NamedEq]) -> Option<&'a str> {
+    if let Some(preset) = custom.iter().find(|p| same(&p.bands, bands)) {
         return Some(&preset.name);
     }
-    std::iter::once(&FLAT)
-        .chain(ALL.iter().flat_map(|c| c.presets))
-        .find(|p| same(&p.gains_db, gains_db))
-        .map(|p| p.name)
+    std::iter::once(&FLAT).chain(ALL.iter().flat_map(|c| c.presets)).find(|p| same(&p.bands(), bands)).map(|p| p.name)
 }
 
 #[cfg(test)]
@@ -168,7 +184,7 @@ mod tests {
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
                 assert_ne!(a.name, b.name);
-                assert!(!same(&a.gains_db, &b.gains_db), "{} and {} have the same curve", a.name, b.name);
+                assert!(!same(&a.bands(), &b.bands()), "{} and {} have the same curve", a.name, b.name);
             }
         }
     }
@@ -187,9 +203,12 @@ mod tests {
     #[test]
     fn your_presets_win_over_built_ins_with_the_same_curve() {
         let jazz = MUSIC.presets.iter().find(|p| p.name == "Jazz").unwrap();
-        let custom = vec![NamedEq { name: "Mine".into(), gains_db: jazz.gains_db }];
-        assert_eq!(matching(&jazz.gains_db, &custom), Some("Mine"));
-        assert_eq!(matching(&jazz.gains_db, &[]), Some("Jazz"));
-        assert_eq!(matching(&[0.3, 0.0, 0.0, 0.0, 0.0], &[]), None);
+        let custom = vec![NamedEq { name: "Mine".into(), bands: jazz.bands() }];
+        assert_eq!(matching(&jazz.bands(), &custom), Some("Mine"));
+        assert_eq!(matching(&jazz.bands(), &[]), Some("Jazz"));
+        let mut moved = jazz.bands();
+        moved[0].gain_db += 0.5;
+        assert_eq!(matching(&moved, &[]), None);
+        assert_eq!(matching(&audio_engine::DEFAULT_EQ_BANDS, &[]), Some("Flat"), "flat however its bands sit");
     }
 }

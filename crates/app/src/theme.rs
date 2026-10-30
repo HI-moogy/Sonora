@@ -176,6 +176,24 @@ pub const TAG_COLORS: [Rgb; 12] = [
     Rgb::new(0xA0, 0xA6, 0xAE),
 ];
 
+/// Each EQ band's dot, low to high.
+const EQ_BAND_COLORS: [Rgb; 10] = [
+    Rgb::new(0x8B, 0x5C, 0xF6),
+    Rgb::new(0x63, 0x66, 0xF1),
+    Rgb::new(0xEC, 0x48, 0x99),
+    Rgb::new(0xEF, 0x44, 0x44),
+    Rgb::new(0xF9, 0x73, 0x16),
+    Rgb::new(0xF5, 0x9E, 0x0B),
+    Rgb::new(0xA3, 0xE6, 0x35),
+    Rgb::new(0x14, 0xB8, 0xA6),
+    Rgb::new(0x22, 0xD3, 0xEE),
+    Rgb::new(0x0E, 0xA5, 0xE9),
+];
+
+pub fn eq_band_color(index: usize) -> Color32 {
+    color(EQ_BAND_COLORS[index % EQ_BAND_COLORS.len()])
+}
+
 /// The colors in use.
 static CURRENT: RwLock<ThemeColors> = RwLock::new(ThemeColors::SONORA);
 

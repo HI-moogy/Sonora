@@ -5,27 +5,148 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-pub const EQ_BAND_COUNT: usize = 5;
+/// How many bands a channel's EQ has.
+pub const EQ_BANDS: usize = 10;
 
-/// A saved 5-band EQ setting, keyed by bus name ("Game", "Media", "Aux",
-/// "Mic", ...) in [`Presets::eq`].
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct EqPreset {
-    pub gains_db: [f32; EQ_BAND_COUNT],
+/// What one EQ band does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EqKind {
+    /// Raises or lowers the frequencies around its own.
+    #[default]
+    Peak,
+    /// Raises or lowers everything below it.
+    LowShelf,
+    /// Raises or lowers everything above it.
+    HighShelf,
+    /// Takes away everything below it.
+    LowCut,
+    /// Takes away everything above it.
+    HighCut,
 }
 
-/// An EQ setting you saved under a name, to pick for any channel.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NamedEq {
-    pub name: String,
-    pub gains_db: [f32; EQ_BAND_COUNT],
+/// One EQ band: where it is (Hz), how much (dB, for peaks and shelves)
+/// and how wide (Q: higher is narrower).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EqBand {
+    pub kind: EqKind,
+    pub freq: f32,
+    pub gain_db: f32,
+    pub q: f32,
+    pub on: bool,
+}
+
+/// The Q of a peak an octave wide.
+pub const OCTAVE_Q: f32 = 1.41;
+
+impl EqBand {
+    pub const fn peak(freq: f32) -> Self {
+        Self { kind: EqKind::Peak, freq, gain_db: 0.0, q: OCTAVE_Q, on: true }
+    }
+
+    /// Whether it changes the sound: cuts always do, peaks and shelves when
+    /// they raise or lower.
+    pub fn shapes(&self) -> bool {
+        self.on
+            && match self.kind {
+                EqKind::Peak | EqKind::LowShelf | EqKind::HighShelf => self.gain_db.abs() >= 0.01,
+                EqKind::LowCut | EqKind::HighCut => true,
+            }
+    }
+}
+
+/// Where a channel's bands start: an octave apart, flat, like a graphic EQ.
+pub const DEFAULT_EQ_BANDS: [EqBand; EQ_BANDS] = [
+    EqBand::peak(31.25),
+    EqBand::peak(62.5),
+    EqBand::peak(125.0),
+    EqBand::peak(250.0),
+    EqBand::peak(500.0),
+    EqBand::peak(1000.0),
+    EqBand::peak(2000.0),
+    EqBand::peak(4000.0),
+    EqBand::peak(8000.0),
+    EqBand::peak(16_000.0),
+];
+
+/// Older Sonora's five bands (100 Hz to 10 kHz, Q 1).
+const FIVE_BAND_FREQUENCIES: [f32; 5] = [100.0, 350.0, 1000.0, 3500.0, 10_000.0];
+
+/// The ten bands that sound exactly as older Sonora's five did with these
+/// gains: each of the five takes the place of the band nearest it.
+pub fn bands_from_five(gains_db: [f32; 5]) -> [EqBand; EQ_BANDS] {
+    let mut bands = DEFAULT_EQ_BANDS;
+    let mut placed = [false; EQ_BANDS];
+    for (freq, gain_db) in FIVE_BAND_FREQUENCIES.into_iter().zip(gains_db) {
+        let distance = |band: &EqBand| (band.freq / freq).ln().abs();
+        let nearest = (0..EQ_BANDS)
+            .filter(|&index| !placed[index])
+            .min_by(|&a, &b| distance(&bands[a]).total_cmp(&distance(&bands[b])))
+            .expect("more bands than older Sonora had");
+        bands[nearest] = EqBand { kind: EqKind::Peak, freq, gain_db, q: 1.0, on: true };
+        placed[nearest] = true;
+    }
+    bands
+}
+
+/// A channel's EQ as saved, keyed by bus name ("Game", "Media", "Aux",
+/// "Mic", ...) in [`Presets::eq`]. Settings from older Sonora, with five
+/// gains, load as the ten bands that sound the same.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(from = "SavedEq")]
+pub struct EqPreset {
+    /// Off, the EQ is bypassed but keeps its bands.
+    pub enabled: bool,
+    pub bands: [EqBand; EQ_BANDS],
 }
 
 impl Default for EqPreset {
     fn default() -> Self {
-        Self {
-            gains_db: [0.0; EQ_BAND_COUNT],
+        Self { enabled: true, bands: DEFAULT_EQ_BANDS }
+    }
+}
+
+/// An EQ setting you saved under a name, to pick for any channel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "SavedNamedEq")]
+pub struct NamedEq {
+    pub name: String,
+    pub bands: [EqBand; EQ_BANDS],
+}
+
+/// A saved EQ, as this version or older ones wrote it.
+#[derive(Deserialize)]
+struct SavedEq {
+    enabled: Option<bool>,
+    bands: Option<Vec<EqBand>>,
+    gains_db: Option<[f32; 5]>,
+}
+
+#[derive(Deserialize)]
+struct SavedNamedEq {
+    name: String,
+    #[serde(flatten)]
+    eq: SavedEq,
+}
+
+impl SavedEq {
+    fn bands(self) -> [EqBand; EQ_BANDS] {
+        match (self.bands, self.gains_db) {
+            (Some(saved), _) => std::array::from_fn(|index| saved.get(index).copied().unwrap_or(DEFAULT_EQ_BANDS[index])),
+            (None, Some(gains_db)) => bands_from_five(gains_db),
+            (None, None) => DEFAULT_EQ_BANDS,
         }
+    }
+}
+
+impl From<SavedEq> for EqPreset {
+    fn from(saved: SavedEq) -> Self {
+        Self { enabled: saved.enabled.unwrap_or(true), bands: saved.bands() }
+    }
+}
+
+impl From<SavedNamedEq> for NamedEq {
+    fn from(saved: SavedNamedEq) -> Self {
+        Self { name: saved.name, bands: saved.eq.bands() }
     }
 }
 
@@ -746,7 +867,7 @@ mod tests {
     fn settings_from_before_moments_load_with_moments_defaults() {
         let old = r#"{ "eq": { "Game": { "gains_db": [1.0, 0.0, 0.0, 0.0, 0.0] } } }"#;
         let presets: Presets = serde_json::from_str(old).unwrap();
-        assert_eq!(presets.eq["Game"].gains_db[0], 1.0);
+        assert_eq!(presets.eq["Game"].bands.iter().find(|band| band.freq == 100.0).map(|band| band.gain_db), Some(1.0));
         assert_eq!(presets.moments, MomentsConfig::default());
         assert_eq!(presets.mixer, MixerSetup::default());
     }
@@ -902,14 +1023,14 @@ mod tests {
                         "mixer": { "master_gain": "loud" } }"#;
         std::fs::write(&path, text).unwrap();
         let (presets, notices) = load_from(&path);
-        assert_eq!(presets.eq["Game"].gains_db[0], 1.0);
+        assert_eq!(presets.eq["Game"].bands.iter().find(|band| band.freq == 100.0).map(|band| band.gain_db), Some(1.0));
         assert_eq!(presets.moments.buffer_secs, 60);
         assert_eq!(presets.mixer, MixerSetup::default());
         assert!(notices[0].contains("(mixer)"), "{notices:?}");
         assert!(files_in(&dir).iter().any(|f| f.contains("corrupt")));
         // The good sections survive every later load, not just the first.
         let (again, notices) = load_from(&path);
-        assert_eq!(again.eq["Game"].gains_db[0], 1.0);
+        assert_eq!(again.eq["Game"].bands.iter().find(|band| band.freq == 100.0).map(|band| band.gain_db), Some(1.0));
         assert_eq!(again.moments.buffer_secs, 60);
         assert!(notices.is_empty(), "{notices:?}");
     }
@@ -953,6 +1074,29 @@ mod tests {
 
     fn names<'a>(tags: impl IntoIterator<Item = &'a ClipTag>) -> Vec<&'a str> {
         tags.into_iter().map(|tag| tag.name.as_str()).collect()
+    }
+
+    #[test]
+    fn eqs_from_older_sonora_keep_their_sound() {
+        let preset: EqPreset = serde_json::from_str(r#"{ "gains_db": [3.0, 0.0, -2.0, 4.0, 1.0] }"#).unwrap();
+        assert!(preset.enabled);
+        let shaping: Vec<(f32, f32, f32)> =
+            preset.bands.iter().filter(|band| band.shapes()).map(|band| (band.freq, band.gain_db, band.q)).collect();
+        assert_eq!(shaping, [(100.0, 3.0, 1.0), (1000.0, -2.0, 1.0), (3500.0, 4.0, 1.0), (10_000.0, 1.0, 1.0)]);
+        assert!(preset.bands.windows(2).all(|pair| pair[0].freq < pair[1].freq), "still low to high");
+
+        let named: NamedEq = serde_json::from_str(r#"{ "name": "Mine", "gains_db": [1.0, 1.0, 1.0, 1.0, 1.0] }"#).unwrap();
+        assert_eq!(named.bands.iter().filter(|band| band.shapes()).count(), 5);
+    }
+
+    #[test]
+    fn an_eq_saves_and_loads_as_it_was() {
+        let mut preset = EqPreset { enabled: false, ..EqPreset::default() };
+        preset.bands[0] = EqBand { kind: EqKind::LowCut, freq: 40.0, gain_db: 0.0, q: 0.7, on: true };
+        let json = serde_json::to_string(&preset).unwrap();
+        assert_eq!(serde_json::from_str::<EqPreset>(&json).unwrap(), preset);
+        let named = NamedEq { name: "Mine".into(), bands: preset.bands };
+        assert_eq!(serde_json::from_str::<NamedEq>(&serde_json::to_string(&named).unwrap()).unwrap(), named);
     }
 
     #[test]

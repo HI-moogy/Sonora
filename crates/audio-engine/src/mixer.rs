@@ -11,7 +11,7 @@ use common::{Priority, Surround};
 
 use crate::atomic_f32::AtomicF32;
 use crate::denoise::MicCleanup;
-use crate::eq::{EqBands, EQ_BAND_COUNT};
+use crate::eq::{EqBand, EqBands, EQ_BANDS};
 use crate::error::{self, Result};
 use crate::platform::{self, DeviceOutput};
 use crate::surround::VirtualSurround;
@@ -272,7 +272,9 @@ pub struct BusInfo {
     pub muted: bool,
     /// Peak since the previous snapshot.
     pub level: f32,
-    pub eq_gains_db: [f32; EQ_BAND_COUNT],
+    pub eq: [EqBand; EQ_BANDS],
+    /// Whether its EQ is on (off, it keeps its bands but changes nothing).
+    pub eq_enabled: bool,
     /// `None` means this bus renders to the system default output device.
     pub device_id: Option<String>,
     /// See [`Mixer::set_bus_fallback`].
@@ -595,10 +597,17 @@ impl Mixer {
         }
     }
 
-    /// Sets one band (0..[`EQ_BAND_COUNT`]) of `bus`'s EQ, in dB.
-    pub fn set_bus_eq_band(&self, bus: &str, band: usize, gain_db: f32) {
+    /// Sets band `index` (0..[`EQ_BANDS`]) of `bus`'s EQ.
+    pub fn set_bus_eq_band(&self, bus: &str, index: usize, band: EqBand) {
         if let Some(bus) = self.buses.lock().unwrap().get(bus) {
-            bus.eq.lock().unwrap().set_band(band, gain_db);
+            bus.eq.lock().unwrap().set_band(index, band);
+        }
+    }
+
+    /// Turns `bus`'s EQ on or off; off, it keeps its bands.
+    pub fn set_bus_eq_enabled(&self, bus: &str, enabled: bool) {
+        if let Some(bus) = self.buses.lock().unwrap().get(bus) {
+            bus.eq.lock().unwrap().set_enabled(enabled);
         }
     }
 
@@ -686,21 +695,30 @@ impl Mixer {
             .lock()
             .unwrap()
             .iter()
-            .map(|(name, b)| BusInfo {
-                name: name.clone(),
-                gain: b.gain.load(),
-                muted: b.muted.load(Ordering::Relaxed),
-                level: if take_levels { b.level.take() } else { b.level.load() },
-                eq_gains_db: b.eq.lock().unwrap().gains(),
-                device_id: b.device_id.lock().unwrap().clone(),
-                fallback_to_default: b.fallback_to_default.load(Ordering::Relaxed),
-                heard: b.heard.load(Ordering::Relaxed),
-                priority: *b.priority.lock().unwrap(),
-                delay_ms: b.delay_ms.load(),
-                send: b.send.load(Ordering::Relaxed),
-                monitor: b.monitor.load(Ordering::Relaxed),
-                direct: b.direct.load(Ordering::Relaxed),
-                surround: b.surround.lock().unwrap().settings(),
+            .map(|(name, b)| {
+                // Locked once: a second lock in the same expression would
+                // wait on the first, which lives until the expression ends.
+                let (eq, eq_enabled) = {
+                    let eq = b.eq.lock().unwrap();
+                    (eq.bands(), eq.enabled())
+                };
+                BusInfo {
+                    name: name.clone(),
+                    gain: b.gain.load(),
+                    muted: b.muted.load(Ordering::Relaxed),
+                    level: if take_levels { b.level.take() } else { b.level.load() },
+                    eq,
+                    eq_enabled,
+                    device_id: b.device_id.lock().unwrap().clone(),
+                    fallback_to_default: b.fallback_to_default.load(Ordering::Relaxed),
+                    heard: b.heard.load(Ordering::Relaxed),
+                    priority: *b.priority.lock().unwrap(),
+                    delay_ms: b.delay_ms.load(),
+                    send: b.send.load(Ordering::Relaxed),
+                    monitor: b.monitor.load(Ordering::Relaxed),
+                    direct: b.direct.load(Ordering::Relaxed),
+                    surround: b.surround.lock().unwrap().settings(),
+                }
             })
             .collect()
     }
@@ -714,14 +732,13 @@ impl Mixer {
         if buses.contains_key(name) {
             return;
         }
-        let gains_db = [0.0; EQ_BAND_COUNT];
         buses.insert(
             name.to_string(),
             Arc::new(BusInner {
                 gain: AtomicF32::new(1.0),
                 muted: AtomicBool::new(false),
                 level: AtomicF32::new(0.0),
-                eq: Mutex::new(EqBands::from_gains(SAMPLE_RATE, gains_db)),
+                eq: Mutex::new(EqBands::new(SAMPLE_RATE)),
                 surround: Mutex::new(VirtualSurround::new(Surround::default())),
                 device_id: Mutex::new(None),
                 fallback_to_default: AtomicBool::new(true),
@@ -786,7 +803,7 @@ struct BusSnapshot {
 fn update_route_plans(bus_snapshot: &[BusSnapshot], master_gain: f32, can_process: bool) {
     for snapshot in bus_snapshot {
         let bus = &snapshot.bus;
-        let flat = bus.eq.lock().unwrap().gains().iter().all(|gain| gain.abs() < 0.01);
+        let flat = bus.eq.lock().unwrap().is_flat();
         let surround = bus.surround.lock().unwrap().settings().enabled;
         let bus_direct = snapshot.device_ok
             && ((flat && !surround) || !can_process)
@@ -1251,6 +1268,11 @@ mod tests {
         assert!(Arc::ptr_eq(&sources[&0], &game), "apps stay");
     }
 
+    /// The third EQ band, raised by `gain_db`.
+    fn raised(gain_db: f32) -> EqBand {
+        EqBand { gain_db, ..crate::eq::DEFAULT_EQ_BANDS[2] }
+    }
+
     fn bus() -> Arc<BusInner> {
         Arc::new(BusInner {
             gain: AtomicF32::new(1.0),
@@ -1313,9 +1335,9 @@ mod tests {
         app.gain.store(0.8);
 
         // The EQ needs the mixer.
-        game.eq.lock().unwrap().set_band(2, 3.0);
+        game.eq.lock().unwrap().set_band(2, raised(3.0));
         assert!(!plan_for(&game, &app, true, 1.0).direct);
-        game.eq.lock().unwrap().set_band(2, 0.0);
+        game.eq.lock().unwrap().set_band(2, raised(0.0));
 
         // So does surround.
         game.surround.lock().unwrap().set(Surround { enabled: true, ..Surround::default() });
@@ -1331,7 +1353,7 @@ mod tests {
     #[test]
     fn without_app_capture_apps_always_play_direct() {
         let (game, app) = (bus(), source(Some(100), "Game"));
-        game.eq.lock().unwrap().set_band(2, 3.0);
+        game.eq.lock().unwrap().set_band(2, raised(3.0));
         app.gain.store(2.0);
         // The EQ and the boost can't reach it, but its volume is capped.
         let plan = plan_where(&game, &app, true, 1.0, false);

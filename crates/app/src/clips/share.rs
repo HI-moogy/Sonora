@@ -224,7 +224,7 @@ fn limit_picker(ui: &mut egui::Ui, limit_mb: &mut u32) -> bool {
     let mut settled = false;
     ui.horizontal(|ui| {
         ui.label("Each file under");
-        let label = |mb: u32| if mb >= 1000 && mb % 1000 == 0 { format!("{} GB", mb / 1000) } else { format!("{mb} MB") };
+        let label = |mb: u32| if mb >= 1000 && mb.is_multiple_of(1000) { format!("{} GB", mb / 1000) } else { format!("{mb} MB") };
         let selected = match LIMITS.iter().find(|(mb, _)| mb == limit_mb) {
             Some((mb, what)) => format!("{} ({what})", label(*mb)),
             None => "Other".to_string(),

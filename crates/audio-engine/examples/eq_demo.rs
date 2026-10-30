@@ -23,17 +23,17 @@ fn main() -> windows::core::Result<()> {
         }
 
         // --- Phase 2: EQ changes apply and are readable back ---
-        mixer.set_bus_eq_band("Mic", 0, 6.0);
-        mixer.set_bus_eq_band("Mic", 4, -4.0);
-        let gains = mixer
+        mixer.set_bus_eq_band("Mic", 2, audio_engine::EqBand { gain_db: 6.0, ..audio_engine::DEFAULT_EQ_BANDS[2] });
+        mixer.set_bus_eq_band("Mic", 8, audio_engine::EqBand { gain_db: -4.0, ..audio_engine::DEFAULT_EQ_BANDS[8] });
+        let bands = mixer
             .buses()
             .into_iter()
             .find(|b| b.name == "Mic")
-            .map(|b| b.eq_gains_db)
+            .map(|b| b.eq)
             .expect("Mic bus should exist");
-        println!("Mic EQ after set: {gains:?}");
-        assert!((gains[0] - 6.0).abs() < 0.001, "band 0 should be 6.0");
-        assert!((gains[4] - (-4.0)).abs() < 0.001, "band 4 should be -4.0");
+        println!("Mic EQ after set: {bands:?}");
+        assert!((bands[2].gain_db - 6.0).abs() < 0.001, "band 2 should be 6.0");
+        assert!((bands[8].gain_db - (-4.0)).abs() < 0.001, "band 8 should be -4.0");
 
         mixer.remove_source(id);
     }

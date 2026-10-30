@@ -38,7 +38,7 @@ pub mod pulse;
 #[cfg(windows)]
 pub use com::ComGuard;
 pub use denoise::{MicCleanup, MicTest};
-pub use eq::{EQ_BAND_COUNT, EQ_BAND_FREQUENCIES, EQ_GAIN_RANGE_DB};
+pub use eq::{response_db, EqBand, EqKind, DEFAULT_EQ_BANDS, EQ_BANDS, EQ_FREQ_RANGE, EQ_GAIN_RANGE_DB, EQ_Q_RANGE};
 pub use error::{Error, Result};
 pub use mixer::{BusInfo, BusTap, Mixer, SourceInfo};
 #[cfg(windows)]

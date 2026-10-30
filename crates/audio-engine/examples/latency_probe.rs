@@ -219,7 +219,7 @@ fn run(device_id: &str, routed: Option<Priority>, tone: bool, eq: bool) -> windo
             mixer.set_bus_device("Game", Some(device_id.to_string()));
             mixer.set_bus_priority("Game", priority);
             if eq {
-                mixer.set_bus_eq_band("Game", 2, 3.0);
+                mixer.set_bus_eq_band("Game", 5, audio_engine::EqBand { gain_db: 3.0, ..audio_engine::DEFAULT_EQ_BANDS[5] });
             }
             mixer.add_source(child.0.id(), "probe", "Game")?;
             std::thread::sleep(Duration::from_millis(1500));

@@ -98,10 +98,16 @@ fn voice_details(mixer: &Mixer) -> Vec<String> {
         (true, Some(id)) => device_name(&outputs, id),
     };
     let cleanup = mixer.mic_cleanup();
-    let eq = if bus.eq_gains_db.iter().all(|&g| g == 0.0) {
-        "flat".into()
-    } else {
-        format!("{:?} dB", bus.eq_gains_db)
+    let shaping: Vec<String> = bus
+        .eq
+        .iter()
+        .filter(|band| band.shapes())
+        .map(|band| format!("{:?} {:.0} Hz {:+.1} dB Q {:.2}", band.kind, band.freq, band.gain_db, band.q))
+        .collect();
+    let eq = match (bus.eq_enabled, shaping.is_empty()) {
+        (false, _) => "off".into(),
+        (true, true) => "flat".into(),
+        (true, false) => shaping.join(", "),
     };
     lines.push(format!(
         "{} channel: sends to {sends_to}; Listen to my mic {}; noise removal {:?}{}; EQ {eq}{}",
